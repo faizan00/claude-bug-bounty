@@ -47,6 +47,7 @@ if _REPO not in sys.path:
 
 from tools import lead_board  # noqa: E402
 from tools import fingerprint  # noqa: E402
+from tools import secrets_scanner  # noqa: E402
 from memory.finding_score import normalize_vuln_class  # noqa: E402
 from memory.pattern_db import PatternDB  # noqa: E402
 from memory.vuln_intelligence import (  # noqa: E402
@@ -60,6 +61,7 @@ from memory.vuln_intelligence import (  # noqa: E402
     _read_jsonl_best_effort,  # reused for journal.jsonl (no dedicated JournalDB exists)
     duplicate_or_noise_check,
     expected_value_per_hour,
+    extract_rejection_lessons,
     hypothesis_calibration,
     priority_score,
     tech_vuln_affinity,
@@ -95,6 +97,31 @@ AUTO_DETECTABLE_SKIP_REASONS = (
     "BELOW_EV_FLOOR", "MATCHES_FAILED_PATTERN", "DUPLICATE",
     "TIME_CONSTRAINT", "DEPENDENCY_UNMET", "INSUFFICIENT_EVIDENCE",
 )
+
+# POLICY_EXCLUDED stays OUT of AUTO_DETECTABLE_SKIP_REASONS deliberately —
+# see the module-level comment above SKIP_REASONS. It only ever fires when
+# a caller explicitly opts in by passing build_plan(rejection_lessons=...),
+# and only for a vuln_class whose real-world rejection_rate (from
+# memory.vuln_intelligence.extract_rejection_lessons(), min_samples-gated)
+# clears this bar. Default build_plan() calls (rejection_lessons=None)
+# never touch this path, so TestFalsifiersAndStopConditions.
+# test_always_rejected_and_policy_excluded_stay_in_vocabulary_but_unused
+# keeps passing unmodified.
+#
+# 1.0 (unanimous), not an intermediate value: this repo has no historical
+# corpus to empirically derive a "how much rejection is enough" cutoff
+# from, and any value strictly between 0 and 1 (0.8, 0.9, whatever) is a
+# subjective judgment call with no principled basis — picking one would be
+# exactly the kind of unjustified heuristic constant this codebase's
+# discipline forbids. 1.0 is the one point on that scale that requires NO
+# judgment call: it means every real report_outcomes observation in the
+# qualifying bucket (>=MIN_SAMPLES_FOR_DEDUP_PROBABILITY, extract_rejection_
+# lessons()'s own min_samples gate) was a rejection, with zero counter-
+# examples. Anything short of unanimous is deliberately left for a human
+# to read off extract_rejection_lessons()'s rejection_rate/top_reasons
+# output and decide manually — this constant only auto-fires the case
+# where the data itself leaves no ambiguity.
+POLICY_EXCLUSION_REJECTION_RATE_THRESHOLD = 1.0
 
 RISK_LEVELS = ("LOW", "MEDIUM", "HIGH")
 
@@ -338,6 +365,282 @@ def attack_graph_leads(target: str, recon_dir: str, memory_dir: str | None = Non
         target, recon_dir=recon_dir, tech_stack=tech_stack, tech_attack_matrix=tech_attack_matrix,
     )
     return ag.top_paths(target, graph)
+
+
+# ─── Standalone tool findings -> concrete leads (Phase 5, Part B) ──────────
+#
+# tools/takeover_scanner.sh, tools/cloud_recon.sh, and tools/graphql_audit.sh
+# all work standalone but, unlike Phase 1's browser_recon.py, none of them
+# write under recon/<target>/ by default — each defaults to a *timestamped*
+# findings/<tool>/<timestamp>/ dir outside the recon tree (confirmed by
+# reading all three scripts; not modifying that default here, since changing
+# a script's own output location is a behavior change outside this phase's
+# scope). So these adapters can't glob a fixed recon-dir-relative path the
+# way browser_intel_leads() does — they take the exact directory a given
+# run's output landed in as an explicit findings_dir argument. Director.
+# build_plan()'s new optional *_findings_dir params (all default None) are
+# how a caller opts a specific run's output into a plan; omitting all three
+# reproduces prior build_plan() behavior exactly.
+#
+# Same shape as browser_intel_leads()/attack_graph_leads() otherwise: pure
+# file reads, never raises, [] if the directory or its files don't exist,
+# and every resulting lead flows through the SAME priority_score()/
+# expected_value_per_hour() scoring _score_lead() already applies to every
+# other lead source — no second formula.
+
+
+def _read_json_file(path: Path) -> dict | list | None:
+    """Best-effort JSON read: missing/malformed resolves to None, same
+    convention as _read_browser_json() above (duplicated, not imported —
+    it's a 4-line helper reading a different tree than recon/<t>/browser/)."""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+
+
+def _read_text_lines(path: Path) -> list[str]:
+    """Best-effort text read, one stripped non-empty line per entry."""
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+
+def _new_tool_lead(target: str, skill: str, priority: str, signal: str, why: str,
+                    evidence: str, source: str, artifact: str) -> dict:
+    """Same shape as _new_browser_lead() above, generalized with a caller-
+    supplied `source` tag (e.g. "takeover-scan") instead of the hardcoded
+    "browser-intel" — every other field/convention (id prefix aside) matches."""
+    now = lead_board.now_iso()
+    return {
+        "id": "tf-" + secrets.token_hex(3),
+        "target": target,
+        "skill": skill,
+        "priority": priority,
+        "signal": signal,
+        "why": why,
+        "evidence": lead_board.norm_evidence(evidence),
+        "source": source,
+        "tool_artifact": artifact,
+        "status": "new",
+        "note": "",
+        "created": now,
+        "last_seen": now,
+        "seen_count": 1,
+    }
+
+
+def takeover_leads(target: str, findings_dir: str) -> list[dict]:
+    """Convert tools/takeover_scanner.sh output into lead-board-shaped
+    candidates. Uses the existing "hunt-subdomain" skill — the same one
+    lead_board.py's nuclei-tag routing already uses for takeover signals
+    (tools/lead_board.py's NUCLEI_TAG_SKILL table), not a new skill name.
+
+    dnsReaper/subjack hits are the scanner's own vetted candidates -> P_HIGH.
+    The curl-fingerprint fallback (only used when neither tool is installed)
+    is explicitly labeled "(low signal)" by takeover_scanner.sh itself -> P_MED.
+    """
+    leads: list[dict] = []
+    base = Path(findings_dir)
+    if not base.is_dir():
+        return leads
+
+    def _add(priority: str, host: str, evidence: str, artifact: str) -> None:
+        if not host:
+            return
+        leads.append(_new_tool_lead(
+            target, "hunt-subdomain", priority,
+            "subdomain takeover candidate",
+            "DNS record points at an unclaimed/misconfigured third-party service "
+            "— claim the service and host content to prove takeover",
+            evidence, "takeover-scan", artifact,
+        ))
+
+    dnsreaper = _read_json_file(base / "dnsreaper.json")
+    if isinstance(dnsreaper, list):
+        for item in dnsreaper:
+            if isinstance(item, dict):
+                host = item.get("domain") or item.get("host") or item.get("subdomain") or ""
+                _add(lead_board.P_HIGH, host, json.dumps(item)[:300], "dnsreaper.json")
+            elif isinstance(item, str):
+                _add(lead_board.P_HIGH, item, item, "dnsreaper.json")
+
+    for line in _read_text_lines(base / "subjack.txt"):
+        _add(lead_board.P_HIGH, line.split()[0], line, "subjack.txt")
+
+    for line in _read_text_lines(base / "fingerprint_grep.txt"):
+        _add(lead_board.P_MED, line.split()[0], line, "fingerprint_grep.txt")
+
+    return leads
+
+
+def cloud_recon_leads(target: str, findings_dir: str) -> list[dict]:
+    """Convert tools/cloud_recon.sh output into lead-board-shaped candidates,
+    using the existing "hunt-cloud-misconfig" skill (already routed by
+    lead_board.py's Firebase/cloud-bucket tech-signal rules). Public
+    buckets / exposed origin IPs are "often critical when real" (Part B
+    spec) -> P_HIGH across the board, matching cloud_recon.sh's own "hit"
+    (not "ok") classification for every one of these lines.
+    """
+    leads: list[dict] = []
+    base = Path(findings_dir)
+    if not base.is_dir():
+        return leads
+
+    def _add(signal: str, why: str, evidence: str, artifact: str) -> None:
+        leads.append(_new_tool_lead(
+            target, "hunt-cloud-misconfig", lead_board.P_HIGH, signal, why,
+            evidence, "cloud-recon", artifact,
+        ))
+
+    for line in _read_text_lines(base / "s3scanner.txt"):
+        if re.search(r"exists|public", line, re.I):
+            _add("public/existing S3 bucket",
+                 "s3scanner matched an accessible bucket across providers — verify read/write ACLs",
+                 line, "s3scanner.txt")
+
+    for line in _read_text_lines(base / "cloud_enum.txt"):
+        _add("multi-cloud discovery (cloud_enum)",
+             "cloud_enum hit across AWS/Azure/GCP — confirm public exposure before reporting",
+             line, "cloud_enum.txt")
+
+    for line in _read_text_lines(base / "cloudfail.txt"):
+        if re.search(r"\[FOUND\]|origin", line, re.I):
+            _add("CloudFlare origin IP exposed",
+                 "origin IP recovered via DNS history — direct access bypasses WAF/CDN protections",
+                 line, "cloudfail.txt")
+
+    for line in _read_text_lines(base / "non_cf_ips.txt"):
+        _add("non-CloudFlare origin IP",
+             "subdomain resolves outside CloudFlare's published ranges — likely origin IP bypassing the WAF",
+             line, "non_cf_ips.txt")
+
+    return leads
+
+
+# One (artifact filename, priority, signal, why) row per graphql_audit.sh
+# output file that indicates a real finding (as opposed to a clean/empty
+# scan). Table instead of one hand-written `if` per file so adding a new
+# audit-script output later is a one-line addition, not new branching logic.
+_GRAPHQL_AUDIT_SIGNALS: tuple[tuple[str, str, str, str], ...] = (
+    ("introspection.json", lead_board.P_HIGH, "introspection enabled",
+     "full schema dump available — map hidden types/mutations for IDOR/auth-bypass candidates"),
+    ("field_suggestions.json", lead_board.P_MED, "clairvoyance field suggestions",
+     "introspection disabled but field-suggestion errors leak schema shape (clairvoyance technique)"),
+    ("batching_dos.txt", lead_board.P_HIGH, "batching DoS confirmed",
+     "query batching bypasses per-request rate limiting — resource exhaustion / brute-force amplification"),
+    ("alias_bomb.txt", lead_board.P_HIGH, "alias bomb confirmed",
+     "aliased duplicate fields amplify a single request — DoS / rate-limit bypass"),
+    ("interesting_fields.txt", lead_board.P_MED, "interesting schema fields",
+     "introspection surfaced fields named like internal/admin/id — IDOR candidates"),
+    ("gqlmap.txt", lead_board.P_HIGH, "gqlmap injection signal",
+     "gqlmap flagged a possible injection point in a GraphQL field"),
+    ("cop_report.txt", lead_board.P_MED, "graphql-cop checklist findings",
+     "graphql-cop flagged one or more standard GraphQL security misconfigurations"),
+)
+
+
+def graphql_audit_leads(target: str, findings_dir: str, recon_dir: str | None = None) -> list[dict]:
+    """Convert tools/graphql_audit.sh output into lead-board-shaped
+    candidates tagged api_style=graphql, using the existing "hunt-graphql"
+    skill. Cross-references Phase 3's recon/<target>/fingerprint.json
+    api_style field (purely informational tagging in `why` — presence/
+    absence never gates whether a lead is emitted, since the audit tool's
+    own output is already direct evidence a GraphQL endpoint exists)."""
+    leads: list[dict] = []
+    base = Path(findings_dir)
+    if not base.is_dir():
+        return leads
+
+    api_style_confirmed = False
+    if recon_dir:
+        fp_data = _read_json_file(Path(recon_dir) / "fingerprint.json")
+        if isinstance(fp_data, dict):
+            api_style_confirmed = "graphql" in (fp_data.get("api_style") or [])
+    tag = "[api_style=graphql, fingerprint-confirmed]" if api_style_confirmed else "[api_style=graphql]"
+
+    for filename, priority, signal, why in _GRAPHQL_AUDIT_SIGNALS:
+        path = base / filename
+        if filename.endswith(".json"):
+            data = _read_json_file(path)
+            has_content = bool(data)
+        else:
+            has_content = bool(_read_text_lines(path))
+        if not has_content:
+            continue
+        leads.append(_new_tool_lead(
+            target, "hunt-graphql", priority, signal, f"{why} {tag}",
+            str(path), "graphql-audit", filename,
+        ))
+
+    return leads
+
+
+# ─── Secret scan -> concrete leads (Phase 5, Part C) ───────────────────────
+#
+# Unlike takeover_leads()/cloud_recon_leads()/graphql_audit_leads() above,
+# tools/secrets_scanner.py's two data sources (recon/<target>/browser/
+# sources/ from Phase 1, and recon/<target>/cicd/ from cicd_scanner.sh via
+# recon_engine.sh's Phase 8) are BOTH already deterministic, recon_dir-
+# relative paths — no timestamped external findings/ dir problem. So this
+# adapter follows browser_intel_leads()/attack_graph_leads()'s exact
+# wiring: called unconditionally in build_plan(), no opt-in directory
+# param, [] when neither source exists yet.
+
+# Every secrets_scanner.py finding `category` -> (existing hunt-* skill,
+# lead_board priority). No new skill names invented — all four already
+# exist and are already routed by lead_board.py's own ROUTES table for the
+# same kind of signal (source leaks, internal API surface, gated features,
+# GraphQL). Priority is keyed on the finding CATEGORY (a factual
+# classification of what was found), the same convention browser_intel_
+# leads() already uses when it hardcodes P_MED for a role/permission
+# constant above — NOT derived from secrets_scanner.py's evidence_type/
+# method fields. Those two fields describe provenance/mechanism (see that
+# module's EVIDENCE TYPING docstring section); turning a type into a
+# number happens ONLY in priority_score()/memory/attack_graph.py, never
+# here — this table is the same kind of pre-existing categorical routing
+# tag lead_board.py's ROUTES table already assigns per signal-type, not a
+# second confidence-to-number translation point.
+_SECRET_FINDING_ROUTE: dict[str, tuple[str, str]] = {
+    # Vendor-pattern matches and directory-proven signals: definite, not a
+    # statistical guess.
+    "cloud_credential": ("hunt-source-leak", lead_board.P_HIGH),
+    "vcs_credential": ("hunt-source-leak", lead_board.P_HIGH),
+    "chat_credential": ("hunt-source-leak", lead_board.P_HIGH),
+    "payment_credential": ("hunt-source-leak", lead_board.P_HIGH),
+    "auth_token": ("hunt-source-leak", lead_board.P_HIGH),
+    "private_key": ("hunt-source-leak", lead_board.P_HIGH),
+    "generic_secret": ("hunt-source-leak", lead_board.P_HIGH),
+    "exposed_sourcemap": ("hunt-source-leak", lead_board.P_HIGH),
+    # Statistical/heuristic detections: real signal, but not confirmed —
+    # same P_MED tier browser_intel_leads() already uses for its own
+    # heuristic (non-definite) finding categories.
+    "high_entropy_string": ("hunt-source-leak", lead_board.P_MED),
+    "internal_api_url": ("hunt-api-misconfig", lead_board.P_MED),
+    "feature_flag": ("hunt-auth-bypass", lead_board.P_MED),
+    "graphql_fragment": ("hunt-graphql", lead_board.P_MED),
+}
+
+
+def secret_scan_leads(target: str, recon_dir: str) -> list[dict]:
+    """Convert tools/secrets_scanner.py findings into lead-board-shaped
+    candidates via _SECRET_FINDING_ROUTE (category -> skill/priority)."""
+    findings = secrets_scanner.scan_all(recon_dir, target=target)
+    leads = []
+    for f in findings:
+        skill, priority = _SECRET_FINDING_ROUTE.get(f["category"], ("hunt-source-leak", lead_board.P_MED))
+        why = f"{f['category']} finding ({f['method']}, evidence_type={f.get('evidence_type', '?')})"
+        leads.append(_new_tool_lead(
+            target, skill, priority, f["category"], why,
+            f.get("match", ""), "secret-scan", f.get("file", ""),
+        ))
+    return leads
 
 
 # ─── Risk level (static heuristic tier — NOT a measured value) ─────────────
@@ -657,7 +960,11 @@ class Director:
     # ── plan construction ───────────────────────────────────────────────
 
     def build_plan(self, target: str, hours: float, memory_dir: str | None = None,
-                    recon_dir: str | None = None) -> Plan:
+                    recon_dir: str | None = None,
+                    rejection_lessons: list[dict] | None = None,
+                    takeover_findings_dir: str | None = None,
+                    cloud_findings_dir: str | None = None,
+                    graphql_findings_dir: str | None = None) -> Plan:
         if hours <= 0:
             raise ValueError("hours must be positive")
         memory_dir = memory_dir if memory_dir is not None else self.memory_dir
@@ -675,11 +982,30 @@ class Director:
         board_leads = [ld for ld in board_leads if ld.get("status") == "new"]
         bi_leads = browser_intel_leads(target, recon_dir)
         graph_leads = attack_graph_leads(target, recon_dir, memory_dir)
-        all_leads = board_leads + bi_leads + graph_leads
+        # Deterministic recon_dir-relative, like bi_leads/graph_leads above —
+        # unconditional, no opt-in param needed (Phase 5, Part C).
+        secret_leads = secret_scan_leads(target, recon_dir)
+
+        # Standalone-tool adapters (Phase 5, Part B) — all default None,
+        # so omitting them reproduces prior build_plan() behavior exactly.
+        # Unlike bi_leads/graph_leads, these tools don't write under
+        # recon_dir by default (see the module comment above
+        # takeover_leads()), so a caller must explicitly point at wherever
+        # a given run's output landed.
+        tool_leads: list[dict] = []
+        if takeover_findings_dir:
+            tool_leads += takeover_leads(target, takeover_findings_dir)
+        if cloud_findings_dir:
+            tool_leads += cloud_recon_leads(target, cloud_findings_dir)
+        if graphql_findings_dir:
+            tool_leads += graphql_audit_leads(target, graphql_findings_dir, recon_dir)
+
+        all_leads = board_leads + bi_leads + graph_leads + secret_leads + tool_leads
 
         candidates: list[dict] = []
         for lead in all_leads:
-            candidates.append(self._score_lead(lead, target, tech_stack, mem, tech_attack_matrix))
+            candidates.append(self._score_lead(lead, target, tech_stack, mem, tech_attack_matrix,
+                                                 rejection_lessons))
 
         # Highest EV/hour first (ties broken by priority score) — this is
         # "maximize expected value per hour", the Director's stated goal,
@@ -768,7 +1094,8 @@ class Director:
         return plan
 
     def _score_lead(self, lead: dict, target: str, tech_stack: list[str], mem: dict,
-                     tech_attack_matrix: dict | None = None) -> dict:
+                     tech_attack_matrix: dict | None = None,
+                     rejection_lessons: list[dict] | None = None) -> dict:
         vuln_class = skill_to_vuln_class(lead["skill"])
         score_result = priority_score(
             vuln_class=vuln_class, tech_stack=tech_stack, target=target,
@@ -788,9 +1115,21 @@ class Director:
             failed_patterns=mem["failed_patterns"],
         )
         has_signal = _has_affinity_signal(vuln_class, tech_stack, mem["patterns"], mem["failed_patterns"])
+
+        # Opt-in only: rejection_lessons is None unless a caller explicitly
+        # passed build_plan(rejection_lessons=extract_rejection_lessons(...)).
+        # See POLICY_EXCLUSION_REJECTION_RATE_THRESHOLD above.
+        policy_exclusion = None
+        for lesson in (rejection_lessons or []):
+            if (lesson.get("vuln_class") == vuln_class
+                    and lesson.get("rejection_rate", 0) >= POLICY_EXCLUSION_REJECTION_RATE_THRESHOLD):
+                policy_exclusion = lesson
+                break
+
         return {
             "lead": lead, "vuln_class": vuln_class, "score_result": score_result,
             "ev_result": ev_result, "dup_check": dup_check, "has_signal": has_signal, "skip_detail": "",
+            "policy_exclusion": policy_exclusion,
         }
 
     def _skip_reason(self, c: dict, budget_minutes_remaining: float) -> str | None:
@@ -804,6 +1143,11 @@ class Director:
         if dup_check["is_noise"] or c["score_result"]["hard_kill"]:
             c["skip_detail"] = c["score_result"].get("failed_pattern_reason") or "matches failed_patterns.jsonl"
             return "MATCHES_FAILED_PATTERN"
+        if c.get("policy_exclusion"):
+            lesson = c["policy_exclusion"]
+            c["skip_detail"] = (f"rejection_rate {lesson['rejection_rate']} for {lesson['vuln_class']} "
+                                 f"({lesson['basis']})")
+            return "POLICY_EXCLUDED"
         if ev_result["ev_label"] == _EV_FLOOR_LABEL:
             c["skip_detail"] = f"ev/hr {ev_result['ev_per_hour']} below floor (label={_EV_FLOOR_LABEL})"
             return "BELOW_EV_FLOOR"
@@ -1188,8 +1532,19 @@ class Director:
 
 def _cmd_build_plan(args: argparse.Namespace) -> int:
     director = Director(memory_dir=args.memory_dir)
-    plan = director.build_plan(args.target, args.hours, memory_dir=args.memory_dir,
-                                recon_dir=args.recon_dir)
+
+    rejection_lessons = None
+    if args.apply_rejection_lessons:
+        outcomes = ReportOutcomeDB(_memory_paths(args.memory_dir)["report_outcomes"]).read_all()
+        rejection_lessons = extract_rejection_lessons(outcomes)
+
+    plan = director.build_plan(
+        args.target, args.hours, memory_dir=args.memory_dir, recon_dir=args.recon_dir,
+        rejection_lessons=rejection_lessons,
+        takeover_findings_dir=args.takeover_findings_dir,
+        cloud_findings_dir=args.cloud_findings_dir,
+        graphql_findings_dir=args.graphql_findings_dir,
+    )
     if args.write:
         path = director.write_plan(plan, recon_dir=args.recon_dir)
         print(f"[+] wrote {path}")
@@ -1245,6 +1600,15 @@ def main(argv: list[str] | None = None) -> int:
                           help="Also write recon/<target>/hunt-plan.md and its hunt-plan.json sidecar")
     p_build.add_argument("--plan-file", default=None,
                           help="Override path for the JSON sidecar (default: recon/<target>/hunt-plan.json)")
+    p_build.add_argument("--apply-rejection-lessons", action="store_true",
+                          help="Opt-in (Phase 5): compute extract_rejection_lessons() from "
+                               "report_outcomes.jsonl and let matching leads skip as POLICY_EXCLUDED")
+    p_build.add_argument("--takeover-findings-dir", default=None,
+                          help="Phase 5: dir a takeover_scanner.sh run wrote to (not recon-dir-relative)")
+    p_build.add_argument("--cloud-findings-dir", default=None,
+                          help="Phase 5: dir a cloud_recon.sh run wrote to (not recon-dir-relative)")
+    p_build.add_argument("--graphql-findings-dir", default=None,
+                          help="Phase 5: dir a graphql_audit.sh run wrote to (not recon-dir-relative)")
     p_build.set_defaults(func=_cmd_build_plan)
 
     p_replan = sub.add_parser("replan", help="Update a saved plan with results-so-far, across process boundaries")

@@ -8,10 +8,15 @@ from memory.vuln_intelligence import (
     HypothesisDB,
     ReportOutcomeDB,
     VULN_IMPACT_POTENTIAL,
+    MIN_SAMPLES_FOR_DEDUP_PROBABILITY,
+    MAX_IMPACT_RECALIBRATION_WEIGHT,
+    DEFAULT_DEDUP_PROBABILITY,
     chain_priority,
+    dedup_probability,
     duplicate_or_noise_check,
     endpoint_shape_stats,
     expected_value_per_hour,
+    extract_rejection_lessons,
     format_browser_test_plan,
     format_decision,
     hypothesis_calibration,
@@ -833,3 +838,172 @@ class TestFormatBrowserTestPlan:
     def test_sections_appear_in_order(self):
         out = format_browser_test_plan(reason="R", target_flow="F", expected_weakness="W")
         assert out.index("Reason:") < out.index("Target flow:") < out.index("Expected weakness:")
+
+
+class TestDedupProbability:
+    """Historical duplicate-rate signal (Part A) — derived only from real
+    report_outcomes.jsonl entries, never a fabricated number."""
+
+    def test_cold_start_with_no_report_outcomes(self):
+        result = dedup_probability("idor", report_outcomes=[])
+        assert result["probability"] == DEFAULT_DEDUP_PROBABILITY
+        assert result["sample_size"] == 0
+        assert "cold start" in result["basis"]
+
+    def test_below_min_samples_falls_back_to_cold_start(self):
+        outcomes = [{"vuln_class": "idor", "outcome": "duplicate"} for _ in range(MIN_SAMPLES_FOR_DEDUP_PROBABILITY - 1)]
+        result = dedup_probability("idor", report_outcomes=outcomes)
+        assert result["sample_size"] == 0
+        assert result["probability"] == DEFAULT_DEDUP_PROBABILITY
+
+    def test_real_duplicate_rate_once_min_samples_cleared(self):
+        outcomes = (
+            [{"vuln_class": "idor", "outcome": "duplicate"}] * 4
+            + [{"vuln_class": "idor", "outcome": "accepted"}]
+        )
+        result = dedup_probability("idor", report_outcomes=outcomes)
+        assert result["sample_size"] == 5
+        assert result["probability"] == 0.8
+        assert "vuln_class" in result["basis"]
+
+    def test_other_vuln_classes_dont_pollute_the_bucket(self):
+        outcomes = (
+            [{"vuln_class": "idor", "outcome": "duplicate"}] * 5
+            + [{"vuln_class": "xss", "outcome": "accepted"}] * 5
+        )
+        result = dedup_probability("xss", report_outcomes=outcomes)
+        assert result["sample_size"] == 5
+        assert result["probability"] == 0.0
+
+    def test_endpoint_shape_narrows_the_bucket_when_present(self):
+        matching = [{"vuln_class": "idor", "outcome": "duplicate", "endpoint": "/api/users/1"}] * 5
+        non_matching = [{"vuln_class": "idor", "outcome": "accepted", "endpoint": "/api/orders/1"}] * 5
+        result = dedup_probability("idor", endpoint_shape=normalize_endpoint("/api/users/999"),
+                                    report_outcomes=matching + non_matching)
+        assert result["sample_size"] == 5
+        assert result["probability"] == 1.0
+        assert "endpoint_shape" in result["basis"]
+
+    def test_program_narrows_via_platform_field(self):
+        h1 = [{"vuln_class": "ssrf", "outcome": "duplicate", "platform": "hackerone"}] * 5
+        bc = [{"vuln_class": "ssrf", "outcome": "accepted", "platform": "bugcrowd"}] * 5
+        result = dedup_probability("ssrf", program="hackerone", report_outcomes=h1 + bc)
+        assert result["sample_size"] == 5
+        assert result["probability"] == 1.0
+
+    def test_entries_missing_new_optional_fields_dont_match_narrow_buckets(self):
+        # Old entries saved before endpoint/tech_stack existed shouldn't
+        # silently match a narrowed bucket they carry no data for.
+        old_entries = [{"vuln_class": "idor", "outcome": "duplicate"}] * 5
+        result = dedup_probability("idor", endpoint_shape="/api/users/{id}", report_outcomes=old_entries)
+        # falls through the endpoint_shape bucket (0 matches) to the
+        # vuln_class-only bucket, which does clear the sample minimum
+        assert result["sample_size"] == 5
+        assert result["basis"] == "5 real report_outcomes entries matched on vuln_class"
+
+
+class TestDedupProbabilityWiredIntoPriorityScore:
+    """Same additive-optional-param discipline as tech_attack_matrix (Phase 3)."""
+
+    def test_omitting_param_reproduces_prior_score_exactly(self):
+        patterns = [{"vuln_class": "idor", "tech_stack": ["express"], "payout": 1000, "target": "a.com"}]
+        before = priority_score("idor", ["express"], "a.com", patterns=patterns, failed_patterns=[], chains=[])
+        after = priority_score("idor", ["express"], "a.com", patterns=patterns, failed_patterns=[], chains=[],
+                                dedup_probability_result=None)
+        assert before == after
+
+    def test_cold_start_dedup_result_never_discounts_score(self):
+        patterns = [{"vuln_class": "idor", "tech_stack": ["express"], "payout": 1000, "target": "a.com"}]
+        baseline = priority_score("idor", ["express"], "a.com", patterns=patterns, failed_patterns=[], chains=[])
+        cold = dedup_probability("idor", report_outcomes=[])
+        with_cold = priority_score("idor", ["express"], "a.com", patterns=patterns, failed_patterns=[], chains=[],
+                                    dedup_probability_result=cold)
+        assert with_cold["score"] == baseline["score"]
+        assert with_cold["components"]["dedup_penalty"] == 0
+
+    def test_sample_backed_high_dedup_probability_reduces_score(self):
+        patterns = [{"vuln_class": "idor", "tech_stack": ["express"], "payout": 1000, "target": "a.com"}]
+        baseline = priority_score("idor", ["express"], "a.com", patterns=patterns, failed_patterns=[], chains=[])
+        hot = {"probability": 1.0, "sample_size": MIN_SAMPLES_FOR_DEDUP_PROBABILITY, "basis": "test"}
+        discounted = priority_score("idor", ["express"], "a.com", patterns=patterns, failed_patterns=[], chains=[],
+                                     dedup_probability_result=hot)
+        assert discounted["score"] < baseline["score"]
+        # dedup_penalty = pre-penalty base * MAX_IMPACT_RECALIBRATION_WEIGHT (the
+        # SAME existing "real data pulls a prior at most halfway" constant
+        # _recalibrated_impact() uses) * probability — never a flat magic number.
+        components = baseline["components"]
+        base = (components["impact_potential"] + components["historical_success_probability"]
+                + components["technology_match"] + components["attack_chain_probability"]) / 4
+        expected_penalty = round(base * MAX_IMPACT_RECALIBRATION_WEIGHT * hot["probability"])
+        assert discounted["components"]["dedup_penalty"] == expected_penalty
+
+    def test_dedup_penalty_never_exceeds_half_of_pre_penalty_base(self):
+        # MAX_IMPACT_RECALIBRATION_WEIGHT=0.5 caps it structurally, for any
+        # probability up to and including 1.0 (the maximum possible).
+        patterns = [{"vuln_class": "idor", "tech_stack": ["express"], "payout": 1000, "target": "a.com"}]
+        baseline = priority_score("idor", ["express"], "a.com", patterns=patterns, failed_patterns=[], chains=[])
+        components = baseline["components"]
+        base = (components["impact_potential"] + components["historical_success_probability"]
+                + components["technology_match"] + components["attack_chain_probability"]) / 4
+        hot = {"probability": 1.0, "sample_size": MIN_SAMPLES_FOR_DEDUP_PROBABILITY, "basis": "test"}
+        discounted = priority_score("idor", ["express"], "a.com", patterns=patterns, failed_patterns=[], chains=[],
+                                     dedup_probability_result=hot)
+        assert discounted["components"]["dedup_penalty"] <= round(base * MAX_IMPACT_RECALIBRATION_WEIGHT) + 1  # rounding slack
+
+    def test_expected_value_per_hour_omitting_param_reproduces_prior_exactly(self):
+        before = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[])
+        after = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                         dedup_probability_result=None)
+        assert before == after
+
+    def test_expected_value_per_hour_discounts_payout_probability_when_sample_backed(self):
+        outcomes = [{"vuln_class": "idor", "outcome": "accepted"}]
+        baseline = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                            report_outcomes=outcomes)
+        hot = {"probability": 0.9, "sample_size": MIN_SAMPLES_FOR_DEDUP_PROBABILITY, "basis": "test"}
+        discounted = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                              report_outcomes=outcomes, dedup_probability_result=hot)
+        assert discounted["payout_probability"] < baseline["payout_probability"]
+
+
+class TestExtractRejectionLessons:
+    """Never emits below min_samples — a rejection 'lesson' backed by a
+    handful of noisy outcomes is not a pattern."""
+
+    def test_below_min_samples_emits_nothing(self):
+        outcomes = [{"vuln_class": "xss", "outcome": "not_applicable"} for _ in range(4)]
+        assert extract_rejection_lessons(outcomes, min_samples=5) == []
+
+    def test_meets_min_samples_emits_a_lesson(self):
+        outcomes = (
+            [{"vuln_class": "xss", "outcome": "not_applicable", "notes": "CSP blocks execution"}] * 4
+            + [{"vuln_class": "xss", "outcome": "informative", "notes": "CSP blocks execution"}]
+            + [{"vuln_class": "xss", "outcome": "accepted"}]
+        )
+        lessons = extract_rejection_lessons(outcomes, min_samples=5)
+        assert len(lessons) == 1
+        lesson = lessons[0]
+        assert lesson["vuln_class"] == "xss"
+        assert lesson["sample_size"] == 5
+        assert lesson["total_outcomes"] == 6
+        assert lesson["top_reasons"][0] == {"text": "CSP blocks execution", "count": 5}
+
+    def test_duplicate_outcome_not_counted_as_rejection(self):
+        # dedup_probability() owns the "duplicate" signal; rejection lessons
+        # are specifically not_applicable/informative.
+        outcomes = [{"vuln_class": "ssrf", "outcome": "duplicate"} for _ in range(10)]
+        assert extract_rejection_lessons(outcomes, min_samples=5) == []
+
+    def test_empty_report_outcomes_emits_nothing(self):
+        assert extract_rejection_lessons([]) == []
+
+    def test_notes_never_fabricated_only_verbatim(self):
+        outcomes = [{"vuln_class": "cors", "outcome": "not_applicable", "notes": "self-XSS, no impact"}] * 5
+        lessons = extract_rejection_lessons(outcomes, min_samples=5)
+        assert lessons[0]["top_reasons"][0]["text"] == "self-XSS, no impact"
+
+    def test_entries_without_notes_dont_crash_and_yield_no_reasons(self):
+        outcomes = [{"vuln_class": "misconfig", "outcome": "not_applicable"}] * 5
+        lessons = extract_rejection_lessons(outcomes, min_samples=5)
+        assert lessons[0]["sample_size"] == 5
+        assert lessons[0]["top_reasons"] == []

@@ -72,6 +72,7 @@
     {"name": "scope_checker.py", "path": "tools/scope_checker.py", "description": "Deterministic scope safety checker — anchored allowlist/blocklist matching before any outbound request"},
     {"name": "scope_aggregator.sh", "path": "tools/scope_aggregator.sh", "description": "Multi-platform in-scope asset pull (bbscope + bounty-targets-data dump)"},
     {"name": "secrets_hunter.sh", "path": "tools/secrets_hunter.sh", "description": "trufflehog/noseyparker/gitleaks wrapper for filesystem/git/JS-bundle/GitHub-org secret scanning"},
+    {"name": "secrets_scanner.py", "path": "tools/secrets_scanner.py", "description": "Pattern + Shannon-entropy + JS-signal secret scanner over Phase 1's recovered source maps and cicd_scanner.sh output (no network I/O)"},
     {"name": "takeover_scanner.sh", "path": "tools/takeover_scanner.sh", "description": "dnsReaper/subjack subdomain-takeover scanner with built-in fingerprint-grep fallback"},
     {"name": "cloud_recon.sh", "path": "tools/cloud_recon.sh", "description": "S3Scanner + cloud_enum + CloudFail wrapper for public bucket discovery and CloudFlare-bypass origin IPs"},
     {"name": "param_discovery.sh", "path": "tools/param_discovery.sh", "description": "Arjun/x8 hidden-parameter discovery"},

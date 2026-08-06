@@ -164,6 +164,291 @@ class TestBrowserIntelLeads:
         assert lb.load_ledger("t.example") == []
 
 
+class TestTakeoverLeads:
+    """Part B — tools/takeover_scanner.sh output -> lead-board leads. The
+    scanner writes to a timestamped findings/takeover/<ts>/ dir outside
+    recon/, so the caller passes that exact dir (not a recon-dir glob)."""
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert director.takeover_leads("t.example", str(tmp_path / "nope")) == []
+
+    def test_dnsreaper_json_becomes_high_priority_lead(self, tmp_path):
+        d = tmp_path / "takeover"
+        d.mkdir()
+        (d / "dnsreaper.json").write_text(json.dumps([
+            {"domain": "old.t.example", "fingerprint": "github-pages"},
+        ]))
+        leads = director.takeover_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["skill"] == "hunt-subdomain"
+        assert leads[0]["priority"] == "high"
+        assert leads[0]["source"] == "takeover-scan"
+        assert leads[0]["tool_artifact"] == "dnsreaper.json"
+
+    def test_subjack_txt_lines_become_leads(self, tmp_path):
+        d = tmp_path / "takeover"
+        d.mkdir()
+        (d / "subjack.txt").write_text("stale.t.example [VULNERABLE] [heroku]\n")
+        leads = director.takeover_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "high"
+
+    def test_fingerprint_grep_fallback_is_medium_priority(self, tmp_path):
+        d = tmp_path / "takeover"
+        d.mkdir()
+        (d / "fingerprint_grep.txt").write_text("stale2.t.example  s3\n")
+        leads = director.takeover_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "med"
+
+    def test_malformed_dnsreaper_json_does_not_raise(self, tmp_path):
+        d = tmp_path / "takeover"
+        d.mkdir()
+        (d / "dnsreaper.json").write_text("{not json")
+        assert director.takeover_leads("t.example", str(d)) == []
+
+    def test_empty_dir_returns_empty(self, tmp_path):
+        d = tmp_path / "takeover"
+        d.mkdir()
+        assert director.takeover_leads("t.example", str(d)) == []
+
+
+class TestCloudReconLeads:
+    """Part B — tools/cloud_recon.sh output -> lead-board leads, always
+    P_HIGH per spec ('often critical when real')."""
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert director.cloud_recon_leads("t.example", str(tmp_path / "nope")) == []
+
+    def test_s3scanner_hit_line_becomes_lead(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "s3scanner.txt").write_text(
+            "t-example-backups | bucket_exists | AWS | us-east-1 | public\n"
+            "t-example-nope | bucket_not_exist\n"
+        )
+        leads = director.cloud_recon_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["skill"] == "hunt-cloud-misconfig"
+        assert leads[0]["priority"] == "high"
+        assert "public" in leads[0]["evidence"]
+
+    def test_cloud_enum_every_line_becomes_a_lead(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "cloud_enum.txt").write_text("t-example.blob.core.windows.net\n")
+        leads = director.cloud_recon_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["source"] == "cloud-recon"
+
+    def test_cloudfail_found_line_becomes_lead(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "cloudfail.txt").write_text("[FOUND] 203.0.113.5 -- possible origin\nclean line\n")
+        leads = director.cloud_recon_leads("t.example", str(d))
+        assert len(leads) == 1
+
+    def test_non_cf_ips_all_lines_become_leads(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "non_cf_ips.txt").write_text("origin.t.example -> 203.0.113.9\n")
+        leads = director.cloud_recon_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["tool_artifact"] == "non_cf_ips.txt"
+
+
+class TestGraphqlAuditLeads:
+    """Part B — tools/graphql_audit.sh output -> hunt-graphql leads tagged
+    api_style=graphql, optionally cross-referenced against Phase 3's
+    fingerprint.json."""
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert director.graphql_audit_leads("t.example", str(tmp_path / "nope")) == []
+
+    def test_introspection_enabled_becomes_high_priority_lead(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        (d / "introspection.json").write_text(json.dumps({"data": {"__schema": {"types": []}}}))
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["skill"] == "hunt-graphql"
+        assert leads[0]["priority"] == "high"
+        assert leads[0]["source"] == "graphql-audit"
+        assert "api_style=graphql" in leads[0]["why"]
+
+    def test_empty_output_files_emit_no_leads(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        (d / "batching_dos.txt").write_text("")
+        (d / "introspection.json").write_text("")
+        assert director.graphql_audit_leads("t.example", str(d)) == []
+
+    def test_multiple_signal_files_each_become_a_lead(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        (d / "batching_dos.txt").write_text("10 queries batched, all 200 OK\n")
+        (d / "alias_bomb.txt").write_text("500 aliases accepted in one request\n")
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 2
+        assert all(l["skill"] == "hunt-graphql" for l in leads)
+
+    def test_fingerprint_confirmation_tag_when_api_style_present(self, tmp_path):
+        recon_dir = tmp_path / "recon" / "t.example"
+        recon_dir.mkdir(parents=True)
+        (recon_dir / "fingerprint.json").write_text(json.dumps({"api_style": ["graphql"]}))
+        gd = tmp_path / "graphql"
+        gd.mkdir()
+        (gd / "introspection.json").write_text(json.dumps({"data": {}}))
+        leads = director.graphql_audit_leads("t.example", str(gd), str(recon_dir))
+        assert "fingerprint-confirmed" in leads[0]["why"]
+
+    def test_no_fingerprint_file_still_emits_leads_without_confirmation_tag(self, tmp_path):
+        gd = tmp_path / "graphql"
+        gd.mkdir()
+        (gd / "introspection.json").write_text(json.dumps({"data": {}}))
+        leads = director.graphql_audit_leads("t.example", str(gd), str(tmp_path / "recon" / "nope"))
+        assert leads and "fingerprint-confirmed" not in leads[0]["why"]
+
+
+class TestSecretScanLeads:
+    """Part C — tools/secrets_scanner.py findings -> lead-board leads.
+    Deterministic recon_dir-relative paths (unlike Part B's three tools),
+    so no findings_dir param needed here."""
+
+    def test_no_sources_or_cicd_dir_returns_empty(self, tmp_path):
+        assert director.secret_scan_leads("t.example", str(tmp_path / "recon" / "t.example")) == []
+
+    def test_pattern_match_becomes_high_priority_source_leak_lead(self, tmp_path):
+        recon_dir = tmp_path / "recon" / "t.example"
+        bundle = recon_dir / "browser" / "sources" / "main.bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "app.ts").write_text('const k = "AKIAIOSFODNN7EXAMPLE";')
+        leads = director.secret_scan_leads("t.example", str(recon_dir))
+        cred_leads = [l for l in leads if l["signal"] == "cloud_credential"]
+        assert cred_leads
+        assert cred_leads[0]["skill"] == "hunt-source-leak"
+        assert cred_leads[0]["priority"] == "high"
+        assert cred_leads[0]["source"] == "secret-scan"
+
+    def test_entropy_only_finding_becomes_medium_priority(self, tmp_path):
+        recon_dir = tmp_path / "recon" / "t.example"
+        bundle = recon_dir / "browser" / "sources" / "main.bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "app.ts").write_text('const t = "aZ9kLm3pQwErTyUiOpAsDfGhJkLzXcVbNm12";')
+        leads = director.secret_scan_leads("t.example", str(recon_dir))
+        entropy_leads = [l for l in leads if l["signal"] == "high_entropy_string"]
+        assert entropy_leads
+        assert entropy_leads[0]["priority"] == "med"
+
+    def test_internal_api_url_routes_to_api_misconfig_skill(self, tmp_path):
+        recon_dir = tmp_path / "recon" / "t.example"
+        bundle = recon_dir / "browser" / "sources" / "main.bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "app.ts").write_text('fetch("http://admin-api.internal.t.example/x");')
+        leads = director.secret_scan_leads("t.example", str(recon_dir))
+        assert any(l["skill"] == "hunt-api-misconfig" for l in leads)
+
+    def test_feature_flag_routes_to_auth_bypass_skill(self, tmp_path):
+        recon_dir = tmp_path / "recon" / "t.example"
+        bundle = recon_dir / "browser" / "sources" / "main.bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "app.ts").write_text("if (flags.betaDashboard) { render(); }")
+        leads = director.secret_scan_leads("t.example", str(recon_dir))
+        assert any(l["skill"] == "hunt-auth-bypass" for l in leads)
+
+    def test_graphql_fragment_routes_to_graphql_skill(self, tmp_path):
+        recon_dir = tmp_path / "recon" / "t.example"
+        bundle = recon_dir / "browser" / "sources" / "main.bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "app.ts").write_text("fragment UserFields on User { id name }")
+        leads = director.secret_scan_leads("t.example", str(recon_dir))
+        assert any(l["skill"] == "hunt-graphql" for l in leads)
+
+    def test_exposed_sourcemap_directory_evidence_becomes_high_priority_lead(self, tmp_path):
+        recon_dir = tmp_path / "recon" / "t.example"
+        (recon_dir / "browser" / "sources" / "main.bundle").mkdir(parents=True)
+        leads = director.secret_scan_leads("t.example", str(recon_dir))
+        sm_leads = [l for l in leads if l["signal"] == "exposed_sourcemap"]
+        assert sm_leads and sm_leads[0]["priority"] == "high"
+
+    def test_cicd_findings_feed_the_same_pipeline_not_a_separate_lead_type(self, tmp_path):
+        # Part B's deferred requirement: cicd_scanner.sh output goes through
+        # Part C's scanner, not a distinct adapter/skill category.
+        recon_dir = tmp_path / "recon" / "t.example"
+        cicd = recon_dir / "cicd" / "acme-org"
+        cicd.mkdir(parents=True)
+        (cicd / "scan_results.txt").write_text("ghp_" + "a" * 36)
+        leads = director.secret_scan_leads("t.example", str(recon_dir))
+        assert any(l["skill"] == "hunt-source-leak" for l in leads)
+
+
+class TestBuildPlanSecretScanWiring:
+    """secret_scan_leads() is wired unconditionally into build_plan(),
+    same as browser_intel_leads()/attack_graph_leads() — no opt-in param,
+    since both its data sources are already deterministic recon_dir-
+    relative paths, empty for every existing fixture."""
+
+    def test_no_sources_or_cicd_dir_reproduces_prior_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d1 = director.Director(memory_dir=str(tmp_path / "hunt-memory-a"))
+        d2 = director.Director(memory_dir=str(tmp_path / "hunt-memory-b"))
+        plan_a = d1.build_plan("t.example", hours=5, recon_dir=rd)
+        plan_b = d2.build_plan("t.example", hours=5, recon_dir=rd)
+        assert len(plan_a.attacks) == len(plan_b.attacks)
+
+    def test_secret_finding_adds_a_candidate_to_the_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        bundle = Path(rd) / "browser" / "sources" / "main.bundle"
+        bundle.mkdir(parents=True)
+        (bundle / "app.ts").write_text('const k = "AKIAIOSFODNN7EXAMPLE";')
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+        all_evidence = [a.evidence for a in plan.attacks] + [[s["evidence"]] for s in plan.skipped]
+        flat = [e for group in all_evidence for e in group]
+        assert any("AKIA" in e for e in flat)
+
+
+class TestBuildPlanToolAdapterWiring:
+    """The three Part B adapters are additive/opt-in on build_plan() —
+    omitting their *_findings_dir params must reproduce prior behavior
+    exactly, matching the tech_attack_matrix/rejection_lessons precedent."""
+
+    def test_omitting_findings_dirs_reproduces_prior_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d1 = director.Director(memory_dir=str(tmp_path / "hunt-memory-a"))
+        d2 = director.Director(memory_dir=str(tmp_path / "hunt-memory-b"))
+        plan_default = d1.build_plan("t.example", hours=5, recon_dir=rd)
+        plan_explicit_none = d2.build_plan(
+            "t.example", hours=5, recon_dir=rd,
+            takeover_findings_dir=None, cloud_findings_dir=None, graphql_findings_dir=None,
+        )
+        assert len(plan_default.attacks) == len(plan_explicit_none.attacks)
+        assert sorted(s["reason"] for s in plan_default.skipped) == \
+               sorted(s["reason"] for s in plan_explicit_none.skipped)
+
+    def test_takeover_findings_dir_adds_candidates_to_the_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        takeover_dir = tmp_path / "takeover"
+        takeover_dir.mkdir()
+        (takeover_dir / "subjack.txt").write_text("stale.t.example [VULNERABLE] [github]\n")
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd, takeover_findings_dir=str(takeover_dir))
+        all_evidence = [a.evidence for a in plan.attacks] + [[s["evidence"]] for s in plan.skipped]
+        flat = [e for group in all_evidence for e in group]
+        assert any("stale.t.example" in e for e in flat)
+
+    def test_cloud_findings_dir_adds_candidates_to_the_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        cloud_dir = tmp_path / "cloud"
+        cloud_dir.mkdir()
+        (cloud_dir / "non_cf_ips.txt").write_text("origin.t.example -> 203.0.113.9\n")
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd, cloud_findings_dir=str(cloud_dir))
+        all_evidence = [a.evidence for a in plan.attacks] + [[s["evidence"]] for s in plan.skipped]
+        flat = [e for group in all_evidence for e in group]
+        assert any("203.0.113.9" in e for e in flat)
+
+
 class TestBuildPlanBasics:
 
     def test_empty_memory_directory_works(self, isolated, tmp_path):
@@ -312,6 +597,49 @@ class TestSkippedSection:
         assert "ALWAYS_REJECTED" not in reasons
         assert "POLICY_EXCLUDED" not in reasons
         assert {"ALWAYS_REJECTED", "POLICY_EXCLUDED"} <= set(director.SKIP_REASONS)
+
+    def test_policy_excluded_fires_only_when_rejection_lessons_explicitly_passed(self, isolated, tmp_path):
+        """Part A: extract_rejection_lessons() output is opt-in via
+        build_plan(rejection_lessons=...) — POLICY_EXCLUDED must never
+        appear unless a caller explicitly supplies a lesson clearing
+        POLICY_EXCLUSION_REJECTION_RATE_THRESHOLD."""
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        leads = lb.load_ledger("t.example")
+        idor_lead = next(l for l in leads if l["skill"] == "hunt-idor")
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+
+        lessons = [{
+            "vuln_class": "idor", "rejection_rate": 1.0, "sample_size": 5,
+            "total_outcomes": 5, "top_reasons": [], "basis": "5 real not_applicable outcomes",
+        }]
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd, rejection_lessons=lessons)
+        skipped_idor = [s for s in plan.skipped if s["lead_id"] == idor_lead["id"]]
+        assert skipped_idor and skipped_idor[0]["reason"] == "POLICY_EXCLUDED"
+        assert "idor" in skipped_idor[0]["detail"]
+
+    def test_policy_excluded_not_emitted_below_unanimous_rejection_rate(self, isolated, tmp_path):
+        # Anything short of unanimous (1.0) — even 0.99 — deliberately does
+        # NOT auto-fire; see POLICY_EXCLUSION_REJECTION_RATE_THRESHOLD's
+        # comment on why 1.0 is the only non-arbitrary cutoff available.
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        lessons = [{
+            "vuln_class": "idor", "rejection_rate": 0.99, "sample_size": 100,
+            "total_outcomes": 100, "top_reasons": [], "basis": "test",
+        }]
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd, rejection_lessons=lessons)
+        reasons = {s["reason"] for s in plan.skipped}
+        assert "POLICY_EXCLUDED" not in reasons
+
+    def test_rejection_lessons_default_none_reproduces_prior_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d1 = director.Director(memory_dir=str(tmp_path / "hunt-memory-a"))
+        d2 = director.Director(memory_dir=str(tmp_path / "hunt-memory-b"))
+        plan_default = d1.build_plan("t.example", hours=5, recon_dir=rd)
+        plan_explicit_none = d2.build_plan("t.example", hours=5, recon_dir=rd, rejection_lessons=None)
+        reasons_default = sorted(s["reason"] for s in plan_default.skipped)
+        reasons_explicit = sorted(s["reason"] for s in plan_explicit_none.skipped)
+        assert reasons_default == reasons_explicit
 
 
 class TestFalsifiersAndStopConditions:
@@ -695,6 +1023,55 @@ class TestPlanFileCLI:
         assert exit_code == 0
         after = director.load_plan(plan_file)
         assert [a.state for a in before.attacks] == [a.state for a in after.attacks]
+
+    def test_build_plan_cli_without_new_phase5_flags_still_works(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        exit_code = director.main([
+            "build-plan", "t.example", "--hours", "3",
+            "--memory-dir", str(tmp_path / "hunt-memory"), "--recon-dir", rd,
+        ])
+        assert exit_code == 0
+
+    def test_build_plan_cli_accepts_findings_dir_flags(self, isolated, tmp_path, capsys):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        capsys.readouterr()  # discard _seed_leads' ingest stdout
+        takeover_dir = tmp_path / "takeover"
+        takeover_dir.mkdir()
+        (takeover_dir / "subjack.txt").write_text("stale.t.example [VULNERABLE] [github]\n")
+        exit_code = director.main([
+            "build-plan", "t.example", "--hours", "5",
+            "--memory-dir", str(tmp_path / "hunt-memory"), "--recon-dir", rd,
+            "--takeover-findings-dir", str(takeover_dir),
+        ])
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "stale.t.example" in out
+
+    def test_build_plan_cli_apply_rejection_lessons_flag(self, isolated, tmp_path, capsys):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        capsys.readouterr()  # discard _seed_leads' ingest stdout
+        mem_dir = tmp_path / "hunt-memory"
+        outcomes_db = ReportOutcomeDB(mem_dir / "report_outcomes.jsonl")
+        for i in range(5):
+            entry = make_report_outcome_entry(
+                target="other.example", vuln_class="idor", outcome="not_applicable",
+                notes="behind auth, not exploitable",
+            )
+            # ReportOutcomeDB dedups on (target, vuln_class, outcome, ts) —
+            # give each entry a distinct ts so all 5 land as separate rows
+            # instead of collapsing into one same-second "duplicate" save.
+            entry["ts"] = f"2026-01-0{i + 1}T00:00:00Z"
+            outcomes_db.save(entry)
+        exit_code = director.main([
+            "build-plan", "t.example", "--hours", "5",
+            "--memory-dir", str(mem_dir), "--recon-dir", rd,
+            "--apply-rejection-lessons",
+        ])
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        plan_dict = json.loads(out)
+        reasons = {s["reason"] for s in plan_dict["skipped"]}
+        assert "POLICY_EXCLUDED" in reasons
 
 
 class TestShouldStopIntegration:

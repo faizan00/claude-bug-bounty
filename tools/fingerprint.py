@@ -106,6 +106,12 @@ from tools.waf_response_analyzer import WAFSignatureDB  # noqa: E402
 from memory.schemas import CURRENT_SCHEMA_VERSION, validate_target_profile  # noqa: E402
 
 DEFAULT_MATRIX_PATH = str(Path(__file__).resolve().parent / "tech_attack_matrix.json")
+# Phase 5, Part D: where tools/learn.py's opt-in live NVD/GitHub-Advisory
+# lookups get cached, kept separate from the hand-curated DEFAULT_MATRIX_PATH
+# file so auto-fetched entries never intermix with reviewed ones in the same
+# tracked file. Same version_ranges/vulns shape as tech_attack_matrix.json —
+# see merge_tech_attack_matrix() below.
+DEFAULT_LIVE_CVE_CACHE_PATH = str(Path(__file__).resolve().parent / "tech_attack_matrix_live_cache.json")
 
 # ─── Phase 1 / recon-engine readers — pure file I/O, no network ───────────
 
@@ -434,7 +440,9 @@ def _match_cves(tag: str, version: str | None, matrix: dict) -> list[dict]:
 def load_tech_attack_matrix(path: str = DEFAULT_MATRIX_PATH) -> dict:
     """Best-effort: missing/malformed file resolves to {} rather than
     raising — an empty matrix is a legitimate state (no CVE/weight data
-    available yet), the same convention load_tech_stack() uses."""
+    available yet), the same convention load_tech_stack() uses. Also used
+    to load DEFAULT_LIVE_CVE_CACHE_PATH — identical shape, identical
+    missing-file convention, no reason to duplicate this reader."""
     p = Path(path)
     if not p.exists():
         return {}
@@ -443,6 +451,59 @@ def load_tech_attack_matrix(path: str = DEFAULT_MATRIX_PATH) -> dict:
     except (ValueError, OSError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def save_tech_attack_matrix_cache(matrix: dict, path: str = DEFAULT_LIVE_CVE_CACHE_PATH) -> None:
+    """Pure JSON write — no network. Symmetric with load_tech_attack_matrix()
+    for DEFAULT_LIVE_CVE_CACHE_PATH; tools/learn.py calls this after an
+    opt-in live fetch, never this module."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(matrix, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def merge_tech_attack_matrix(static: dict, live: dict) -> dict:
+    """Combine two tech_attack_matrix.json-shaped dicts (the hand-curated
+    static file + an auto-fetched live-CVE cache) into one — pure, no
+    network, no mutation of either input. Same version_ranges/vulns shape
+    both sides already use, so the result needs no new parsing logic
+    anywhere: _match_cves()/_matrix_technology_match() (and, through them,
+    priority_score()'s tech_attack_matrix param) consume it exactly like
+    any other matrix dict — one formula, one schema, two data sources."""
+    merged: dict = {tag: {"version_ranges": list(entry.get("version_ranges", []))}
+                     for tag, entry in (static or {}).items()}
+    for tag, entry in (live or {}).items():
+        if tag in merged:
+            merged[tag]["version_ranges"] = merged[tag]["version_ranges"] + list(entry.get("version_ranges", []))
+        else:
+            merged[tag] = {"version_ranges": list(entry.get("version_ranges", []))}
+    return merged
+
+
+def has_cve_for(tag: str, version: str | None, matrix: dict) -> bool:
+    """True if `matrix` already carries a real, non-null cve for tag+version
+    — thin public wrapper around _match_cves() so callers outside this
+    module (tools/learn.py's opt-in live-fetch path) don't need to reach
+    into a private function to answer "do we already know a real CVE here,
+    or is this actually a gap worth an opt-in network call?"."""
+    return bool(_match_cves(tag, version, matrix))
+
+
+# Exact severity-tier boundary weights _severity_for_weight() above already
+# treats as canonical (>=90 critical, >=70 high, >=40 medium, else low) —
+# reused here in reverse (severity string -> the boundary weight for that
+# tier) rather than inventing new numbers. "low" reuses 20, the exact same
+# cold-start technology_match floor _matrix_technology_match() already
+# returns elsewhere in this file — not a new constant, the same one.
+_SEVERITY_WEIGHT_TIERS = {"critical": 90, "high": 70, "medium": 40, "moderate": 40, "low": 20}
+
+
+def severity_weight_tier(severity: str) -> int:
+    """Map a GitHub-Advisory/NVD severity string to the existing tier
+    boundary weight. Unknown/missing severity falls to the "low" boundary
+    (20) — the same graceful-unknown floor this file already uses, not a
+    fabricated middle-ground guess."""
+    return _SEVERITY_WEIGHT_TIERS.get((severity or "").lower(), _SEVERITY_WEIGHT_TIERS["low"])
 
 
 def build_fingerprint(
@@ -574,11 +635,46 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--matrix", default=DEFAULT_MATRIX_PATH)
     parser.add_argument("--bypass-dir", default="findings/bypass")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--live-cve-lookup", action="store_true",
+        help="Phase 5, Part D: OPT-IN NEW NETWORK CALL (default OFF). Fetch+cache real CVE "
+             "data from GitHub Advisory DB + NVD (via tools/learn.py) for the fingerprinted "
+             "framework+version when tech_attack_matrix.json has no real cve for it yet. "
+             "Every other code path in this module stays offline — see module docstring.",
+    )
+    parser.add_argument(
+        "--live-cve-cache", default=None,
+        help="override path for the live-CVE cache (default: tools/tech_attack_matrix_live_cache.json)",
+    )
     args = parser.parse_args(argv)
 
     recon_dir = args.recon_dir or f"recon/{args.target}"
     matrix = load_tech_attack_matrix(args.matrix)
+
+    live_cache_path = args.live_cve_cache or DEFAULT_LIVE_CVE_CACHE_PATH
+    if args.live_cve_lookup:
+        # Merging the already-cached live data in is itself network-free —
+        # only the fetch_and_cache_cve() call below (gated on an actual gap)
+        # makes a request.
+        matrix = merge_tech_attack_matrix(matrix, load_tech_attack_matrix(live_cache_path))
+
     fingerprint = build_fingerprint(args.target, recon_dir, matrix, args.bypass_dir)
+
+    if args.live_cve_lookup:
+        fw, fw_version = fingerprint["framework"], fingerprint["version"]
+        if fw and fw != "unknown" and not has_cve_for(fw, fw_version, matrix):
+            # Local import: keeps every non-flag invocation of this module
+            # (and everything that merely imports it) free of learn.py's
+            # network-calling machinery — the opt-in flag is the only path
+            # that ever loads it.
+            from tools import learn
+            fetched = learn.fetch_and_cache_cve(
+                fw, fw_version, existing_matrix=matrix, cache_path=live_cache_path,
+            )
+            if fetched:
+                matrix = merge_tech_attack_matrix(matrix, {fw: fetched})
+                fingerprint = build_fingerprint(args.target, recon_dir, matrix, args.bypass_dir)
+
     out_path = write_fingerprint(recon_dir, fingerprint)
 
     if args.memory_dir:

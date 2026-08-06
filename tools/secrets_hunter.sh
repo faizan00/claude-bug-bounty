@@ -13,6 +13,11 @@
 #   ./tools/secrets_hunter.sh --git <repo-path-or-url>
 #   ./tools/secrets_hunter.sh --js-bundle <recon-dir>     # scans recon/<t>/js/
 #   ./tools/secrets_hunter.sh --github-org <org>          # needs trufflehog+token
+#   ./tools/secrets_hunter.sh --recon-sources <recon-dir> [--domain t.example]
+#       Phase 5: pattern + Shannon-entropy + JS-signal scan over Phase 1's
+#       ALREADY-RECOVERED unminified source (recon/<t>/browser/sources/) and
+#       cicd_scanner.sh output (recon/<t>/cicd/) via tools/secrets_scanner.py.
+#       No network I/O — unlike --js-bundle, nothing is re-fetched.
 # =============================================================================
 
 set -uo pipefail
@@ -27,21 +32,23 @@ warn() { echo -e "${YELLOW}[!]${NC} $1"; }
 hit()  { echo -e "${MAG}[SECRET]${NC} $1"; }
 err()  { echo -e "${RED}[-]${NC} $1" >&2; }
 
-MODE=""; TARGET=""; OUT_DIR="${SECRETS_OUT_DIR:-$(pwd)/findings/secrets/$(date +%Y%m%d_%H%M%S)}"
+MODE=""; TARGET=""; DOMAIN=""; OUT_DIR="${SECRETS_OUT_DIR:-$(pwd)/findings/secrets/$(date +%Y%m%d_%H%M%S)}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --filesystem)  MODE="fs";   shift; TARGET="${1:-}" ;;
-    --git)         MODE="git";  shift; TARGET="${1:-}" ;;
-    --js-bundle)   MODE="js";   shift; TARGET="${1:-}" ;;
-    --github-org)  MODE="ghorg";shift; TARGET="${1:-}" ;;
-    --out)         shift; OUT_DIR="${1:-}" ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    --filesystem)     MODE="fs";            shift; TARGET="${1:-}" ;;
+    --git)            MODE="git";           shift; TARGET="${1:-}" ;;
+    --js-bundle)      MODE="js";            shift; TARGET="${1:-}" ;;
+    --github-org)     MODE="ghorg";         shift; TARGET="${1:-}" ;;
+    --recon-sources)  MODE="recon-sources"; shift; TARGET="${1:-}" ;;
+    --domain)         shift; DOMAIN="${1:-}" ;;
+    --out)            shift; OUT_DIR="${1:-}" ;;
+    -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
     *) err "unknown arg: $1"; exit 2 ;;
   esac
   shift
 done
 
-[ -z "$MODE" ] || [ -z "$TARGET" ] && { err "mode + target required"; sed -n '12,16p' "$0"; exit 2; }
+[ -z "$MODE" ] || [ -z "$TARGET" ] && { err "mode + target required"; sed -n '11,20p' "$0"; exit 2; }
 
 mkdir -p "$OUT_DIR"
 
@@ -123,6 +130,19 @@ case "$MODE" in
     _have trufflehog || { err "trufflehog required for --github-org"; exit 1; }
     [ -z "${GITHUB_TOKEN:-}" ] && warn "GITHUB_TOKEN unset — trufflehog will rate-limit fast"
     _run_trufflehog "$TARGET" github
+    ;;
+  recon-sources)
+    # Phase 5, Part C: pattern + entropy + JS-signal scan over already-
+    # recovered local files — no fetch, no curl, no network I/O at all.
+    [ -d "$TARGET/browser/sources" ] || [ -d "$TARGET/cicd" ] || \
+      warn "neither $TARGET/browser/sources/ nor $TARGET/cicd/ exist yet — run browser_recon.py --source-maps / recon_engine.sh first"
+    DOMAIN_ARGS=()
+    [ -n "$DOMAIN" ] && DOMAIN_ARGS=(--target "$DOMAIN")
+    python3 "$SCRIPT_DIR/secrets_scanner.py" --recon-dir "$TARGET" "${DOMAIN_ARGS[@]}" \
+      > "$OUT_DIR/recon_sources_scan.json" 2>/dev/null || true
+    n=$(python3 -c "import json; print(json.load(open('$OUT_DIR/recon_sources_scan.json'))['count'])" 2>/dev/null || echo 0)
+    [ "$n" -gt 0 ] && hit "secrets_scanner.py: $n finding(s) (pattern/entropy/JS-signal) — see recon_sources_scan.json for confidence labels" \
+                    || ok "secrets_scanner.py: clean"
     ;;
 esac
 

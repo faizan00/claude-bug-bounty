@@ -597,6 +597,100 @@ def _matrix_technology_match(vuln_class: str, tech_stack: list[str], tech_attack
     return best
 
 
+# How much real report_outcomes.jsonl data it takes before dedup_probability()
+# trusts a bucket's observed duplicate rate at all. Same threshold as
+# MIN_SAMPLES_FOR_IMPACT_RECALIBRATION — not a new number, the existing
+# "5 real samples" bar this codebase already uses everywhere it blends a
+# static prior toward observed data.
+MIN_SAMPLES_FOR_DEDUP_PROBABILITY = 5
+# Cold start: 0.5 is maximum entropy / maximum uncertainty on a 0-1
+# probability scale — the mathematically neutral prior when there is
+# exactly zero evidence either way (as opposed to a confident-looking
+# number pulled from thin air; 0.5 asserts nothing). Every caller that
+# receives this back also gets sample_size=0 and a basis string saying so
+# — never presented as equivalent to a real estimate.
+DEFAULT_DEDUP_PROBABILITY = 0.5
+
+
+def dedup_probability(
+    vuln_class: str,
+    endpoint_shape: str | None = None,
+    program: str | None = None,
+    tech_stack: list[str] | None = None,
+    report_outcomes: list[dict] | None = None,
+) -> dict:
+    """How likely is a new finding of this shape to get closed as a duplicate?
+
+    Derived ONLY from real report_outcomes.jsonl entries whose outcome is
+    "duplicate" — never a fabricated number. Tries the most specific match
+    first (vuln_class + program/platform + endpoint_shape + tech_stack
+    overlap) and falls back to progressively broader buckets, each gated on
+    MIN_SAMPLES_FOR_DEDUP_PROBABILITY real matching entries before it's
+    trusted — the same discipline _recalibrated_impact()/hypothesis_calibration()
+    use: don't let a handful of noisy outcomes masquerade as a confident
+    estimate. Falls all the way to DEFAULT_DEDUP_PROBABILITY (documented
+    cold start, sample_size 0) when nothing clears the bar.
+
+    endpoint_shape/tech_stack only narrow the match against report_outcomes
+    entries that actually carry those (optional, Phase 5-added) fields —
+    older entries lacking them simply don't match the narrower buckets and
+    the function falls back to a broader one. `program` matches against the
+    existing `platform` field (hackerone/bugcrowd/intigriti/immunefi) — the
+    closest existing analogue; report_outcomes has no per-program-handle
+    field today.
+    """
+    report_outcomes = report_outcomes or []
+    tech_stack = tech_stack or []
+
+    by_class = [o for o in report_outcomes if o.get("vuln_class") == vuln_class]
+
+    def _narrow(pool: list[dict], want_program: bool, want_endpoint: bool, want_tech: bool) -> list[dict]:
+        out = []
+        for o in pool:
+            if want_program and o.get("platform") != program:
+                continue
+            if want_endpoint:
+                ep = o.get("endpoint")
+                if not ep or normalize_endpoint(ep) != endpoint_shape:
+                    continue
+            if want_tech and not _tech_overlap(tech_stack, o.get("tech_stack", [])):
+                continue
+            out.append(o)
+        return out
+
+    # Most specific -> least specific. Each level only attempted if the
+    # caller actually supplied the narrowing key.
+    candidate_levels = []
+    if program and endpoint_shape and tech_stack:
+        candidate_levels.append(("vuln_class+program+endpoint_shape+tech_stack",
+                                  _narrow(by_class, True, True, True)))
+    if program and endpoint_shape:
+        candidate_levels.append(("vuln_class+program+endpoint_shape", _narrow(by_class, True, True, False)))
+    if endpoint_shape:
+        candidate_levels.append(("vuln_class+endpoint_shape", _narrow(by_class, False, True, False)))
+    if program:
+        candidate_levels.append(("vuln_class+program", _narrow(by_class, True, False, False)))
+    candidate_levels.append(("vuln_class", by_class))
+
+    for basis, pool in candidate_levels:
+        sample_size = len(pool)
+        if sample_size < MIN_SAMPLES_FOR_DEDUP_PROBABILITY:
+            continue
+        dup_count = sum(1 for o in pool if o.get("outcome") == "duplicate")
+        return {
+            "probability": round(dup_count / sample_size, 3),
+            "sample_size": sample_size,
+            "basis": f"{sample_size} real report_outcomes entries matched on {basis}",
+        }
+
+    return {
+        "probability": DEFAULT_DEDUP_PROBABILITY,
+        "sample_size": 0,
+        "basis": "cold start — no report_outcomes bucket cleared "
+                 f"the {MIN_SAMPLES_FOR_DEDUP_PROBABILITY}-sample minimum",
+    }
+
+
 def priority_score(
     vuln_class: str,
     tech_stack: list[str],
@@ -609,12 +703,13 @@ def priority_score(
     impact_override: float | None = None,
     report_outcomes: list[dict] | None = None,
     tech_attack_matrix: dict | None = None,
+    dedup_probability_result: dict | None = None,
 ) -> dict:
     """The autopilot decision-engine formula:
 
         Priority = impact_potential + historical_success_probability
                  + technology_match + attack_chain_probability
-                 - failure_penalty
+                 - failure_penalty - dedup_penalty
 
     Every positive component is scaled 0-100, so the base score is their
     average; failure_penalty (100 when this exact target+technique already
@@ -630,6 +725,26 @@ def priority_score(
     patterns/failed_patterns experience for this tech_stack+vuln_class pair
     yet — see _matrix_technology_match() above. Omitting it reproduces the
     exact behavior this function had before the parameter existed.
+
+    dedup_probability_result (optional, default None): a dedup_probability()
+    return dict the caller already computed (same "caller passes an
+    already-computed dict" shape as tech_attack_matrix). Only applied when
+    its sample_size clears MIN_SAMPLES_FOR_DEDUP_PROBABILITY — the cold-start
+    0.5 guess never silently discounts a score. Omitting it, or passing a
+    cold-start result, reproduces the exact score this function had before
+    the parameter existed.
+
+    dedup_penalty's cap deliberately reuses MAX_IMPACT_RECALIBRATION_WEIGHT
+    (0.5) — the SAME existing "real data can pull a prior at most halfway"
+    constant _recalibrated_impact() already uses above, applied here to the
+    pre-penalty base score instead of the impact prior. No new heuristic
+    constant: dedup_penalty = base * MAX_IMPACT_RECALIBRATION_WEIGHT *
+    probability, so a near-certain (probability~1.0) duplicate signal can
+    discount at most half of the pre-penalty base, scaled by how confident
+    the duplicate-rate evidence actually is — never a flat, unexplained
+    point value, and never enough alone to zero a score the way a hard
+    failure_penalty (a proven dead end, a categorically stronger signal)
+    does.
     """
     patterns = patterns or []
     failed_patterns = failed_patterns or []
@@ -680,7 +795,13 @@ def priority_score(
     failure_penalty = 100 if failed_entry else 0
 
     base = (impact + historical_success + technology_match + attack_chain_probability) / 4
-    score = max(0, min(100, round(base - failure_penalty)))
+
+    dedup_penalty = 0
+    if (dedup_probability_result
+            and dedup_probability_result.get("sample_size", 0) >= MIN_SAMPLES_FOR_DEDUP_PROBABILITY):
+        dedup_penalty = round(base * MAX_IMPACT_RECALIBRATION_WEIGHT * dedup_probability_result["probability"])
+
+    score = max(0, min(100, round(base - failure_penalty - dedup_penalty)))
 
     return {
         "vuln_class": vuln_class,
@@ -692,10 +813,12 @@ def priority_score(
             "technology_match": technology_match,
             "attack_chain_probability": attack_chain_probability,
             "failure_penalty": failure_penalty,
+            "dedup_penalty": dedup_penalty,
         },
         "failed_pattern_reason": failed_entry.get("reason") if failed_entry else None,
         "matching_chains": [c["chain_name"] for c in matching_chains],
         "impact_recalibration": impact_recalibration,
+        "dedup_probability": dedup_probability_result,
     }
 
 
@@ -724,6 +847,7 @@ def expected_value_per_hour(
     report_outcomes: list[dict] | None = None,
     estimated_minutes: float | None = None,
     tech_attack_matrix: dict | None = None,
+    dedup_probability_result: dict | None = None,
 ) -> dict:
     """Expected-value-per-hour: which candidate pays off *fastest*, not just highest.
 
@@ -736,6 +860,12 @@ def expected_value_per_hour(
 
     tech_attack_matrix: passed straight through to priority_score() — see
     its docstring. Default None reproduces prior behavior exactly.
+
+    dedup_probability_result: passed straight through to priority_score()
+    (discounts the score) AND discounts payout_probability itself by
+    (1 - probability) when sample-backed — a lead with a high historical
+    duplicate rate pays off less often even if the raw score is high.
+    Default None, or a cold-start result, reproduces prior behavior exactly.
     """
     report_outcomes = report_outcomes or []
     score_result = priority_score(
@@ -743,6 +873,7 @@ def expected_value_per_hour(
         patterns, failed_patterns, chains, chain_detected, impact_override,
         report_outcomes=report_outcomes,
         tech_attack_matrix=tech_attack_matrix,
+        dedup_probability_result=dedup_probability_result,
     )
 
     outcomes_for_class = [o for o in report_outcomes if o.get("vuln_class") == vuln_class]
@@ -757,6 +888,10 @@ def expected_value_per_hour(
         # convention priority_score itself uses when memory is empty.
         payout_probability = score_result["components"]["historical_success_probability"]
         payout_probability_source = "heuristic (no report-outcome data)"
+
+    if (dedup_probability_result
+            and dedup_probability_result.get("sample_size", 0) >= MIN_SAMPLES_FOR_DEDUP_PROBABILITY):
+        payout_probability = round(payout_probability * (1 - dedup_probability_result["probability"]))
 
     minutes = (
         estimated_minutes if estimated_minutes is not None
@@ -966,6 +1101,58 @@ def duplicate_or_noise_check(
         "matching_report_outcomes": [o.get("outcome") for o in already_reported],
         "matching_failed_patterns": len(already_failed),
     }
+
+
+# Outcomes that mean "a human triager looked at this and said no" — distinct
+# from "duplicate" (see dedup_probability() above), which means someone else
+# already found it, not that it wasn't a real bug for this program.
+REJECTION_OUTCOMES = {"not_applicable", "informative"}
+
+
+def extract_rejection_lessons(report_outcomes: list[dict], min_samples: int = 5) -> list[dict]:
+    """What vuln classes keep getting reports closed as not_applicable/informative?
+
+    Groups real report_outcomes.jsonl entries by vuln_class. A vuln_class
+    with fewer than `min_samples` real not_applicable/informative outcomes
+    emits nothing at all — never a lesson backed by a handful of noisy
+    rejections. report_outcomes.jsonl has no structured rejection-reason
+    field (only free-text `notes`), so `top_reasons` is pulled verbatim from
+    real notes text, ranked by how often triagers wrote the exact same
+    thing — never inferred, never fabricated.
+    """
+    report_outcomes = report_outcomes or []
+    by_class: dict[str, list[dict]] = {}
+    for o in report_outcomes:
+        vc = o.get("vuln_class")
+        if vc:
+            by_class.setdefault(vc, []).append(o)
+
+    lessons = []
+    for vuln_class, entries in sorted(by_class.items()):
+        rejected = [o for o in entries if o.get("outcome") in REJECTION_OUTCOMES]
+        if len(rejected) < min_samples:
+            continue
+
+        note_counts: dict[str, int] = {}
+        for o in rejected:
+            note = (o.get("notes") or "").strip()
+            if note:
+                note_counts[note] = note_counts.get(note, 0) + 1
+        top_reasons = [
+            {"text": text, "count": count}
+            for text, count in sorted(note_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        ][:5]
+
+        lessons.append({
+            "vuln_class": vuln_class,
+            "rejection_rate": round(len(rejected) / len(entries), 3),
+            "sample_size": len(rejected),
+            "total_outcomes": len(entries),
+            "top_reasons": top_reasons,
+            "basis": f"{len(rejected)} real not_applicable/informative outcomes "
+                     f"out of {len(entries)} total for {vuln_class}",
+        })
+    return lessons
 
 
 def _read_jsonl_best_effort(path: Path) -> list[dict]:
@@ -1193,6 +1380,8 @@ def _cmd_save_outcome(args: argparse.Namespace) -> int:
         payout=args.payout,
         report_id=args.report_id,
         notes=args.notes,
+        endpoint=args.endpoint,
+        tech_stack=args.tech_stack.split(",") if args.tech_stack else None,
     )
     saved = ReportOutcomeDB(paths["report_outcomes"]).save(entry)
     print(json.dumps({"saved": saved, "entry": entry}, indent=2))
@@ -1278,6 +1467,28 @@ def _cmd_calibration(args: argparse.Namespace) -> int:
     journal = _read_jsonl_best_effort(paths["journal"])
     outcomes = ReportOutcomeDB(paths["report_outcomes"]).read_all()
     result = hypothesis_calibration(hypotheses, journal_entries=journal, report_outcomes=outcomes)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_dedup_probability(args: argparse.Namespace) -> int:
+    paths = _memory_paths(args.memory_dir)
+    outcomes = ReportOutcomeDB(paths["report_outcomes"]).read_all()
+    result = dedup_probability(
+        vuln_class=args.vuln_class,
+        endpoint_shape=normalize_endpoint(args.endpoint) if args.endpoint else None,
+        program=args.program,
+        tech_stack=args.tech_stack.split(",") if args.tech_stack else None,
+        report_outcomes=outcomes,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _cmd_rejection_lessons(args: argparse.Namespace) -> int:
+    paths = _memory_paths(args.memory_dir)
+    outcomes = ReportOutcomeDB(paths["report_outcomes"]).read_all()
+    result = extract_rejection_lessons(outcomes, min_samples=args.min_samples)
     print(json.dumps(result, indent=2))
     return 0
 
@@ -1374,6 +1585,8 @@ def main() -> int:
     p.add_argument("--payout", type=float, default=None)
     p.add_argument("--report-id", default=None)
     p.add_argument("--notes", default=None)
+    p.add_argument("--endpoint", default=None, help="endpoint URL/path (Phase 5: feeds dedup_probability())")
+    p.add_argument("--tech-stack", default=None, help="comma-separated tech tags (Phase 5: feeds dedup_probability())")
     p.add_argument("--memory-dir", default="hunt-memory")
     p.set_defaults(func=_cmd_save_outcome)
 
@@ -1420,6 +1633,19 @@ def main() -> int:
     p.add_argument("--vuln-class", default=None)
     p.add_argument("--memory-dir", default="hunt-memory")
     p.set_defaults(func=_cmd_calibration)
+
+    p = sub.add_parser("dedup-probability", help="Historical duplicate rate for a vuln_class/endpoint/program/tech bucket")
+    p.add_argument("--vuln-class", required=True)
+    p.add_argument("--endpoint", default=None)
+    p.add_argument("--program", default=None, help="matches report_outcomes.jsonl's 'platform' field")
+    p.add_argument("--tech-stack", default=None, help="Comma-separated")
+    p.add_argument("--memory-dir", default="hunt-memory")
+    p.set_defaults(func=_cmd_dedup_probability)
+
+    p = sub.add_parser("rejection-lessons", help="Vuln classes with a real pattern of not_applicable/informative outcomes")
+    p.add_argument("--min-samples", type=int, default=5)
+    p.add_argument("--memory-dir", default="hunt-memory")
+    p.set_defaults(func=_cmd_rejection_lessons)
 
     args = ap.parse_args()
     try:
