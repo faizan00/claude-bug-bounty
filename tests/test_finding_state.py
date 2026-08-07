@@ -67,16 +67,43 @@ class TestCanTransition:
         assert result["allowed"] is True
 
     def test_report_ready_without_reproducible_blocked(self):
-        result = can_transition("CONFIRMED", "REPORT_READY")
+        # Phase 7: CONFIRMED must pass through SELF_CRITIQUED first.
+        result = can_transition("SELF_CRITIQUED", "REPORT_READY")
         assert result["allowed"] is False
         assert "missing reproduction blocks REPORT_READY" in result["reason"]
 
     def test_report_ready_with_reproducible_false_blocked(self):
-        result = can_transition("CONFIRMED", "REPORT_READY", {"reproducible": False})
+        result = can_transition("SELF_CRITIQUED", "REPORT_READY", {"reproducible": False})
         assert result["allowed"] is False
 
     def test_report_ready_with_reproducible_true_allowed(self):
+        result = can_transition("SELF_CRITIQUED", "REPORT_READY", {"reproducible": True})
+        assert result["allowed"] is True
+
+    # Phase 7 — the gate itself: CONFIRMED can no longer reach REPORT_READY
+    # directly; SELF_CRITIQUED sits in between and requires the self-critique
+    # gate to have actually run and cleared (pass or warn — not block).
+
+    def test_confirmed_to_report_ready_directly_no_longer_legal(self):
         result = can_transition("CONFIRMED", "REPORT_READY", {"reproducible": True})
+        assert result["allowed"] is False
+        assert "not a legal transition" in result["reason"]
+
+    def test_self_critiqued_without_evidence_blocked(self):
+        result = can_transition("CONFIRMED", "SELF_CRITIQUED")
+        assert result["allowed"] is False
+        assert "self-critique gate must run" in result["reason"]
+
+    def test_self_critiqued_with_block_overall_blocked(self):
+        result = can_transition("CONFIRMED", "SELF_CRITIQUED", {"self_critique_overall": "block"})
+        assert result["allowed"] is False
+
+    def test_self_critiqued_with_pass_overall_allowed(self):
+        result = can_transition("CONFIRMED", "SELF_CRITIQUED", {"self_critique_overall": "pass"})
+        assert result["allowed"] is True
+
+    def test_self_critiqued_with_warn_overall_allowed(self):
+        result = can_transition("CONFIRMED", "SELF_CRITIQUED", {"self_critique_overall": "warn"})
         assert result["allowed"] is True
 
     def test_all_states_covered_by_transition_table(self):
@@ -100,7 +127,15 @@ class TestTransition:
 
     def test_missing_reproduction_raises_on_report_ready(self):
         with pytest.raises(FindingStateError, match="missing reproduction blocks REPORT_READY"):
-            transition("CONFIRMED", "REPORT_READY")
+            transition("SELF_CRITIQUED", "REPORT_READY")
+
+    def test_confirmed_to_report_ready_directly_raises(self):
+        with pytest.raises(FindingStateError, match="not a legal transition"):
+            transition("CONFIRMED", "REPORT_READY", {"reproducible": True})
+
+    def test_missing_self_critique_raises_on_self_critiqued(self):
+        with pytest.raises(FindingStateError, match="self-critique gate must run"):
+            transition("CONFIRMED", "SELF_CRITIQUED")
 
 
 class TestFindingStateDB:
@@ -138,6 +173,7 @@ class TestFindingStateDB:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         db.advance("a.com", "idor", "/api/x", "CONFIRMED", evidence={"verdict": "STRONG"})
+        db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "pass"})
         db.advance("a.com", "idor", "/api/x", "REPORT_READY", evidence={"reproducible": True})
         assert db.current_state("a.com", "idor", "/api/x") == "REPORT_READY"
 
@@ -165,8 +201,29 @@ class TestFindingStateDB:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         db.advance("a.com", "idor", "/api/x", "CONFIRMED", evidence={"verdict": "STRONG"})
+        db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "pass"})
         with pytest.raises(FindingStateError, match="missing reproduction blocks REPORT_READY"):
             db.advance("a.com", "idor", "/api/x", "REPORT_READY")
+        assert db.current_state("a.com", "idor", "/api/x") == "SELF_CRITIQUED"
+
+    def test_report_ready_directly_from_confirmed_raises_and_does_not_persist(self, finding_states_path):
+        db = FindingStateDB(finding_states_path)
+        db.advance("a.com", "idor", "/api/x", "SUSPECTED")
+        db.advance("a.com", "idor", "/api/x", "TESTING")
+        db.advance("a.com", "idor", "/api/x", "VALIDATED")
+        db.advance("a.com", "idor", "/api/x", "CONFIRMED", evidence={"verdict": "STRONG"})
+        with pytest.raises(FindingStateError, match="not a legal transition"):
+            db.advance("a.com", "idor", "/api/x", "REPORT_READY", evidence={"reproducible": True})
+        assert db.current_state("a.com", "idor", "/api/x") == "CONFIRMED"
+
+    def test_self_critiqued_without_gate_evidence_raises_and_does_not_persist(self, finding_states_path):
+        db = FindingStateDB(finding_states_path)
+        db.advance("a.com", "idor", "/api/x", "SUSPECTED")
+        db.advance("a.com", "idor", "/api/x", "TESTING")
+        db.advance("a.com", "idor", "/api/x", "VALIDATED")
+        db.advance("a.com", "idor", "/api/x", "CONFIRMED", evidence={"verdict": "STRONG"})
+        with pytest.raises(FindingStateError, match="self-critique gate must run"):
+            db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "block"})
         assert db.current_state("a.com", "idor", "/api/x") == "CONFIRMED"
 
     def test_history_ordered_oldest_first(self, finding_states_path):

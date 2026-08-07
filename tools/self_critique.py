@@ -1,0 +1,377 @@
+"""Phase 7, Part B — the Self-Critique Gate.
+
+Takes a memory/candidate.py-shaped Candidate and runs four machine-
+evaluable checks, all reusing existing infrastructure (PERMANENT RULE 1:
+this module computes no priority/score of its own — memory/vuln_intelligence.py
+stays the one formula):
+
+  1. REPRODUCIBILITY   — re-runs validation_plan.steps TWICE through a real
+                          tools/browser_recon.py Fetcher (already scope/
+                          rate-limit gated). Flaky or non-matching -> BLOCK.
+  2. DUPLICATE PROBABILITY — calls memory/vuln_intelligence.py's
+                          dedup_probability() unmodified. WARN when sample-
+                          backed and elevated; BLOCK the same case if the
+                          Candidate's rationale carries no novel-impact
+                          argument.
+  3. EVIDENCE COMPLETENESS — a pure structural check against the Candidate
+                          schema itself (memory/candidate.py).
+  4. BUSINESS-IMPACT CROSS-CHECK — cross-references memory/object_model.py's
+                          relationship-violation detectors. WARN only, never
+                          BLOCK, and never touches priority_score() (verified
+                          by tests/test_self_critique.py's regression test).
+
+Pure library (evaluate_candidate() takes plain data — a Candidate dict, a
+Fetcher, report_outcomes/observations lists already loaded by the caller)
++ thin CLI at the bottom, per PERMANENT RULE 5.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+from memory.candidate import EVIDENCE_TYPES  # noqa: E402
+from memory.object_model import (  # noqa: E402
+    detect_logic_pattern_violations,
+    detect_relationship_violations,
+)
+from memory.vuln_intelligence import (  # noqa: E402
+    DEFAULT_DEDUP_PROBABILITY,
+    MIN_SAMPLES_FOR_DEDUP_PROBABILITY,
+    dedup_probability,
+    normalize_endpoint,
+)
+
+CHECK_STATUSES = frozenset({"pass", "warn", "block"})
+
+# A Candidate's rationale opts into the "duplicate risk accepted, here's why
+# it's still worth reporting" path by carrying this literal marker followed
+# by its argument -- an explicit, deterministic convention (never a fuzzy
+# keyword/sentiment guess over free text, which PERMANENT RULE 4 would treat
+# as an unjustified heuristic).
+_NOVEL_IMPACT_MARKER = "novel impact:"
+
+# validation_plan.expected is free-text (e.g. "403 / 401"); this extracts
+# any 3-digit HTTP status codes it names. Not a heuristic constant -- a
+# fixed, cited protocol fact (HTTP status codes are always 3 digits,
+# RFC 9110 section 15).
+_STATUS_CODE_RE = re.compile(r"\b([1-5]\d{2})\b")
+
+
+def _result(name: str, status: str, reason: str, details: dict | None = None) -> dict:
+    assert status in CHECK_STATUSES
+    return {"name": name, "status": status, "reason": reason, "details": details or {}}
+
+
+# ─── 1. Reproducibility ──────────────────────────────────────────────────
+
+def _executable_steps(validation_plan: dict) -> list[dict]:
+    steps = validation_plan.get("steps") or []
+    return [s for s in steps if isinstance(s, dict) and s.get("method") and s.get("url")]
+
+
+def _expected_statuses(validation_plan: dict) -> set[int]:
+    expected = validation_plan.get("expected") or ""
+    return {int(m) for m in _STATUS_CODE_RE.findall(expected)}
+
+
+def check_reproducibility(candidate: dict, fetcher) -> dict:
+    """Re-runs the Candidate's validation_plan.steps TWICE via `fetcher`
+    (tools/browser_recon.py's Fetcher — scope/cap/circuit-breaker/rate-limit
+    already enforced there, not reimplemented here). Both runs must produce
+    the same per-step HTTP status, and every observed status must be one
+    validation_plan.expected actually names, or this BLOCKS.
+
+    Conservative by construction: a Candidate whose validation_plan carries
+    no machine-executable {method,url} step, or whose `expected` names no
+    parseable status code, cannot be verified here at all -- that BLOCKS
+    too (an unverifiable claim is not evidence of reproducibility, so it
+    must not silently pass)."""
+    validation_plan = candidate.get("validation_plan") or {}
+    steps = _executable_steps(validation_plan)
+    if not steps:
+        return _result(
+            "reproducibility", "block",
+            "validation_plan.steps has no machine-executable {method,url} step -- cannot verify reproducibility",
+        )
+
+    expected_statuses = _expected_statuses(validation_plan)
+    if not expected_statuses:
+        return _result(
+            "reproducibility", "block",
+            "validation_plan.expected has no parseable HTTP status code to verify against",
+        )
+
+    runs: list[tuple[int, ...]] = []
+    for _ in range(2):
+        run_statuses = []
+        for step in steps:
+            try:
+                resp = fetcher.request(step["method"], step["url"])
+            except Exception as exc:  # noqa: BLE001 - any fetch failure blocks, never crashes the gate
+                return _result("reproducibility", "block", f"request failed while reproducing: {exc}")
+            run_statuses.append(resp.status_code)
+        runs.append(tuple(run_statuses))
+
+    if runs[0] != runs[1]:
+        return _result(
+            "reproducibility", "block",
+            f"non-reproducible: run 1 = {runs[0]}, run 2 = {runs[1]}",
+            details={"runs": runs},
+        )
+
+    if not all(status in expected_statuses for status in runs[0]):
+        return _result(
+            "reproducibility", "block",
+            f"observed status {runs[0]} does not match validation_plan.expected ({sorted(expected_statuses)})",
+            details={"runs": runs},
+        )
+
+    return _result(
+        "reproducibility", "pass",
+        "reproduced twice, both runs match validation_plan.expected",
+        details={"runs": runs},
+    )
+
+
+# ─── 2. Duplicate probability ────────────────────────────────────────────
+
+def check_duplicate_probability(candidate: dict, report_outcomes: list[dict] | None = None) -> dict:
+    """Calls vuln_intelligence.dedup_probability() with the Candidate's
+    type/target/program/tech_stack -- no new formula, same function
+    priority_score() itself consumes. WARN when the sample-backed
+    probability is elevated (above DEFAULT_DEDUP_PROBABILITY, the same 0.5
+    cold-start baseline dedup_probability() already treats as neutral) and
+    the rationale carries a novel-impact argument; BLOCK the identical case
+    with no such argument."""
+    metadata = candidate.get("metadata") or {}
+    vuln_class = candidate.get("type", "")
+    endpoint = metadata.get("endpoint")
+    result = dedup_probability(
+        vuln_class=vuln_class,
+        endpoint_shape=normalize_endpoint(endpoint) if endpoint else None,
+        program=metadata.get("program"),
+        tech_stack=metadata.get("tech_stack"),
+        report_outcomes=report_outcomes,
+    )
+
+    sample_backed = result["sample_size"] >= MIN_SAMPLES_FOR_DEDUP_PROBABILITY
+    elevated = sample_backed and result["probability"] > DEFAULT_DEDUP_PROBABILITY
+    rationale = (candidate.get("rationale") or "").lower()
+    has_novel_impact_argument = _NOVEL_IMPACT_MARKER in rationale
+
+    if elevated and not has_novel_impact_argument:
+        return _result(
+            "duplicate_probability", "block",
+            f"sample-backed duplicate probability {result['probability']} ({result['basis']}) "
+            f"with no novel-impact argument in rationale",
+            details={"dedup_probability": result},
+        )
+    if elevated:
+        return _result(
+            "duplicate_probability", "warn",
+            f"sample-backed duplicate probability {result['probability']} ({result['basis']}) "
+            f"-- allowed through on the rationale's novel-impact argument",
+            details={"dedup_probability": result},
+        )
+    return _result(
+        "duplicate_probability", "pass",
+        f"duplicate probability {result['probability']} not sample-backed elevated ({result['basis']})",
+        details={"dedup_probability": result},
+    )
+
+
+# ─── 3. Evidence completeness ────────────────────────────────────────────
+
+def check_evidence_completeness(candidate: dict) -> dict:
+    """Pure structural check against memory/candidate.py's schema: evidence[]
+    non-empty with real Evidence Typing labels, validation_plan carrying all
+    three fields, rationale non-empty. BLOCKS on any missing/empty field."""
+    missing: list[str] = []
+
+    evidence = candidate.get("evidence")
+    if not evidence:
+        missing.append("evidence")
+    else:
+        for i, entry in enumerate(evidence):
+            if entry.get("type") not in EVIDENCE_TYPES:
+                missing.append(f"evidence[{i}].type")
+
+    validation_plan = candidate.get("validation_plan") or {}
+    for field in ("steps", "expected", "stop_condition"):
+        if not validation_plan.get(field):
+            missing.append(f"validation_plan.{field}")
+
+    if not candidate.get("rationale"):
+        missing.append("rationale")
+
+    if missing:
+        return _result(
+            "evidence_completeness", "block",
+            f"missing/empty required field(s): {', '.join(missing)}",
+            details={"missing": missing},
+        )
+    return _result("evidence_completeness", "pass", "all required Candidate fields present")
+
+
+# ─── 4. Business-impact cross-check ──────────────────────────────────────
+
+def _violation_refs(violation: dict) -> tuple:
+    """Relationship-violation Candidates carry the (subject, object) pair
+    under different metadata keys depending on which object_model.py
+    detector produced them (detect_relationship_violations() uses
+    subject_id/object_id; detect_logic_pattern_violations() uses
+    performed_by/governing_object) -- read either, never guess a third."""
+    md = violation.get("metadata") or {}
+    subject = md.get("subject_id") or md.get("performed_by")
+    obj = md.get("object_id") or md.get("governing_object")
+    return (subject, obj)
+
+
+def check_business_impact(candidate: dict, observations: list[dict] | None = None) -> dict:
+    """WARN-only, never BLOCK, never imports/calls priority_score() (see
+    tests/test_self_critique.py's regression test). If the Candidate
+    already originates from object_model.py's own violation detectors,
+    it IS a confirmed relationship violation by construction. Otherwise,
+    cross-reference the Candidate's own subject_id/object_id (if its
+    metadata carries them) against what those same detectors currently
+    find in `observations` -- an empty/cold-start Object Model just means
+    nothing to cross-reference, never a crash."""
+    if candidate.get("source") == "object-model":
+        return _result(
+            "business_impact", "warn",
+            "Candidate originates from object-model relationship-violation detection -- "
+            "business-impact confirmed, upgrade report language accordingly",
+            details={"upgraded_impact": True},
+        )
+
+    observations = observations or []
+    metadata = candidate.get("metadata") or {}
+    subject_id = metadata.get("subject_id")
+    object_ref = metadata.get("object_id")
+    if not subject_id or not object_ref or not observations:
+        return _result(
+            "business_impact", "pass",
+            "no object-model relationship data to cross-reference",
+            details={"upgraded_impact": False},
+        )
+
+    target = metadata.get("target")
+    violations = (
+        detect_relationship_violations(observations, target=target)
+        + detect_logic_pattern_violations(observations, target=target)
+    )
+    matched = any(_violation_refs(v) == (subject_id, object_ref) for v in violations)
+
+    if matched:
+        return _result(
+            "business_impact", "warn",
+            "confirming this Candidate corresponds to an observed relationship-graph violation -- "
+            "upgrade report language accordingly",
+            details={"upgraded_impact": True},
+        )
+    return _result(
+        "business_impact", "pass",
+        "no matching relationship violation found in the current object model",
+        details={"upgraded_impact": False},
+    )
+
+
+# ─── Combined gate ────────────────────────────────────────────────────────
+
+def self_critique(
+    candidate: dict,
+    fetcher=None,
+    report_outcomes: list[dict] | None = None,
+    observations: list[dict] | None = None,
+) -> dict:
+    """Run all four checks. `fetcher` is optional at the API level so
+    non-HTTP-reproducible checks (2-4) can still run standalone in tests --
+    omitting it makes the reproducibility check BLOCK (no fetcher means no
+    verification), never silently skips it."""
+    if fetcher is not None:
+        checks = [check_reproducibility(candidate, fetcher)]
+    else:
+        checks = [_result("reproducibility", "block", "no fetcher supplied -- cannot verify reproducibility")]
+
+    checks.append(check_duplicate_probability(candidate, report_outcomes))
+    checks.append(check_evidence_completeness(candidate))
+    checks.append(check_business_impact(candidate, observations))
+
+    if any(c["status"] == "block" for c in checks):
+        overall = "block"
+    elif any(c["status"] == "warn" for c in checks):
+        overall = "warn"
+    else:
+        overall = "pass"
+
+    return {
+        "candidate_id": candidate.get("id"),
+        "checks": checks,
+        "overall": overall,
+        "details": {c["name"]: c for c in checks},
+    }
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────
+
+def _load_json(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _load_jsonl(path: str | None) -> list[dict]:
+    if not path or not os.path.exists(path):
+        return []
+    entries = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    return entries
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Phase 7 Self-Critique Gate for a memory/candidate.py Candidate")
+    ap.add_argument("--candidate", required=True, help="Path to a Candidate JSON file")
+    ap.add_argument("--report-outcomes", default=None, help="Path to hunt-memory/report_outcomes.jsonl")
+    ap.add_argument("--observations", default=None, help="Path to memory/object_model.py's observations.jsonl")
+    ap.add_argument("--allowed-domain", action="append", default=[], help="Scope allowlist for the reproducibility Fetcher (repeatable)")
+    ap.add_argument("--no-fetch", action="store_true", help="Skip live reproduction — reproducibility check BLOCKs (no fetcher)")
+    ap.add_argument("--recon-rps", type=float, default=None)
+    ap.add_argument("--max-requests", type=int, default=None)
+    args = ap.parse_args()
+
+    candidate = _load_json(args.candidate)
+    report_outcomes = _load_jsonl(args.report_outcomes)
+    observations = _load_jsonl(args.observations)
+
+    fetcher = None
+    if not args.no_fetch and args.allowed_domain:
+        from tools.browser_recon import Fetcher
+        from tools.scope_checker import ScopeChecker
+
+        checker = ScopeChecker(args.allowed_domain, [])
+        kwargs = {}
+        if args.recon_rps is not None:
+            kwargs["recon_rps"] = args.recon_rps
+        if args.max_requests is not None:
+            kwargs["max_requests"] = args.max_requests
+        fetcher = Fetcher(checker, **kwargs)
+
+    report = self_critique(candidate, fetcher=fetcher, report_outcomes=report_outcomes, observations=observations)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["overall"] != "block" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

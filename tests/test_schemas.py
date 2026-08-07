@@ -743,7 +743,7 @@ class TestFindingStateValidation:
             validate_finding_state_entry(sample_finding_state_entry)
 
     def test_all_valid_states_accepted(self, sample_finding_state_entry):
-        for state in ("SUSPECTED", "TESTING", "VALIDATED", "CONFIRMED", "REPORT_READY", "REJECTED"):
+        for state in ("SUSPECTED", "TESTING", "VALIDATED", "CONFIRMED", "SELF_CRITIQUED", "REPORT_READY", "REJECTED"):
             sample_finding_state_entry["state"] = state
             assert validate_finding_state_entry(sample_finding_state_entry)["state"] == state
 

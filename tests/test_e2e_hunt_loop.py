@@ -355,11 +355,19 @@ class TestStage5Report:
             technique="exposed-config-file", tech_stack=["python", "http.server"],
             payout=500,
         )
-        report_ready = db.advance(TARGET, vuln_class, endpoint, "REPORT_READY", evidence=evidence)
+        # Phase 7 — the self-critique gate now sits between CONFIRMED and
+        # REPORT_READY; a real caller would pass tools/self_critique.py's
+        # self_critique()["overall"] here.
+        db.advance(TARGET, vuln_class, endpoint, "SELF_CRITIQUED",
+                    evidence={**evidence, "self_critique_overall": "pass"})
+        report_ready = db.advance(
+            TARGET, vuln_class, endpoint, "REPORT_READY",
+            evidence={**evidence, "self_critique_overall": "pass"},
+        )
 
         assert db.current_state(TARGET, vuln_class, endpoint) == "REPORT_READY"
         assert report_ready["state"] == "REPORT_READY"
-        assert report_ready["previous_state"] == "CONFIRMED"
+        assert report_ready["previous_state"] == "SELF_CRITIQUED"
 
         # Self-learning write-back actually landed — the point of TODO-6/7's
         # earlier work: no manual /remember step required for this to count
@@ -430,7 +438,10 @@ class TestFullSequence:
         db.advance(TARGET, "info-disclosure", "/.env", "VALIDATED", evidence=evidence)
         db.advance(TARGET, "info-disclosure", "/.env", "CONFIRMED", evidence=evidence,
                     technique="exposed-config-file", tech_stack=["python", "http.server"])
-        db.advance(TARGET, "info-disclosure", "/.env", "REPORT_READY", evidence=evidence)
+        db.advance(TARGET, "info-disclosure", "/.env", "SELF_CRITIQUED",
+                    evidence={**evidence, "self_critique_overall": "pass"})
+        db.advance(TARGET, "info-disclosure", "/.env", "REPORT_READY",
+                    evidence={**evidence, "self_critique_overall": "pass"})
 
         assert db.current_state(TARGET, "info-disclosure", "/.env") == "REPORT_READY", (
             "report stage failed to reach a submittable state"

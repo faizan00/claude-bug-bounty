@@ -1,6 +1,7 @@
 """
 Finding lifecycle engine — SUSPECTED -> TESTING -> VALIDATED -> CONFIRMED ->
-REPORT_READY (plus REJECTED, reachable from any non-terminal state), backed
+SELF_CRITIQUED -> REPORT_READY (plus REJECTED, reachable from any non-terminal
+state), backed
 by an append-only hunt-memory/finding_states.jsonl transition log, the same
 JSONL + schema-validation + flock pattern every other file in this package
 uses (patterns.jsonl, chains.jsonl, hypotheses.jsonl, experiments.jsonl,
@@ -65,18 +66,24 @@ from memory.schemas import (
 )
 from memory.vuln_intelligence import normalize_endpoint
 
-FINDING_STATES = ("SUSPECTED", "TESTING", "VALIDATED", "CONFIRMED", "REPORT_READY", "REJECTED")
+FINDING_STATES = ("SUSPECTED", "TESTING", "VALIDATED", "CONFIRMED", "SELF_CRITIQUED", "REPORT_READY", "REJECTED")
 
 # Legal forward transitions. REJECTED is reachable from every non-terminal
 # state (a finding can be killed at any point in its life), but nothing is
 # reachable FROM REJECTED or REPORT_READY — both are terminal.
+#
+# Phase 7: CONFIRMED no longer jumps straight to REPORT_READY — it must pass
+# through SELF_CRITIQUED first (tools/self_critique.py's four-check gate).
+# This is the one edge Phase 7 exists to close; every other transition below
+# is byte-identical to what it was before.
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    "SUSPECTED":    {"TESTING", "REJECTED"},
-    "TESTING":      {"VALIDATED", "REJECTED"},
-    "VALIDATED":    {"CONFIRMED", "REJECTED"},
-    "CONFIRMED":    {"REPORT_READY", "REJECTED"},
-    "REPORT_READY": set(),
-    "REJECTED":     set(),
+    "SUSPECTED":      {"TESTING", "REJECTED"},
+    "TESTING":        {"VALIDATED", "REJECTED"},
+    "VALIDATED":      {"CONFIRMED", "REJECTED"},
+    "CONFIRMED":      {"SELF_CRITIQUED", "REJECTED"},
+    "SELF_CRITIQUED": {"REPORT_READY", "REJECTED"},
+    "REPORT_READY":   set(),
+    "REJECTED":       set(),
 }
 
 
@@ -119,6 +126,18 @@ def can_transition(current_state: str, next_state: str, evidence: dict | None = 
             "reason": (
                 f"validation-engine verdict is {evidence.get('verdict')!r}, not STRONG — "
                 "weak evidence cannot become CONFIRMED"
+            ),
+        }
+
+    # Phase 7 — nothing reaches SELF_CRITIQUED without tools/self_critique.py's
+    # gate having actually run and cleared it (pass or warn; block means at
+    # least one of the four checks found a real problem).
+    if next_state == "SELF_CRITIQUED" and evidence.get("self_critique_overall") not in ("pass", "warn"):
+        return {
+            "allowed": False,
+            "reason": (
+                f"self-critique overall is {evidence.get('self_critique_overall')!r}, not pass/warn — "
+                "the self-critique gate must run and clear before a finding is SELF_CRITIQUED"
             ),
         }
 

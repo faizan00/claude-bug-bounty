@@ -93,6 +93,7 @@ This repo is an agent-portable bug bounty plugin for professional hunting across
 - `tools/vuln_scanner.sh` — XSS/SQLi/SSTI/MFA/SAML probe pipeline with verified PoC generation
 - `tools/validate.py` — Interactive 4-gate finding validator + CVSS 4.0 scorer + report skeleton; headless via --non-interactive
 - `tools/validation_core.py` — Pure, headless 4-gate validation logic + CVSS 4.0 calculator (dict in/out, zero I/O) — the single implementation validate.py wraps
+- `tools/self_critique.py` — Phase 7 Part B — the Self-Critique Gate: four machine-evaluable checks on a memory/candidate.py Candidate before it can reach finding_state.py's REPORT_READY (reproducibility via a real browser_recon.py Fetcher re-run twice, duplicate probability via vuln_intelligence.dedup_probability() unmodified, evidence-completeness structural check, object_model.py business-impact cross-check that only ever WARNs); self_critique() combines all four into {candidate_id, checks, overall, details}, gated additively into finding_state.py's ALLOWED_TRANSITIONS as the new SELF_CRITIQUED state between CONFIRMED and REPORT_READY
 - `tools/learn.py` — Fetches recent bug intelligence for a tech stack from GitHub Advisories, NVD CVE API, and HackerOne Hacktivity
 - `tools/intel_engine.py` — On-demand intel fetch for a target — wraps learn.py + HackerOne MCP + hunt memory context
 - `tools/scope_checker.py` — Deterministic scope safety checker — anchored allowlist/blocklist matching before any outbound request
@@ -151,7 +152,7 @@ This repo is an agent-portable bug bounty plugin for professional hunting across
 - `memory/audit_log.py` — Append-only outbound-request audit log, rate limiter, and circuit breaker for autopilot sessions
 - `memory/rotation.py` — Size-based JSONL rotation (10MB cap, keep 3 backups), auto-fired on every append
 - `memory/schemas.py` — Schema validation for all hunt-memory JSONL entry types (schema_version for migrations)
-- `memory/finding_state.py` — Finding lifecycle state machine — SUSPECTED→TESTING→VALIDATED→CONFIRMED→REPORT_READY (+REJECTED), append-only transition log
+- `memory/finding_state.py` — Finding lifecycle state machine — SUSPECTED→TESTING→VALIDATED→CONFIRMED→SELF_CRITIQUED→REPORT_READY (+REJECTED), append-only transition log; Phase 7 gates REPORT_READY behind tools/self_critique.py's SELF_CRITIQUED state (evidence["self_critique_overall"] must be pass/warn)
 - `memory/finding_score.py` — Ranks raw scanner-output lines using vuln_intelligence.priority_score() as the single scoring formula — not yet wired to brain.py
 - `memory/attack_graph.py` — Typed capability graph (Asset/Endpoint/Credential/Capability/Boundary/Impact nodes) built from lead-board leads + browser intelligence, including cross-host bridging via matching cookie/storage/header value_fingerprint across two hosts; bounded N-leg DFS path search with provenance and contradiction-aware edge confidence; path_score() reuses vuln_intelligence's impact/time tables; top_paths() wired into director.py's build_plan() alongside board/browser-intel leads
 - `memory/identity.py` — Phase 6 — shared reference-id scheme (entity:<type>:<id>, object:<type>:<id>, endpoint:<path>, capability:<name>) used by object_model.py/candidate.py; attack_graph.py's pre-existing endpoint:/capability: node ids call these helpers, byte-identical output
