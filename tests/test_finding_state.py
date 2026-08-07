@@ -1,5 +1,7 @@
 """Tests for memory/finding_state.py — the finding lifecycle engine."""
 
+import json
+
 import pytest
 
 from memory.finding_state import (
@@ -110,6 +112,66 @@ class TestCanTransition:
         # Sanity check that FINDING_STATES and the transition rules agree.
         from memory.finding_state import ALLOWED_TRANSITIONS
         assert set(ALLOWED_TRANSITIONS.keys()) == set(FINDING_STATES)
+
+
+class TestFindingStateCLI:
+    """The CLI is how bash-only agents reach this module (module docstring) —
+    --self-critique-overall must actually work end to end, not just the
+    underlying can_transition()/advance() functions."""
+
+    def test_can_transition_cli_pass_allows(self, monkeypatch, capsys):
+        import sys as _sys
+        from memory.finding_state import main
+
+        monkeypatch.setattr(_sys, "argv", [
+            "finding_state.py", "can-transition",
+            "--current-state", "CONFIRMED", "--next-state", "SELF_CRITIQUED",
+            "--self-critique-overall", "pass",
+        ])
+        assert main() == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["allowed"] is True
+
+    def test_can_transition_cli_missing_overall_blocks(self, monkeypatch, capsys):
+        import sys as _sys
+        from memory.finding_state import main
+
+        monkeypatch.setattr(_sys, "argv", [
+            "finding_state.py", "can-transition",
+            "--current-state", "CONFIRMED", "--next-state", "SELF_CRITIQUED",
+        ])
+        assert main() == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["allowed"] is False
+        assert "self-critique gate must run" in out["reason"]
+
+    def test_advance_cli_persists_self_critique_overall(self, monkeypatch, capsys, finding_states_path):
+        import sys as _sys
+        from memory.finding_state import main
+
+        for state, extra in (
+            ("SUSPECTED", []), ("TESTING", []), ("VALIDATED", []),
+            ("CONFIRMED", ["--verdict", "STRONG"]),
+        ):
+            monkeypatch.setattr(_sys, "argv", [
+                "finding_state.py", "advance",
+                "--target", "a.com", "--vuln-class", "idor", "--endpoint", "/api/x",
+                "--state", state, "--memory-dir", str(finding_states_path.parent),
+                *extra,
+            ])
+            assert main() == 0
+            capsys.readouterr()
+
+        monkeypatch.setattr(_sys, "argv", [
+            "finding_state.py", "advance",
+            "--target", "a.com", "--vuln-class", "idor", "--endpoint", "/api/x",
+            "--state", "SELF_CRITIQUED", "--self-critique-overall", "warn",
+            "--memory-dir", str(finding_states_path.parent),
+        ])
+        assert main() == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["advanced"] is True
+        assert out["entry"]["self_critique_overall"] == "warn"
 
 
 class TestTransition:

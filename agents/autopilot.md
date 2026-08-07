@@ -104,11 +104,13 @@ Ten phases, not four. The old `RECON -> HUNT -> VALIDATE -> REPORT` shorthand hi
                             /remember step to forget.
 
 9.  REPORT                  report-writer drafts once finding_state.py allows the
-                            CONFIRMED -> REPORT_READY transition (requires
-                            reproducible evidence on record)
+                            CONFIRMED -> SELF_CRITIQUED -> REPORT_READY transitions
+                            (tools/self_critique.py's four-check gate must return
+                            pass/warn, then reproducible evidence must be on record)
                             WHY: writing the report is the cheap part; this gate exists
                             so a report never gets drafted for a finding that can't
-                            actually be reproduced from the writeup alone.
+                            actually be reproduced from the writeup alone, or that
+                            self-critique flagged as flaky/incomplete/likely-duplicate.
 
 10. CHECKPOINT               Show findings to human, per checkpoint mode
                             WHY: NEVER submit without explicit human approval (Safety
@@ -286,7 +288,7 @@ No separate action here — this is what already happened automatically in Step 
 
 ## Step 9: Report
 
-Once a finding is `CONFIRMED`, `report-writer` advances it to `REPORT_READY` (requires `--reproducible` — `finding_state.py` blocks this transition without it, "missing reproduction blocks REPORT_READY") right before drafting. Draft reports for validated findings using the report-writer format.
+Once a finding is `CONFIRMED`, `report-writer` runs `tools/self_critique.py` and advances it to `SELF_CRITIQUED` (requires a recorded `pass`/`warn` overall — `finding_state.py` blocks `CONFIRMED` → `REPORT_READY` directly now) and then to `REPORT_READY` (requires `--reproducible`) right before drafting. Draft reports for validated findings using the report-writer format.
 Do NOT submit — queue for human review.
 
 ## Step 10: Checkpoint

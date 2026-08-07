@@ -37,12 +37,17 @@ If the `validation-engine` agent hasn't already run on this finding, run its dup
 python3 -m memory.vuln_intelligence duplicate-check --target <target> --vuln-class <class> --endpoint <endpoint> --memory-dir hunt-memory
 ```
 
-Once you answered all four questions above concretely (especially #1 and #4 — that's what "reproducible" means here), advance the finding to `REPORT_READY`. `memory/finding_state.py` hard-blocks this transition without `--reproducible`, so a finding you're not actually ready to write can't be marked ready by accident:
+Once you answered all four questions above concretely (especially #1 and #4 — that's what "reproducible" means here), run `tools/self_critique.py` and advance the finding through `SELF_CRITIQUED` to `REPORT_READY`. Phase 7 gates `REPORT_READY` behind `SELF_CRITIQUED` — `memory/finding_state.py` hard-blocks a direct `CONFIRMED` → `REPORT_READY` jump, and blocks `SELF_CRITIQUED` itself without a recorded `pass`/`warn` overall, so a finding you're not actually ready to write can't be marked ready by accident:
 ```bash
+python3 -m tools.self_critique --candidate <candidate.json> --report-outcomes hunt-memory/report_outcomes.jsonl \
+  --observations hunt-memory/observations.jsonl --allowed-domain <target>
+# read the printed report's "overall" (pass/warn/block), then:
+python3 -m memory.finding_state advance --target <target> --vuln-class <class> --endpoint <endpoint> \
+  --state SELF_CRITIQUED --self-critique-overall <overall> --memory-dir hunt-memory
 python3 -m memory.finding_state advance --target <target> --vuln-class <class> --endpoint <endpoint> \
   --state REPORT_READY --reproducible --memory-dir hunt-memory
 ```
-If that command errors, it's telling you something upstream is missing — either `validator` never ran (finding never reached `CONFIRMED`) or `validation-engine` never recorded a STRONG verdict. Don't write the report until it succeeds.
+If either command errors, it's telling you something upstream is missing — either `validator` never ran (finding never reached `CONFIRMED`), `validation-engine` never recorded a STRONG verdict, or the self-critique gate returned `block`. Don't write the report until both succeed.
 
 ## Memory-Informed Writing
 
