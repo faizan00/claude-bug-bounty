@@ -129,13 +129,24 @@ class TestDuplicateProbability:
     def test_sample_backed_elevated_with_novel_impact_warns(self):
         assert MIN_SAMPLES_FOR_DEDUP_PROBABILITY == 5
         outcomes = self._outcomes(n_dup=4, n_total=5)  # 0.8 > 0.5, sample_size 5
-        candidate = _candidate(rationale="novel impact: this chains into full account takeover, unlike prior reports")
+        candidate = _candidate(metadata={
+            "target": "example.com",
+            "novel_impact_argument": "this chains into full account takeover, unlike prior reports",
+        })
         result = sc.check_duplicate_probability(candidate, report_outcomes=outcomes)
         assert result["status"] == "warn"
 
     def test_sample_backed_elevated_without_novel_impact_blocks(self):
         outcomes = self._outcomes(n_dup=4, n_total=5)
-        candidate = _candidate()  # default rationale has no "novel impact:" marker
+        candidate = _candidate()  # default metadata has no novel_impact_argument field
+        result = sc.check_duplicate_probability(candidate, report_outcomes=outcomes)
+        assert result["status"] == "block"
+
+    def test_sample_backed_elevated_with_blank_novel_impact_blocks(self):
+        """A present-but-empty/whitespace-only field must not count as an
+        argument -- BLOCK, not WARN, on the same elevated-probability case."""
+        outcomes = self._outcomes(n_dup=4, n_total=5)
+        candidate = _candidate(metadata={"target": "example.com", "novel_impact_argument": "   "})
         result = sc.check_duplicate_probability(candidate, report_outcomes=outcomes)
         assert result["status"] == "block"
 
