@@ -94,12 +94,13 @@ from pathlib import Path
 
 import yaml
 
-from memory.candidate import EVIDENCE_TYPES, make_candidate
-from memory.rotation import DEFAULT_KEEP, DEFAULT_MAX_BYTES, rotate_if_needed
-
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
+
+from memory.candidate import EVIDENCE_TYPES, make_candidate  # noqa: E402
+from memory.rotation import DEFAULT_KEEP, DEFAULT_MAX_BYTES, rotate_if_needed  # noqa: E402
+from tools.auth_session import AuthSession  # noqa: E402
 
 DEFAULT_LOGIC_PATTERNS_PATH = os.path.join(_REPO, "rules", "logic_patterns.yaml")
 
@@ -645,3 +646,82 @@ def detect_logic_pattern_violations(
             ))
 
     return candidates
+
+
+# ─── Part 3: stateful session checkpoint ────────────────────────────────────
+#
+# Reuses tools/auth_session.py's AuthSession — no reinvention. Same JSON
+# sidecar convention as tools/director.py's save_plan()/load_plan()
+# (plain json.dumps(..., indent=2, sort_keys=True), plain json.loads()).
+#
+# NEVER PERSISTED: cookies, bearer tokens, passwords, session IDs (the raw
+# values). AuthSession.session_id() is already a one-way sha256 hash of the
+# canonical header set (tools/auth_session.py's own docstring: "Secrets
+# never appear in logs or repr/str. The session_id is the only piece
+# written to hunt-memory") — that hash, never AuthSession.headers_dict()/
+# headers_list()/curl_args(), is the only thing this checkpoint ever
+# touches. reachable_objects/reachable_capabilities are validated to be
+# memory/identity.py-shaped reference strings (entity:/object:/endpoint:/
+# capability:), not arbitrary values, so a caller can't accidentally smuggle
+# a raw secret into either list.
+
+CHECKPOINT_VERSION = 1
+_IDENTITY_PREFIXES = ("entity:", "object:", "endpoint:", "capability:")
+
+
+def _is_identity_ref(value) -> bool:
+    return isinstance(value, str) and value.startswith(_IDENTITY_PREFIXES)
+
+
+def make_checkpoint(
+    workflow_state: dict,
+    reachable_objects: list[str],
+    reachable_capabilities: list[str],
+    auth_session: AuthSession | None = None,
+    metadata: dict | None = None,
+) -> dict:
+    """Build a workflow checkpoint. Raises ValueError if reachable_objects/
+    reachable_capabilities contain anything that isn't a memory/identity.py
+    -shaped reference string — the one guard against a raw value (a cookie,
+    a token, a literal user-supplied string) ending up somewhere this
+    checkpoint will later be written to disk."""
+    for label, refs in (("reachable_objects", reachable_objects), ("reachable_capabilities", reachable_capabilities)):
+        for ref in refs:
+            if not _is_identity_ref(ref):
+                raise ValueError(
+                    f"{label} entry {ref!r} is not an identity reference "
+                    f"(memory/identity.py — expected one of {_IDENTITY_PREFIXES})"
+                )
+
+    fingerprint = None
+    if auth_session is not None and not auth_session.is_empty():
+        fingerprint = auth_session.session_id()
+
+    return {
+        "version": CHECKPOINT_VERSION,
+        "workflow_state": dict(workflow_state),
+        "reachable_objects": list(reachable_objects),
+        "reachable_capabilities": list(reachable_capabilities),
+        "fingerprinted_session_reference": fingerprint,
+        "metadata": dict(metadata or {}),
+    }
+
+
+def save_session(checkpoint: dict, path: str | Path) -> str:
+    """JSON sidecar for cross-process workflow resume — same convention as
+    tools/director.py's save_plan()."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(checkpoint, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return str(out_path)
+
+
+def load_session(path: str | Path) -> dict:
+    """Inverse of save_session() — same convention as tools/director.py's
+    load_plan(). Raises ValueError if the file's `version` doesn't match
+    CHECKPOINT_VERSION this module knows how to read (fail loud on a
+    future format change, rather than silently misinterpreting one)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if data.get("version") != CHECKPOINT_VERSION:
+        raise ValueError(f"unsupported checkpoint version {data.get('version')!r}, expected {CHECKPOINT_VERSION}")
+    return data
