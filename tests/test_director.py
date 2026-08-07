@@ -1316,3 +1316,68 @@ class TestExplainAttackGraphLead:
         non_graph = next(c for c in candidates if c["lead"]["source"] != "attack-graph")
         text = d.explain(non_graph["lead"]["id"])
         assert "Attack-graph path" not in text
+
+
+class TestObjectModelLeads:
+    """Phase 6, Part 1: memory/object_model.py's relationship-violation
+    Candidates -> lead-board-shaped candidates via object_model_leads().
+    Cold-start (no memory/object_model/<target>.jsonl yet) must be [] and
+    must not change build_plan()'s output at all, the same guarantee every
+    other Phase 5/6 adapter gives."""
+
+    def test_cold_start_returns_empty(self, tmp_path):
+        assert director.object_model_leads("t.example", str(tmp_path / "hunt-memory")) == []
+
+    def test_cold_start_build_plan_byte_identical(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        mem_dir = str(tmp_path / "hunt-memory")
+        d1 = director.Director(memory_dir=mem_dir)
+        plan_before = d1.build_plan("t.example", hours=3, recon_dir=rd)
+
+        # An object_model dir existing with nothing recorded for THIS
+        # target must not change anything either.
+        (Path(mem_dir) / "object_model").mkdir(parents=True, exist_ok=True)
+        d2 = director.Director(memory_dir=mem_dir)
+        plan_after = d2.build_plan("t.example", hours=3, recon_dir=rd)
+
+        def _stable(plan):
+            return sorted((a.lead_id, a.vuln_class, a.priority) for a in plan.attacks)
+
+        assert _stable(plan_before) == _stable(plan_after)
+
+    def test_relationship_violation_becomes_hunt_idor_lead(self, tmp_path):
+        from memory import object_model as om
+        mem_dir = str(tmp_path / "hunt-memory")
+        path = director.object_model_observations_path("t.example", mem_dir)
+        store = om.ObservationStore(path)
+        alice = "entity:User:alice"
+        bob = "entity:User:bob"
+        doc = "object:Document:1"
+        ev = [{"type": "Observed-HTTP-Response", "detail": "d", "artifact": "a"}]
+        store.record(om.make_observation(alice, doc, "created", evidence=ev, ts="2026-01-01T00:00:00Z"))
+        store.record(om.make_observation(bob, doc, "accessed", evidence=ev, outcome_status=200,
+                                          ts="2026-01-02T00:00:00Z"))
+
+        leads = director.object_model_leads("t.example", mem_dir)
+        assert len(leads) == 1
+        assert leads[0]["skill"] == "hunt-idor"
+        assert leads[0]["priority"] == "high"
+        assert leads[0]["source"] == "object-model"
+        assert leads[0]["target"] == "t.example"
+
+    def test_object_model_lead_flows_into_build_plan(self, isolated, tmp_path):
+        from memory import object_model as om
+        mem_dir = str(tmp_path / "hunt-memory")
+        path = director.object_model_observations_path("t.example", mem_dir)
+        store = om.ObservationStore(path)
+        alice, bob, doc = "entity:User:alice", "entity:User:bob", "object:Document:1"
+        ev = [{"type": "Observed-HTTP-Response", "detail": "d", "artifact": "a"}]
+        store.record(om.make_observation(alice, doc, "created", evidence=ev, ts="2026-01-01T00:00:00Z"))
+        store.record(om.make_observation(bob, doc, "accessed", evidence=ev, outcome_status=200,
+                                          ts="2026-01-02T00:00:00Z"))
+
+        d = director.Director(memory_dir=mem_dir)
+        plan = d.build_plan("t.example", hours=3, recon_dir=str(isolated / "recon" / "t.example"))
+        assert any(a.vuln_class == "idor" for a in plan.attacks) or any(
+            s["vuln_class"] == "idor" for s in plan.skipped
+        )
