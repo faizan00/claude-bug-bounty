@@ -96,12 +96,14 @@ FINDING_STATE_OPTIONAL = {
     "previous_state",  # the state this event transitioned FROM
     "verdict",         # validation-engine's STRONG/WEAK/REJECT verdict, if this transition cited one
     "reproducible",    # bool -- whether reproducible evidence was on hand at this transition
+    "self_critique_overall",  # Phase 7 -- tools/self_critique.py's pass/warn/block, if this transition cited one
     "notes", "tags", "session_id",
 }
 FINDING_STATE_ALL = FINDING_STATE_REQUIRED | FINDING_STATE_OPTIONAL
 
-VALID_FINDING_STATES = {"SUSPECTED", "TESTING", "VALIDATED", "CONFIRMED", "REPORT_READY", "REJECTED"}
+VALID_FINDING_STATES = {"SUSPECTED", "TESTING", "VALIDATED", "CONFIRMED", "SELF_CRITIQUED", "REPORT_READY", "REJECTED"}
 VALID_FINDING_VERDICTS = {"STRONG", "WEAK", "REJECT"}
+VALID_SELF_CRITIQUE_OVERALLS = {"pass", "warn", "block"}
 
 
 def _current_session_id() -> str | None:
@@ -547,6 +549,12 @@ def validate_finding_state_entry(entry: dict) -> dict:
     if "reproducible" in entry and not isinstance(entry["reproducible"], bool):
         raise SchemaError(f"Finding-state entry: 'reproducible' must be a boolean, got {entry['reproducible']!r}")
 
+    if "self_critique_overall" in entry and entry["self_critique_overall"] not in VALID_SELF_CRITIQUE_OVERALLS:
+        raise SchemaError(
+            f"Finding-state entry: 'self_critique_overall' must be one of "
+            f"{sorted(VALID_SELF_CRITIQUE_OVERALLS)}, got {entry['self_critique_overall']!r}"
+        )
+
     if "tags" in entry:
         if not isinstance(entry["tags"], list) or not all(isinstance(t, str) for t in entry["tags"]):
             raise SchemaError("Finding-state entry: 'tags' must be a list of strings")
@@ -915,6 +923,7 @@ def make_finding_state_entry(
     previous_state: str | None = None,
     verdict: str | None = None,
     reproducible: bool | None = None,
+    self_critique_overall: str | None = None,
     notes: str | None = None,
     tags: list[str] | None = None,
     session_id: str | None = None,
@@ -934,6 +943,8 @@ def make_finding_state_entry(
         entry["verdict"] = verdict
     if reproducible is not None:
         entry["reproducible"] = reproducible
+    if self_critique_overall is not None:
+        entry["self_critique_overall"] = self_critique_overall
     if notes is not None:
         entry["notes"] = notes
     if tags is not None:

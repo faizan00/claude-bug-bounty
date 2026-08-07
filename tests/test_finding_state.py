@@ -1,5 +1,7 @@
 """Tests for memory/finding_state.py — the finding lifecycle engine."""
 
+import json
+
 import pytest
 
 from memory.finding_state import (
@@ -67,22 +69,109 @@ class TestCanTransition:
         assert result["allowed"] is True
 
     def test_report_ready_without_reproducible_blocked(self):
-        result = can_transition("CONFIRMED", "REPORT_READY")
+        # Phase 7: CONFIRMED must pass through SELF_CRITIQUED first.
+        result = can_transition("SELF_CRITIQUED", "REPORT_READY")
         assert result["allowed"] is False
         assert "missing reproduction blocks REPORT_READY" in result["reason"]
 
     def test_report_ready_with_reproducible_false_blocked(self):
-        result = can_transition("CONFIRMED", "REPORT_READY", {"reproducible": False})
+        result = can_transition("SELF_CRITIQUED", "REPORT_READY", {"reproducible": False})
         assert result["allowed"] is False
 
     def test_report_ready_with_reproducible_true_allowed(self):
+        result = can_transition("SELF_CRITIQUED", "REPORT_READY", {"reproducible": True})
+        assert result["allowed"] is True
+
+    # Phase 7 — the gate itself: CONFIRMED can no longer reach REPORT_READY
+    # directly; SELF_CRITIQUED sits in between and requires the self-critique
+    # gate to have actually run and cleared (pass or warn — not block).
+
+    def test_confirmed_to_report_ready_directly_no_longer_legal(self):
         result = can_transition("CONFIRMED", "REPORT_READY", {"reproducible": True})
+        assert result["allowed"] is False
+        assert "not a legal transition" in result["reason"]
+
+    def test_self_critiqued_without_evidence_blocked(self):
+        result = can_transition("CONFIRMED", "SELF_CRITIQUED")
+        assert result["allowed"] is False
+        assert "self-critique gate must run" in result["reason"]
+
+    def test_self_critiqued_with_block_overall_blocked(self):
+        result = can_transition("CONFIRMED", "SELF_CRITIQUED", {"self_critique_overall": "block"})
+        assert result["allowed"] is False
+
+    def test_self_critiqued_with_pass_overall_allowed(self):
+        result = can_transition("CONFIRMED", "SELF_CRITIQUED", {"self_critique_overall": "pass"})
+        assert result["allowed"] is True
+
+    def test_self_critiqued_with_warn_overall_allowed(self):
+        result = can_transition("CONFIRMED", "SELF_CRITIQUED", {"self_critique_overall": "warn"})
         assert result["allowed"] is True
 
     def test_all_states_covered_by_transition_table(self):
         # Sanity check that FINDING_STATES and the transition rules agree.
         from memory.finding_state import ALLOWED_TRANSITIONS
         assert set(ALLOWED_TRANSITIONS.keys()) == set(FINDING_STATES)
+
+
+class TestFindingStateCLI:
+    """The CLI is how bash-only agents reach this module (module docstring) —
+    --self-critique-overall must actually work end to end, not just the
+    underlying can_transition()/advance() functions."""
+
+    def test_can_transition_cli_pass_allows(self, monkeypatch, capsys):
+        import sys as _sys
+        from memory.finding_state import main
+
+        monkeypatch.setattr(_sys, "argv", [
+            "finding_state.py", "can-transition",
+            "--current-state", "CONFIRMED", "--next-state", "SELF_CRITIQUED",
+            "--self-critique-overall", "pass",
+        ])
+        assert main() == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["allowed"] is True
+
+    def test_can_transition_cli_missing_overall_blocks(self, monkeypatch, capsys):
+        import sys as _sys
+        from memory.finding_state import main
+
+        monkeypatch.setattr(_sys, "argv", [
+            "finding_state.py", "can-transition",
+            "--current-state", "CONFIRMED", "--next-state", "SELF_CRITIQUED",
+        ])
+        assert main() == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["allowed"] is False
+        assert "self-critique gate must run" in out["reason"]
+
+    def test_advance_cli_persists_self_critique_overall(self, monkeypatch, capsys, finding_states_path):
+        import sys as _sys
+        from memory.finding_state import main
+
+        for state, extra in (
+            ("SUSPECTED", []), ("TESTING", []), ("VALIDATED", []),
+            ("CONFIRMED", ["--verdict", "STRONG"]),
+        ):
+            monkeypatch.setattr(_sys, "argv", [
+                "finding_state.py", "advance",
+                "--target", "a.com", "--vuln-class", "idor", "--endpoint", "/api/x",
+                "--state", state, "--memory-dir", str(finding_states_path.parent),
+                *extra,
+            ])
+            assert main() == 0
+            capsys.readouterr()
+
+        monkeypatch.setattr(_sys, "argv", [
+            "finding_state.py", "advance",
+            "--target", "a.com", "--vuln-class", "idor", "--endpoint", "/api/x",
+            "--state", "SELF_CRITIQUED", "--self-critique-overall", "warn",
+            "--memory-dir", str(finding_states_path.parent),
+        ])
+        assert main() == 0
+        out = json.loads(capsys.readouterr().out)
+        assert out["advanced"] is True
+        assert out["entry"]["self_critique_overall"] == "warn"
 
 
 class TestTransition:
@@ -100,7 +189,15 @@ class TestTransition:
 
     def test_missing_reproduction_raises_on_report_ready(self):
         with pytest.raises(FindingStateError, match="missing reproduction blocks REPORT_READY"):
-            transition("CONFIRMED", "REPORT_READY")
+            transition("SELF_CRITIQUED", "REPORT_READY")
+
+    def test_confirmed_to_report_ready_directly_raises(self):
+        with pytest.raises(FindingStateError, match="not a legal transition"):
+            transition("CONFIRMED", "REPORT_READY", {"reproducible": True})
+
+    def test_missing_self_critique_raises_on_self_critiqued(self):
+        with pytest.raises(FindingStateError, match="self-critique gate must run"):
+            transition("CONFIRMED", "SELF_CRITIQUED")
 
 
 class TestFindingStateDB:
@@ -138,6 +235,7 @@ class TestFindingStateDB:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         db.advance("a.com", "idor", "/api/x", "CONFIRMED", evidence={"verdict": "STRONG"})
+        db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "pass"})
         db.advance("a.com", "idor", "/api/x", "REPORT_READY", evidence={"reproducible": True})
         assert db.current_state("a.com", "idor", "/api/x") == "REPORT_READY"
 
@@ -165,8 +263,29 @@ class TestFindingStateDB:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         db.advance("a.com", "idor", "/api/x", "CONFIRMED", evidence={"verdict": "STRONG"})
+        db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "pass"})
         with pytest.raises(FindingStateError, match="missing reproduction blocks REPORT_READY"):
             db.advance("a.com", "idor", "/api/x", "REPORT_READY")
+        assert db.current_state("a.com", "idor", "/api/x") == "SELF_CRITIQUED"
+
+    def test_report_ready_directly_from_confirmed_raises_and_does_not_persist(self, finding_states_path):
+        db = FindingStateDB(finding_states_path)
+        db.advance("a.com", "idor", "/api/x", "SUSPECTED")
+        db.advance("a.com", "idor", "/api/x", "TESTING")
+        db.advance("a.com", "idor", "/api/x", "VALIDATED")
+        db.advance("a.com", "idor", "/api/x", "CONFIRMED", evidence={"verdict": "STRONG"})
+        with pytest.raises(FindingStateError, match="not a legal transition"):
+            db.advance("a.com", "idor", "/api/x", "REPORT_READY", evidence={"reproducible": True})
+        assert db.current_state("a.com", "idor", "/api/x") == "CONFIRMED"
+
+    def test_self_critiqued_without_gate_evidence_raises_and_does_not_persist(self, finding_states_path):
+        db = FindingStateDB(finding_states_path)
+        db.advance("a.com", "idor", "/api/x", "SUSPECTED")
+        db.advance("a.com", "idor", "/api/x", "TESTING")
+        db.advance("a.com", "idor", "/api/x", "VALIDATED")
+        db.advance("a.com", "idor", "/api/x", "CONFIRMED", evidence={"verdict": "STRONG"})
+        with pytest.raises(FindingStateError, match="self-critique gate must run"):
+            db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "block"})
         assert db.current_state("a.com", "idor", "/api/x") == "CONFIRMED"
 
     def test_history_ordered_oldest_first(self, finding_states_path):
