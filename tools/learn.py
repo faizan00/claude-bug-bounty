@@ -23,6 +23,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 from tools.banner import print_banner  # noqa: E402
+from tools import fingerprint  # noqa: E402 — pure/offline; see fetch_and_cache_cve() below
 
 # macOS: Python may not have system SSL certs. Use unverified context for API queries.
 _SSL_CTX = ssl.create_default_context()
@@ -264,6 +265,101 @@ def fetch_intel(techs: list[str]) -> list[dict]:
 
 def severity_order(s: str) -> int:
     return {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "MODERATE": 2, "LOW": 3, "UNKNOWN": 4}.get(s.upper(), 4)
+
+
+# ─── Phase 5, Part D: live CVE -> tools/tech_attack_matrix.json population ──
+#
+# EVERY OTHER FUNCTION IN THIS FILE ALREADY MAKES LIVE NETWORK CALLS (that's
+# this module's whole job) — but fetch_and_cache_cve() is new in a
+# different sense: it's the first thing in this repo that turns a live
+# fetch into data cached back into the SAME matrix schema priority_score()
+# reads via its tech_attack_matrix param (tools/fingerprint.py's
+# deliberately-offline Phase 3 design). Every caller of this function
+# (tools/fingerprint.py's CLI) must gate it behind an explicit opt-in flag,
+# default OFF — see --live-cve-lookup there.
+
+
+def _weight_for_cve_result(result: dict) -> int:
+    """0-100 tech_attack_matrix.json weight, derived only from real fetched
+    data — never invented:
+      - NVD gives a real CVSS base score (0-10, a cited external standard,
+        https://www.first.org/cvss/) -> linear rescale to the 0-100 scale
+        every other weight in tech_attack_matrix.json already uses
+        (weight = score * 10) — a unit conversion between two fixed,
+        already-established numeric ranges, not a judgment call.
+      - GitHub Advisory gives only a severity tier string, no numeric score
+        -> fingerprint.severity_weight_tier(), the EXACT existing critical/
+        high/medium/low boundary weights tools/fingerprint.py's
+        _severity_for_weight() already treats as canonical — reused, not
+        reinvented.
+    """
+    score = result.get("score")
+    if isinstance(score, (int, float)):
+        return max(0, min(100, round(score * 10)))
+    return fingerprint.severity_weight_tier(result.get("severity", ""))
+
+
+def fetch_and_cache_cve(
+    tag: str,
+    version: str | None = None,
+    existing_matrix: dict | None = None,
+    cache_path: str | None = None,
+) -> dict | None:
+    """OPT-IN, NETWORK-CALLING: fetch real CVE data for `tag` (a
+    fingerprinted framework/tech name) from GitHub Advisory DB + NVD (this
+    module's own fetch_github_advisories()/fetch_nvd_cves(), already used
+    by fetch_intel() above) and cache it to disk in tools/
+    tech_attack_matrix.json's own version_ranges/vulns shape — see
+    tools/fingerprint.py's merge_tech_attack_matrix()/has_cve_for(), which
+    this reuses rather than re-deriving matrix-matching logic here.
+
+    Never fabricates a CVE id: only real results whose `id` actually starts
+    with "CVE-" get cached (a bare GHSA id or HackerOne report URL is not a
+    CVE). A tag with no real CVE found leaves the cache untouched for this
+    tag — cve stays null/absent, same as today, per Part D's spec.
+
+    vuln_class is set to "misconfig" — the SAME safe default memory/
+    finding_score.py's SCANNER_CATEGORY_ALIASES already uses for a raw CVE
+    signal that hasn't been bucketed into a specific vuln class (NVD/
+    GitHub-Advisory JSON has no vuln_class field to read instead of
+    guessing one; reusing the existing convention beats inventing a new
+    default bucket).
+
+    Cache-first: if fingerprint.has_cve_for() already finds a real cve for
+    this tag+version in existing_matrix merged with the on-disk cache, this
+    returns the cached entry WITHOUT a new network call — "fetch and
+    cache", not "fetch every time".
+    """
+    if cache_path is None:
+        cache_path = fingerprint.DEFAULT_LIVE_CVE_CACHE_PATH
+
+    cache = fingerprint.load_tech_attack_matrix(cache_path)
+    merged = fingerprint.merge_tech_attack_matrix(existing_matrix or {}, cache)
+    if fingerprint.has_cve_for(tag, version, merged):
+        return cache.get(tag)
+
+    results = fetch_github_advisories(tag) + fetch_nvd_cves(tag)
+    real = [r for r in results if (r.get("id") or "").startswith("CVE-")]
+    if not real:
+        return None
+
+    real.sort(key=lambda r: severity_order(r.get("severity", "UNKNOWN")))
+    best = real[0]
+    entry = {
+        "version_ranges": [{
+            "range": f"=={version}" if version else "*",
+            "vulns": [{
+                "class": "misconfig",
+                "weight": _weight_for_cve_result(best),
+                "cve": best["id"],
+                "citation": f"{best.get('source', 'live lookup')}: {best.get('summary', '')} "
+                            f"(fetched {datetime.now().strftime('%Y-%m-%d')})",
+            }],
+        }],
+    }
+    cache[tag] = entry
+    fingerprint.save_tech_attack_matrix_cache(cache, cache_path)
+    return entry
 
 
 def build_markdown(techs: list[str], results: list[dict]) -> str:

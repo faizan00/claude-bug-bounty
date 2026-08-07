@@ -85,11 +85,12 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 - `tools/recon_engine.sh` — subdomain + URL discovery (now with optional `nuclei` phase)
 - `tools/vuln_scanner.sh` — XSS/SQLi/SSTI/MFA/SAML probe pipeline
 - `tools/validate.py` — 4-gate finding validator
-- `tools/learn.py` — CVE + disclosure intel
+- `tools/learn.py` — CVE + disclosure intel; `fetch_and_cache_cve()` (Phase 5) populates `tools/tech_attack_matrix_live_cache.json` with real fetched CVEs, called only via `fingerprint.py`'s opt-in `--live-cve-lookup` flag (new network call, default OFF)
 - `tools/intel_engine.py` — on-demand intel with memory context
 - `tools/scope_checker.py` — deterministic scope safety checker
 - `tools/scope_aggregator.sh` — multi-platform scope pull (bbscope + bounty-targets-data)
-- `tools/secrets_hunter.sh` — trufflehog/noseyparker/gitleaks wrapper for FS/git/JS/GH-org
+- `tools/secrets_hunter.sh` — trufflehog/noseyparker/gitleaks wrapper for FS/git/JS/GH-org; `--recon-sources` mode runs `secrets_scanner.py` against Phase 1's recovered sources + cicd_scanner.sh output, no network I/O
+- `tools/secrets_scanner.py` — pattern + Shannon-entropy + JS-signal (internal API URLs, feature flags, GraphQL fragments, exposed sourcemaps) secret scanner over `recon/<target>/browser/sources/` and `recon/<target>/cicd/`
 - `tools/takeover_scanner.sh` — dnsReaper/subjack subdomain-takeover scanner
 - `tools/cloud_recon.sh` — S3Scanner + cloud_enum + CloudFail wrapper
 - `tools/param_discovery.sh` — Arjun/x8 hidden-parameter discovery

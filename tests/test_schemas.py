@@ -296,6 +296,34 @@ class TestReportOutcomeValidation:
         with pytest.raises(SchemaError, match="unknown fields"):
             validate_report_outcome_entry(sample_report_outcome_entry)
 
+    def test_optional_endpoint_and_tech_stack_accepted(self, sample_report_outcome_entry):
+        sample_report_outcome_entry["endpoint"] = "/api/users/123"
+        sample_report_outcome_entry["tech_stack"] = ["express", "nextjs"]
+        result = validate_report_outcome_entry(sample_report_outcome_entry)
+        assert result["endpoint"] == "/api/users/123"
+        assert result["tech_stack"] == ["express", "nextjs"]
+
+    def test_entries_without_endpoint_or_tech_stack_still_valid(self):
+        # Phase 5 additive fields: old entries lacking them must stay valid.
+        entry = {
+            "ts": "2026-03-24T21:00:00Z",
+            "target": "target.com",
+            "vuln_class": "idor",
+            "outcome": "accepted",
+            "schema_version": CURRENT_SCHEMA_VERSION,
+        }
+        assert validate_report_outcome_entry(entry) == entry
+
+    def test_empty_endpoint_rejected(self, sample_report_outcome_entry):
+        sample_report_outcome_entry["endpoint"] = ""
+        with pytest.raises(SchemaError, match="'endpoint' must be a non-empty"):
+            validate_report_outcome_entry(sample_report_outcome_entry)
+
+    def test_tech_stack_must_be_list_of_strings(self, sample_report_outcome_entry):
+        sample_report_outcome_entry["tech_stack"] = "express"
+        with pytest.raises(SchemaError, match="'tech_stack' must be a list"):
+            validate_report_outcome_entry(sample_report_outcome_entry)
+
 
 class TestTargetProfileValidation:
 
@@ -402,6 +430,22 @@ class TestFactoryFunctions:
         assert entry["outcome"] == "accepted"
         assert entry["platform"] == "hackerone"
         assert entry["schema_version"] == CURRENT_SCHEMA_VERSION
+
+    def test_make_report_outcome_entry_with_endpoint_and_tech_stack(self):
+        entry = make_report_outcome_entry(
+            target="target.com",
+            vuln_class="idor",
+            outcome="duplicate",
+            endpoint="/api/users/{id}",
+            tech_stack=["express"],
+        )
+        assert entry["endpoint"] == "/api/users/{id}"
+        assert entry["tech_stack"] == ["express"]
+
+    def test_make_report_outcome_entry_omits_endpoint_and_tech_stack_by_default(self):
+        entry = make_report_outcome_entry(target="target.com", vuln_class="idor", outcome="accepted")
+        assert "endpoint" not in entry
+        assert "tech_stack" not in entry
 
     def test_make_experiment_entry(self):
         entry = make_experiment_entry(

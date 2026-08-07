@@ -307,3 +307,210 @@ class TestMatrixReachesPriorityScore:
         # Real win/loss experience exists -> affinity confidence path used,
         # not the matrix floor-replacement branch at all.
         assert result["components"]["technology_match"] != 90
+
+
+class TestMergeTechAttackMatrix:
+    """Phase 5, Part D — combining the hand-curated static matrix with an
+    auto-fetched live-CVE cache. Pure, no network, no mutation of inputs."""
+
+    def test_empty_inputs_yield_empty_matrix(self):
+        assert fp.merge_tech_attack_matrix({}, {}) == {}
+
+    def test_static_only_passes_through(self):
+        static = {"nextjs": {"version_ranges": [{"range": "*", "vulns": []}]}}
+        assert fp.merge_tech_attack_matrix(static, {}) == static
+
+    def test_live_only_passes_through(self):
+        live = {"rails": {"version_ranges": [{"range": "*", "vulns": []}]}}
+        assert fp.merge_tech_attack_matrix({}, live) == live
+
+    def test_same_tag_concatenates_version_ranges(self):
+        static = {"nextjs": {"version_ranges": [{"range": "*", "vulns": [{"class": "ssrf", "weight": 50, "cve": None, "citation": "x"}]}]}}
+        live = {"nextjs": {"version_ranges": [{"range": "==14.0.1", "vulns": [{"class": "misconfig", "weight": 90, "cve": "CVE-2024-1234", "citation": "y"}]}]}}
+        merged = fp.merge_tech_attack_matrix(static, live)
+        assert len(merged["nextjs"]["version_ranges"]) == 2
+
+    def test_inputs_not_mutated(self):
+        static = {"nextjs": {"version_ranges": [{"range": "*", "vulns": []}]}}
+        live = {"nextjs": {"version_ranges": [{"range": "==1.0.0", "vulns": []}]}}
+        fp.merge_tech_attack_matrix(static, live)
+        assert len(static["nextjs"]["version_ranges"]) == 1
+        assert len(live["nextjs"]["version_ranges"]) == 1
+
+    def test_merged_matrix_still_consumable_by_match_cves_via_has_cve_for(self):
+        live = {"rails": {"version_ranges": [{"range": "*", "vulns": [{"class": "misconfig", "weight": 70, "cve": "CVE-2023-9999", "citation": "z"}]}]}}
+        merged = fp.merge_tech_attack_matrix({}, live)
+        assert fp.has_cve_for("rails", None, merged) is True
+
+
+class TestHasCveFor:
+
+    def test_no_entry_for_tag_is_false(self):
+        assert fp.has_cve_for("unknown-tag", None, {}) is False
+
+    def test_weight_only_entry_is_false(self):
+        matrix = {"graphql": {"version_ranges": [{"range": "*", "vulns": [{"class": "idor", "weight": 80, "cve": None, "citation": "x"}]}]}}
+        assert fp.has_cve_for("graphql", None, matrix) is False
+
+    def test_real_cve_entry_is_true(self):
+        matrix = {"nextjs": {"version_ranges": [{"range": ">=11.1.4,<13.5.9", "vulns": [{"class": "auth-bypass", "weight": 90, "cve": "CVE-2025-29927", "citation": "x"}]}]}}
+        assert fp.has_cve_for("nextjs", "12.0.0", matrix) is True
+
+    def test_real_cve_outside_version_range_is_false(self):
+        matrix = {"nextjs": {"version_ranges": [{"range": ">=11.1.4,<13.5.9", "vulns": [{"class": "auth-bypass", "weight": 90, "cve": "CVE-2025-29927", "citation": "x"}]}]}}
+        assert fp.has_cve_for("nextjs", "14.0.0", matrix) is False
+
+    def test_default_matrix_next_js_known_cve(self):
+        matrix = fp.load_tech_attack_matrix()
+        assert fp.has_cve_for("nextjs", "12.0.0", matrix) is True
+
+
+class TestSeverityWeightTier:
+    """Reuses _severity_for_weight()'s exact tier boundaries — no new
+    heuristic constants, just the inverse mapping of an existing one."""
+
+    def test_critical_maps_to_the_critical_boundary(self):
+        assert fp.severity_weight_tier("CRITICAL") == 90
+
+    def test_high_maps_to_the_high_boundary(self):
+        assert fp.severity_weight_tier("HIGH") == 70
+
+    def test_medium_maps_to_the_medium_boundary(self):
+        assert fp.severity_weight_tier("MEDIUM") == 40
+
+    def test_moderate_treated_same_as_medium(self):
+        assert fp.severity_weight_tier("MODERATE") == 40
+
+    def test_low_maps_to_the_existing_cold_start_floor(self):
+        assert fp.severity_weight_tier("LOW") == 20
+
+    def test_unknown_severity_falls_to_low_floor(self):
+        assert fp.severity_weight_tier("nonsense") == 20
+        assert fp.severity_weight_tier("") == 20
+
+    def test_round_trips_through_severity_for_weight(self):
+        # severity_weight_tier() is the inverse of the private
+        # _severity_for_weight() — the boundary weight for each tier must
+        # classify back to that same tier.
+        for severity, weight in (("critical", 90), ("high", 70), ("medium", 40), ("low", 20)):
+            assert fp._severity_for_weight(weight) == severity
+
+
+class TestSaveTechAttackMatrixCache:
+
+    def test_writes_valid_json_readable_by_load_tech_attack_matrix(self, tmp_path):
+        path = tmp_path / "cache.json"
+        matrix = {"nextjs": {"version_ranges": [{"range": "==14.0.1", "vulns": [{"class": "misconfig", "weight": 90, "cve": "CVE-2024-1234", "citation": "x"}]}]}}
+        fp.save_tech_attack_matrix_cache(matrix, str(path))
+        assert fp.load_tech_attack_matrix(str(path)) == matrix
+
+    def test_creates_parent_directories(self, tmp_path):
+        path = tmp_path / "nested" / "dir" / "cache.json"
+        fp.save_tech_attack_matrix_cache({}, str(path))
+        assert path.exists()
+
+
+class TestLiveCveLookupCli:
+    """Phase 5, Part D — fp.main()'s --live-cve-lookup opt-in flag. Mocks
+    tools.learn.fetch_and_cache_cve() so these tests never touch the real
+    network (module-level main() only reaches it via a local `from tools
+    import learn` — monkeypatching the already-imported module object
+    works regardless of that import's timing)."""
+
+    def test_default_run_never_imports_or_calls_learn(self, tmp_path, monkeypatch, capsys):
+        from tools import learn as learn_module
+
+        def _boom(*a, **kw):
+            raise AssertionError("must not be called without --live-cve-lookup")
+
+        monkeypatch.setattr(learn_module, "fetch_and_cache_cve", _boom)
+        rd = tmp_path / "recon" / "t.example"
+        _write_httpx(rd, ["https://t.example [200] [Home] [Django,gunicorn]"])
+        exit_code = fp.main(["--target", "t.example", "--recon-dir", str(rd), "--quiet"])
+        assert exit_code == 0
+
+    def test_live_cve_lookup_fetches_only_for_a_real_gap(self, tmp_path, monkeypatch, capsys):
+        from tools import learn as learn_module
+
+        calls = []
+
+        def _fake_fetch(tag, version=None, existing_matrix=None, cache_path=None):
+            calls.append((tag, version))
+            return {
+                "version_ranges": [{
+                    "range": "*",
+                    "vulns": [{"class": "misconfig", "weight": 70, "cve": "CVE-2024-7777", "citation": "test"}],
+                }],
+            }
+
+        monkeypatch.setattr(learn_module, "fetch_and_cache_cve", _fake_fetch)
+
+        rd = tmp_path / "recon" / "t.example"
+        _write_httpx(rd, ["https://t.example [200] [Home] [Django,gunicorn]"])
+        cache_path = tmp_path / "live_cache.json"
+        exit_code = fp.main([
+            "--target", "t.example", "--recon-dir", str(rd),
+            "--live-cve-lookup", "--live-cve-cache", str(cache_path), "--quiet",
+        ])
+        assert exit_code == 0
+        assert calls == [("django", None)]  # django has no version signal in httpx text
+
+    def test_live_cve_lookup_skips_fetch_when_matrix_already_has_a_real_cve(self, tmp_path, monkeypatch):
+        from tools import learn as learn_module
+
+        def _boom(*a, **kw):
+            raise AssertionError("must not fetch — nextjs 12.0.0 already has a real cve in the static matrix")
+
+        monkeypatch.setattr(learn_module, "fetch_and_cache_cve", _boom)
+
+        rd = tmp_path / "recon" / "t.example"
+        # httpx text only (not routes.json) so a VERSION is actually
+        # extracted — routes.json's framework_detected wins tier2 with no
+        # version attached, which would make has_cve_for() fail closed and
+        # defeat this test's premise.
+        _write_httpx(rd, ["https://t.example [200] [Home] [Next.js 12.0.0]"])
+        cache_path = tmp_path / "live_cache.json"
+        exit_code = fp.main([
+            "--target", "t.example", "--recon-dir", str(rd),
+            "--live-cve-lookup", "--live-cve-cache", str(cache_path), "--quiet",
+        ])
+        assert exit_code == 0
+
+    def test_fetched_cve_reaches_the_written_fingerprint(self, tmp_path, monkeypatch):
+        from tools import learn as learn_module
+
+        def _fake_fetch(tag, version=None, existing_matrix=None, cache_path=None):
+            return {
+                "version_ranges": [{
+                    "range": "*",
+                    "vulns": [{"class": "misconfig", "weight": 70, "cve": "CVE-2024-8888", "citation": "test"}],
+                }],
+            }
+
+        monkeypatch.setattr(learn_module, "fetch_and_cache_cve", _fake_fetch)
+
+        rd = tmp_path / "recon" / "t.example"
+        _write_httpx(rd, ["https://t.example [200] [Home] [Django,gunicorn]"])
+        cache_path = tmp_path / "live_cache.json"
+        fp.main([
+            "--target", "t.example", "--recon-dir", str(rd),
+            "--live-cve-lookup", "--live-cve-cache", str(cache_path), "--quiet",
+        ])
+        written = json.loads((rd / "fingerprint.json").read_text())
+        assert any(c["id"] == "CVE-2024-8888" for c in written["cves"])
+
+    def test_no_real_cve_found_leaves_cve_null_same_as_today(self, tmp_path, monkeypatch):
+        from tools import learn as learn_module
+
+        monkeypatch.setattr(learn_module, "fetch_and_cache_cve", lambda *a, **kw: None)
+
+        rd = tmp_path / "recon" / "t.example"
+        _write_httpx(rd, ["https://t.example [200] [Home] [Django,gunicorn]"])
+        cache_path = tmp_path / "live_cache.json"
+        exit_code = fp.main([
+            "--target", "t.example", "--recon-dir", str(rd),
+            "--live-cve-lookup", "--live-cve-cache", str(cache_path), "--quiet",
+        ])
+        assert exit_code == 0
+        written = json.loads((rd / "fingerprint.json").read_text())
+        assert written["cves"] == []

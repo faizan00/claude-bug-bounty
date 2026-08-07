@@ -98,6 +98,7 @@ This repo is an agent-portable bug bounty plugin for professional hunting across
 - `tools/scope_checker.py` — Deterministic scope safety checker — anchored allowlist/blocklist matching before any outbound request
 - `tools/scope_aggregator.sh` — Multi-platform in-scope asset pull (bbscope + bounty-targets-data dump)
 - `tools/secrets_hunter.sh` — trufflehog/noseyparker/gitleaks wrapper for filesystem/git/JS-bundle/GitHub-org secret scanning
+- `tools/secrets_scanner.py` — Pattern + Shannon-entropy + JS-signal secret scanner over Phase 1's recovered source maps and cicd_scanner.sh output (no network I/O)
 - `tools/takeover_scanner.sh` — dnsReaper/subjack subdomain-takeover scanner with built-in fingerprint-grep fallback
 - `tools/cloud_recon.sh` — S3Scanner + cloud_enum + CloudFail wrapper for public bucket discovery and CloudFlare-bypass origin IPs
 - `tools/param_discovery.sh` — Arjun/x8 hidden-parameter discovery

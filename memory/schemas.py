@@ -47,6 +47,10 @@ CHAIN_ALL = CHAIN_REQUIRED | CHAIN_OPTIONAL
 REPORT_OUTCOME_REQUIRED = {"ts", "target", "vuln_class", "outcome", "schema_version"}
 REPORT_OUTCOME_OPTIONAL = {
     "technique", "platform", "severity", "payout", "report_id", "notes", "tags", "session_id",
+    # endpoint/tech_stack (Phase 5): additive — lets dedup_probability() key on
+    # endpoint-shape + tech-stack, not just vuln_class. Entries saved before
+    # this existed simply lack them; every reader treats them as optional.
+    "endpoint", "tech_stack",
 }
 REPORT_OUTCOME_ALL = REPORT_OUTCOME_REQUIRED | REPORT_OUTCOME_OPTIONAL
 
@@ -357,6 +361,15 @@ def validate_report_outcome_entry(entry: dict) -> dict:
     if "session_id" in entry:
         if not isinstance(entry["session_id"], str) or not entry["session_id"].strip():
             raise SchemaError("Report outcome entry: 'session_id' must be a non-empty string")
+
+    if "endpoint" in entry:
+        if not isinstance(entry["endpoint"], str) or not entry["endpoint"].strip():
+            raise SchemaError("Report outcome entry: 'endpoint' must be a non-empty string")
+
+    if "tech_stack" in entry:
+        ts = entry["tech_stack"]
+        if not isinstance(ts, list) or not all(isinstance(t, str) for t in ts):
+            raise SchemaError("Report outcome entry: 'tech_stack' must be a list of strings")
 
     return entry
 
@@ -762,6 +775,8 @@ def make_report_outcome_entry(
     notes: str | None = None,
     tags: list[str] | None = None,
     session_id: str | None = None,
+    endpoint: str | None = None,
+    tech_stack: list[str] | None = None,
 ) -> dict:
     """Create and validate a new report-outcome entry with current timestamp."""
     entry = {
@@ -789,6 +804,10 @@ def make_report_outcome_entry(
         session_id = _current_session_id()
     if session_id is not None:
         entry["session_id"] = session_id
+    if endpoint is not None:
+        entry["endpoint"] = endpoint
+    if tech_stack is not None:
+        entry["tech_stack"] = tech_stack
 
     return validate_report_outcome_entry(entry)
 
