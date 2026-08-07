@@ -11,8 +11,9 @@ stays the one formula):
   2. DUPLICATE PROBABILITY — calls memory/vuln_intelligence.py's
                           dedup_probability() unmodified. WARN when sample-
                           backed and elevated; BLOCK the same case if the
-                          Candidate's rationale carries no novel-impact
-                          argument.
+                          Candidate's metadata.novel_impact_argument is
+                          absent/empty (a structured field, not prose
+                          parsed out of rationale).
   3. EVIDENCE COMPLETENESS — a pure structural check against the Candidate
                           schema itself (memory/candidate.py).
   4. BUSINESS-IMPACT CROSS-CHECK — cross-references memory/object_model.py's
@@ -51,13 +52,6 @@ from memory.vuln_intelligence import (  # noqa: E402
 )
 
 CHECK_STATUSES = frozenset({"pass", "warn", "block"})
-
-# A Candidate's rationale opts into the "duplicate risk accepted, here's why
-# it's still worth reporting" path by carrying this literal marker followed
-# by its argument -- an explicit, deterministic convention (never a fuzzy
-# keyword/sentiment guess over free text, which PERMANENT RULE 4 would treat
-# as an unjustified heuristic).
-_NOVEL_IMPACT_MARKER = "novel impact:"
 
 # validation_plan.expected is free-text (e.g. "403 / 401"); this extracts
 # any 3-digit HTTP status codes it names. Not a heuristic constant -- a
@@ -150,8 +144,14 @@ def check_duplicate_probability(candidate: dict, report_outcomes: list[dict] | N
     priority_score() itself consumes. WARN when the sample-backed
     probability is elevated (above DEFAULT_DEDUP_PROBABILITY, the same 0.5
     cold-start baseline dedup_probability() already treats as neutral) and
-    the rationale carries a novel-impact argument; BLOCK the identical case
-    with no such argument."""
+    candidate.metadata["novel_impact_argument"] is a non-empty string;
+    BLOCK the identical case when it's absent/empty.
+
+    A structured metadata field, not a marker phrase parsed out of
+    `rationale` -- PERMANENT RULE 4 only requires this be a structural
+    presence check, not a heuristic score, and a required field a caller
+    either did or didn't set is less error-prone than a hunter having to
+    remember an exact magic phrase in free text."""
     metadata = candidate.get("metadata") or {}
     vuln_class = candidate.get("type", "")
     endpoint = metadata.get("endpoint")
@@ -165,21 +165,21 @@ def check_duplicate_probability(candidate: dict, report_outcomes: list[dict] | N
 
     sample_backed = result["sample_size"] >= MIN_SAMPLES_FOR_DEDUP_PROBABILITY
     elevated = sample_backed and result["probability"] > DEFAULT_DEDUP_PROBABILITY
-    rationale = (candidate.get("rationale") or "").lower()
-    has_novel_impact_argument = _NOVEL_IMPACT_MARKER in rationale
+    novel_impact_argument = (metadata.get("novel_impact_argument") or "").strip()
+    has_novel_impact_argument = bool(novel_impact_argument)
 
     if elevated and not has_novel_impact_argument:
         return _result(
             "duplicate_probability", "block",
             f"sample-backed duplicate probability {result['probability']} ({result['basis']}) "
-            f"with no novel-impact argument in rationale",
+            f"with no metadata.novel_impact_argument",
             details={"dedup_probability": result},
         )
     if elevated:
         return _result(
             "duplicate_probability", "warn",
             f"sample-backed duplicate probability {result['probability']} ({result['basis']}) "
-            f"-- allowed through on the rationale's novel-impact argument",
+            f"-- allowed through on metadata.novel_impact_argument",
             details={"dedup_probability": result},
         )
     return _result(
