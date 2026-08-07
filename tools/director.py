@@ -67,6 +67,8 @@ from memory.vuln_intelligence import (  # noqa: E402
     tech_vuln_affinity,
 )
 from memory.experiment_memory import should_stop  # noqa: E402
+from memory import object_model  # noqa: E402  (Phase 6 — object_model.py never imports this module, no circularity)
+from memory.candidate import candidate_to_lead_view  # noqa: E402
 
 # ─── State machine ──────────────────────────────────────────────────────────
 
@@ -643,6 +645,71 @@ def secret_scan_leads(target: str, recon_dir: str) -> list[dict]:
     return leads
 
 
+# ─── Object Model -> concrete leads (Phase 6, Part 1) ──────────────────────
+#
+# memory/object_model.py's detect_relationship_violations() emits Candidates
+# (memory/candidate.py's schema) — never a lead-board-shaped dict, and never
+# a priority. This is the ONE place that bridges the two: a type->(skill,
+# priority) routing table this module owns (same convention as
+# _SECRET_FINDING_ROUTE/_GRAPHQL_AUDIT_SIGNALS above), converting each
+# Candidate via candidate_to_lead_view() so it enters `all_leads`/
+# `_score_lead()` exactly the way every other source already does.
+# memory/object_model.py itself never imports lead_board/priority_score/any
+# P_HIGH-shaped constant — Director stays the only place a Candidate becomes
+# a scored lead, and Object Model stays the only place a relationship gets
+# computed. Cold-start (no observations.jsonl for this target yet) returns
+# [] — object_model.ObservationStore.all() on a missing path already does
+# this, so there's nothing extra to guard here.
+
+_OBJECT_MODEL_ROUTE: dict[str, tuple[str, str]] = {
+    # Part 1 — detect_relationship_violations()
+    "ownership_violation": ("hunt-idor", lead_board.P_HIGH),
+    "tenant_isolation_violation": ("hunt-idor", lead_board.P_HIGH),
+    # Part 2 — detect_logic_pattern_violations() (rules/logic_patterns.yaml's
+    # vuln_type per pattern; skill here matches each pattern's own `skill`
+    # field, kept as a separate table so Director stays the one place a
+    # Candidate type maps to a lead-board skill/priority tier, same
+    # convention as every other *_leads() adapter).
+    "invite_flow_violation": ("hunt-business-logic", lead_board.P_HIGH),
+    "ownership_transfer_violation": ("hunt-idor", lead_board.P_HIGH),
+    "tenant_isolation_pattern_violation": ("hunt-idor", lead_board.P_HIGH),
+    "billing_violation": ("hunt-business-logic", lead_board.P_HIGH),
+    "refund_violation": ("hunt-business-logic", lead_board.P_HIGH),
+    "coupon_violation": ("hunt-business-logic", lead_board.P_MED),
+    "role_escalation_violation": ("hunt-auth-bypass", lead_board.P_HIGH),
+}
+_OBJECT_MODEL_DEFAULT_ROUTE = ("hunt-business-logic", lead_board.P_MED)
+
+
+def object_model_observations_path(target: str, memory_dir: str) -> Path:
+    """memory/object_model/<target>.jsonl — same per-target-file-under-
+    memory_dir convention as tools/lead_board.py's memory/leads/<target>.jsonl."""
+    return Path(memory_dir) / "object_model" / f"{target}.jsonl"
+
+
+def object_model_leads(target: str, memory_dir: str) -> list[dict]:
+    """Convert memory/object_model.py's relationship-violation Candidates
+    (Part 1's detect_relationship_violations() + Part 2's YAML-driven
+    detect_logic_pattern_violations()) into lead-board-shaped candidates.
+    Never raises: a target with no recorded observations yet (the common
+    case — Part 1's module docstring explains why there's no automatic
+    recon-artifact adapter) just yields [], same cold-start convention as
+    browser_intel_leads()/attack_graph_leads()."""
+    path = object_model_observations_path(target, memory_dir)
+    observations = object_model.ObservationStore(path).all()
+    if not observations:
+        return []
+    candidates = (
+        object_model.detect_relationship_violations(observations, target=target)
+        + object_model.detect_logic_pattern_violations(observations, target=target)
+    )
+    leads = []
+    for c in candidates:
+        skill, priority = _OBJECT_MODEL_ROUTE.get(c["type"], _OBJECT_MODEL_DEFAULT_ROUTE)
+        leads.append(candidate_to_lead_view(c, skill=skill, priority=priority, id_prefix="om"))
+    return leads
+
+
 # ─── Risk level (static heuristic tier — NOT a measured value) ─────────────
 
 # Skills whose test plan implies an authenticated session is needed at all.
@@ -985,6 +1052,10 @@ class Director:
         # Deterministic recon_dir-relative, like bi_leads/graph_leads above —
         # unconditional, no opt-in param needed (Phase 5, Part C).
         secret_leads = secret_scan_leads(target, recon_dir)
+        # Deterministic memory_dir-relative, same unconditional convention —
+        # cold-start (no memory/object_model/<target>.jsonl yet) is just []
+        # (Phase 6, Part 1).
+        object_model_leads_list = object_model_leads(target, memory_dir)
 
         # Standalone-tool adapters (Phase 5, Part B) — all default None,
         # so omitting them reproduces prior build_plan() behavior exactly.
@@ -1000,7 +1071,7 @@ class Director:
         if graphql_findings_dir:
             tool_leads += graphql_audit_leads(target, graphql_findings_dir, recon_dir)
 
-        all_leads = board_leads + bi_leads + graph_leads + secret_leads + tool_leads
+        all_leads = board_leads + bi_leads + graph_leads + secret_leads + object_model_leads_list + tool_leads
 
         candidates: list[dict] = []
         for lead in all_leads:

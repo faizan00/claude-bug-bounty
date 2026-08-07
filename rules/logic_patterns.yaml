@@ -1,0 +1,243 @@
+# Phase 6 (Logic-Bug Agent) Part 2 — business logic taxonomy, expressed as
+# data and interpreted by ONE generic executor
+# (memory/object_model.py's detect_logic_pattern_violations()), the same
+# "data, not per-rule Python" convention rules/chain_rules.yaml already
+# established for memory/attack_graph.py. No new pattern here ever needs a
+# new Python branch — adding a pattern is a YAML addition.
+#
+# Each pattern is the five-stage shape the spec asked for:
+#   Precondition -> Action -> Expected State -> Observed State -> Violation
+# expressed through this schema (memory/object_model.py's
+# load_logic_patterns()):
+#
+#   id: string                       unique pattern id
+#   description: string
+#   enabled: bool (default true)
+#   required_relationships: [str]    RELATIONSHIP_TYPES subset. GATE: if the
+#                                     object model has ZERO observed
+#                                     instances (any status) of ANY of
+#                                     these types for the observation set
+#                                     being checked, this pattern does NOT
+#                                     execute at all -- "missing
+#                                     relationship evidence means the
+#                                     pattern does not execute, never
+#                                     guess" (Part 2, non-negotiable).
+#   action_event: str                one of object_model.OBSERVATION_EVENTS
+#                                     -- the ACTION this pattern watches.
+#   action_context: str, optional    matched against an observation's
+#                                     metadata.context (an explicit,
+#                                     caller-supplied tag -- e.g. "billing",
+#                                     "refund" -- never inferred from a
+#                                     field/endpoint name). Lets several
+#                                     patterns share the same action_event
+#                                     (e.g. "modified") while only firing on
+#                                     the one they actually govern.
+#   performed_by: str                which observation field names the
+#                                     actor whose authorization is being
+#                                     checked -- "subject_id" or
+#                                     "metadata.performed_by".
+#   requires_active_relationship: str  the RELATIONSHIP_TYPES value
+#                                     `performed_by` must hold, evaluated
+#                                     against the relationship graph AS IT
+#                                     STOOD immediately before this action
+#                                     (point-in-time -- Part 1's "violations
+#                                     evaluated against CURRENT state" read
+#                                     literally: current AS OF the action
+#                                     being checked, so a transfer's own
+#                                     precondition isn't evaluated against
+#                                     state the transfer itself just
+#                                     changed).
+#   relationship_direction: str, optional (default "performed_by_to_governing")
+#                                     the stored relationship-graph edge
+#                                     direction to check. object_model.py's
+#                                     RELATIONSHIP GRAMMAR is fixed per
+#                                     relationship_type (e.g. HAS_MEMBER is
+#                                     always stored (org, HAS_MEMBER, user),
+#                                     never the reverse) -- this field says
+#                                     which of performed_by/governing_object
+#                                     plays which grammatical role for THIS
+#                                     pattern's check, it never changes how
+#                                     compute_relationships() itself stores
+#                                     an edge. "performed_by_to_governing":
+#                                     check (performed_by, rel,
+#                                     governing_object) -- e.g. CAN_INVITE
+#                                     ("user CAN_INVITE org"), OWNS ("user
+#                                     OWNS object"). "governing_to_performed_by":
+#                                     check (governing_object, rel,
+#                                     performed_by) -- e.g. HAS_MEMBER ("org
+#                                     HAS_MEMBER user"), where governing_object
+#                                     is the org and performed_by is the user.
+#   governing_object: str            which observation field names the
+#                                     object/org `performed_by` must hold
+#                                     `requires_active_relationship` against
+#                                     -- "subject_id", "object_id", or
+#                                     "metadata.<key>".
+#   skill: str                       hunt-* skill (must already exist in
+#                                     tools/lead_board.py's skill
+#                                     vocabulary).
+#   vuln_type: str                   Candidate `type` this pattern emits.
+#   violation: str                   free-text rationale template (the
+#                                     literal spec's "Violation" stage).
+#   validation_plan: {steps: [str], expected: str, stop_condition: str}
+#
+# EXPECTED STATE / OBSERVED STATE (the spec's third/fourth stages) are not
+# separate YAML fields -- they ARE
+# requires_active_relationship(performed_by, governing_object) [expected]
+# vs. what compute_relationships() actually shows at that point in time
+# [observed]. Naming them as distinct fields would just be re-stating the
+# same check under two labels; the schema above IS the comparison.
+
+- id: invite_flow
+  description: >
+    A user was added to an organization (membership_granted) -- the actor
+    who performed the invite must hold an active CAN_INVITE grant on that
+    org at the time.
+  enabled: true
+  required_relationships: [CAN_INVITE, HAS_MEMBER]
+  action_event: membership_granted
+  performed_by: metadata.performed_by
+  requires_active_relationship: CAN_INVITE
+  governing_object: subject_id   # membership_granted's subject IS the org (org HAS_MEMBER user)
+  skill: hunt-business-logic
+  vuln_type: invite_flow_violation
+  violation: >
+    membership was granted to {object_id} by {performed_by}, who holds no
+    active CAN_INVITE grant on {governing_object}
+  validation_plan:
+    steps: ["retry the invite-accept flow as an actor with no CAN_INVITE grant on the org"]
+    expected: "403 / 401, or the membership is never created"
+    stop_condition: "retry fails -> not reproducible"
+
+- id: ownership_transfer
+  description: >
+    An object's ownership was transferred -- the actor who performed the
+    transfer must have owned the object immediately beforehand (or held an
+    equivalent authority this taxonomy doesn't yet separately model).
+  enabled: true
+  required_relationships: [OWNS]
+  action_event: ownership_transferred
+  performed_by: metadata.performed_by
+  requires_active_relationship: OWNS
+  governing_object: object_id
+  skill: hunt-idor
+  vuln_type: ownership_transfer_violation
+  violation: >
+    ownership of {object_id} was transferred by {performed_by}, who did not
+    own it immediately beforehand
+  validation_plan:
+    steps: ["attempt the same transfer as a non-owner, no admin/support role"]
+    expected: "403 / 401, or the transfer is rejected server-side"
+    stop_condition: "retry fails -> not reproducible"
+
+- id: tenant_isolation
+  description: >
+    An actor accessed an object explicitly tagged with the organization it
+    belongs to (metadata.organization_id on the access observation itself,
+    not inferred) -- the actor must be an active member of that org.
+  enabled: true
+  required_relationships: [HAS_MEMBER]
+  action_event: accessed
+  performed_by: subject_id
+  requires_active_relationship: HAS_MEMBER
+  relationship_direction: governing_to_performed_by
+  governing_object: metadata.organization_id
+  skill: hunt-idor
+  vuln_type: tenant_isolation_pattern_violation
+  violation: >
+    {performed_by} accessed {object_id} (tagged organization {governing_object})
+    without an active HAS_MEMBER relationship to that organization
+  validation_plan:
+    steps: ["retry the same request authenticated as a member of a different organization"]
+    expected: "403 / 401"
+    stop_condition: "retry fails -> not reproducible"
+
+- id: billing
+  description: >
+    A billing record was modified -- the actor must be an active member of
+    the organization the billing record is tagged with.
+  enabled: true
+  required_relationships: [HAS_MEMBER]
+  action_event: modified
+  action_context: billing
+  performed_by: subject_id
+  requires_active_relationship: HAS_MEMBER
+  relationship_direction: governing_to_performed_by
+  governing_object: metadata.organization_id
+  skill: hunt-business-logic
+  vuln_type: billing_violation
+  violation: >
+    {performed_by} modified billing object {object_id} (organization
+    {governing_object}) without an active HAS_MEMBER relationship to that
+    organization
+  validation_plan:
+    steps: ["retry the billing mutation authenticated as a non-member of the billing org"]
+    expected: "403 / 401"
+    stop_condition: "retry fails -> not reproducible"
+
+- id: refund
+  description: >
+    A refund was issued (modified, context=refund) -- the actor must be an
+    active member of the organization the refund's order/invoice belongs to.
+  enabled: true
+  required_relationships: [HAS_MEMBER]
+  action_event: modified
+  action_context: refund
+  performed_by: subject_id
+  requires_active_relationship: HAS_MEMBER
+  relationship_direction: governing_to_performed_by
+  governing_object: metadata.organization_id
+  skill: hunt-business-logic
+  vuln_type: refund_violation
+  violation: >
+    {performed_by} issued a refund on {object_id} (organization
+    {governing_object}) without an active HAS_MEMBER relationship to that
+    organization
+  validation_plan:
+    steps: ["retry the refund request authenticated as a non-member of the order's organization"]
+    expected: "403 / 401, or the refund amount/target is rejected"
+    stop_condition: "retry fails -> not reproducible"
+
+- id: coupon
+  description: >
+    A coupon/discount object was modified (created/redeemed/edited) -- the
+    actor must be an active member of the organization the coupon belongs to.
+  enabled: true
+  required_relationships: [HAS_MEMBER]
+  action_event: modified
+  action_context: coupon
+  performed_by: subject_id
+  requires_active_relationship: HAS_MEMBER
+  relationship_direction: governing_to_performed_by
+  governing_object: metadata.organization_id
+  skill: hunt-business-logic
+  vuln_type: coupon_violation
+  violation: >
+    {performed_by} modified coupon {object_id} (organization
+    {governing_object}) without an active HAS_MEMBER relationship to that
+    organization
+  validation_plan:
+    steps: ["retry the coupon mutation/redemption authenticated as a non-member of the org"]
+    expected: "403 / 401, or the coupon is rejected/already-redeemed"
+    stop_condition: "retry fails -> not reproducible"
+
+- id: role_escalation
+  description: >
+    A membership was granted with an explicit role-assignment context
+    (metadata.context=role_assignment) -- only an actor with an active
+    CAN_INVITE grant on the org should be able to assign roles.
+  enabled: true
+  required_relationships: [CAN_INVITE]
+  action_event: membership_granted
+  action_context: role_assignment
+  performed_by: metadata.performed_by
+  requires_active_relationship: CAN_INVITE
+  governing_object: subject_id
+  skill: hunt-auth-bypass
+  vuln_type: role_escalation_violation
+  violation: >
+    a role was assigned to {object_id} within {governing_object} by
+    {performed_by}, who holds no active CAN_INVITE grant on that org
+  validation_plan:
+    steps: ["retry the role-assignment request as a member with no CAN_INVITE/admin grant"]
+    expected: "403 / 401, or the role change is rejected server-side"
+    stop_condition: "retry fails -> not reproducible"

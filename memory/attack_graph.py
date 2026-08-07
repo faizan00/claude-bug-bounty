@@ -79,6 +79,7 @@ if _REPO not in sys.path:
 
 from tools import lead_board  # noqa: E402
 from tools import director  # noqa: E402  (skill_to_vuln_class, _read_browser_json)
+from memory.identity import capability_id, endpoint_id  # noqa: E402  (Phase 6 Part 0 — see identity.py docstring)
 from memory.vuln_intelligence import (  # noqa: E402
     VULN_IMPACT_POTENTIAL,
     DEFAULT_IMPACT_POTENTIAL,
@@ -615,7 +616,7 @@ def build_capability_graph(target: str, recon_dir: str | None = None, leads: lis
         for const in auth_model.get("role_permission_constants", []) or []:
             if not const:
                 continue
-            node_id = f"capability:{const}"
+            node_id = capability_id(const)
             if node_id not in g.nodes:
                 g.add_node(Node(node_id, "Capability", const, origin_lead_id=None,
                                  origin_source="browser/auth-model.json",
@@ -636,7 +637,7 @@ def build_capability_graph(target: str, recon_dir: str | None = None, leads: lis
         for url in auth_model.get("auth_lifecycle_endpoints", []) or []:
             if not url:
                 continue
-            node_id = f"endpoint:{url}"
+            node_id = endpoint_id(url)
             if node_id not in g.nodes:
                 g.add_node(Node(node_id, "Endpoint", url, origin_lead_id=None,
                                  origin_source="browser/auth-model.json",
@@ -651,7 +652,7 @@ def build_capability_graph(target: str, recon_dir: str | None = None, leads: lis
         for ep in payload.get(list_field, []) or []:
             if not ep:
                 continue
-            node_id = f"endpoint:{ep}"
+            node_id = endpoint_id(ep)
             if node_id in g.nodes:
                 continue
             g.add_node(Node(node_id, "Endpoint", ep, origin_lead_id=None,
