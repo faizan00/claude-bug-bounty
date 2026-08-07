@@ -662,8 +662,21 @@ def secret_scan_leads(target: str, recon_dir: str) -> list[dict]:
 # this, so there's nothing extra to guard here.
 
 _OBJECT_MODEL_ROUTE: dict[str, tuple[str, str]] = {
+    # Part 1 — detect_relationship_violations()
     "ownership_violation": ("hunt-idor", lead_board.P_HIGH),
     "tenant_isolation_violation": ("hunt-idor", lead_board.P_HIGH),
+    # Part 2 — detect_logic_pattern_violations() (rules/logic_patterns.yaml's
+    # vuln_type per pattern; skill here matches each pattern's own `skill`
+    # field, kept as a separate table so Director stays the one place a
+    # Candidate type maps to a lead-board skill/priority tier, same
+    # convention as every other *_leads() adapter).
+    "invite_flow_violation": ("hunt-business-logic", lead_board.P_HIGH),
+    "ownership_transfer_violation": ("hunt-idor", lead_board.P_HIGH),
+    "tenant_isolation_pattern_violation": ("hunt-idor", lead_board.P_HIGH),
+    "billing_violation": ("hunt-business-logic", lead_board.P_HIGH),
+    "refund_violation": ("hunt-business-logic", lead_board.P_HIGH),
+    "coupon_violation": ("hunt-business-logic", lead_board.P_MED),
+    "role_escalation_violation": ("hunt-auth-bypass", lead_board.P_HIGH),
 }
 _OBJECT_MODEL_DEFAULT_ROUTE = ("hunt-business-logic", lead_board.P_MED)
 
@@ -676,15 +689,20 @@ def object_model_observations_path(target: str, memory_dir: str) -> Path:
 
 def object_model_leads(target: str, memory_dir: str) -> list[dict]:
     """Convert memory/object_model.py's relationship-violation Candidates
-    into lead-board-shaped candidates. Never raises: a target with no
-    recorded observations yet (the common case — Part 1's module docstring
-    explains why there's no automatic recon-artifact adapter) just yields
-    [], same cold-start convention as browser_intel_leads()/attack_graph_leads()."""
+    (Part 1's detect_relationship_violations() + Part 2's YAML-driven
+    detect_logic_pattern_violations()) into lead-board-shaped candidates.
+    Never raises: a target with no recorded observations yet (the common
+    case — Part 1's module docstring explains why there's no automatic
+    recon-artifact adapter) just yields [], same cold-start convention as
+    browser_intel_leads()/attack_graph_leads()."""
     path = object_model_observations_path(target, memory_dir)
     observations = object_model.ObservationStore(path).all()
     if not observations:
         return []
-    candidates = object_model.detect_relationship_violations(observations, target=target)
+    candidates = (
+        object_model.detect_relationship_violations(observations, target=target)
+        + object_model.detect_logic_pattern_violations(observations, target=target)
+    )
     leads = []
     for c in candidates:
         skill, priority = _OBJECT_MODEL_ROUTE.get(c["type"], _OBJECT_MODEL_DEFAULT_ROUTE)

@@ -89,10 +89,19 @@ import os
 import secrets
 import sys
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
+
+import yaml
 
 from memory.candidate import EVIDENCE_TYPES, make_candidate
 from memory.rotation import DEFAULT_KEEP, DEFAULT_MAX_BYTES, rotate_if_needed
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
+DEFAULT_LOGIC_PATTERNS_PATH = os.path.join(_REPO, "rules", "logic_patterns.yaml")
 
 # ─── Vocabulary ─────────────────────────────────────────────────────────────
 
@@ -397,5 +406,242 @@ def detect_relationship_violations(observations: list[dict], target: str | None 
             provenance={"origin_lead_id": obs["id"], "origin_source": "object-model"},
             metadata={"target": target, "subject_id": subject, "object_id": obj, "owner_id": owner_id},
         ))
+
+    return candidates
+
+
+# ─── Part 2: business logic taxonomy — rules/logic_patterns.yaml ───────────
+#
+# Data, not per-pattern Python (rules/logic_patterns.yaml's own header
+# comment has the full schema) — the same "rules as data" convention
+# rules/chain_rules.yaml established for memory/attack_graph.py. ONE
+# generic executor (detect_logic_pattern_violations() below) interprets
+# every pattern; adding a new business-logic pattern is a YAML addition,
+# never a new Python branch.
+
+
+class LogicPatternLoadError(Exception):
+    """rules/logic_patterns.yaml failed to parse or validate. Raised
+    loudly — never silently skipped or defaulted, same discipline as
+    memory/attack_graph.py's RuleLoadError."""
+
+
+@dataclass(frozen=True)
+class LogicPattern:
+    id: str
+    description: str
+    enabled: bool
+    required_relationships: tuple[str, ...]
+    action_event: str
+    performed_by: str
+    requires_active_relationship: str
+    governing_object: str
+    skill: str
+    vuln_type: str
+    violation: str
+    validation_plan: dict
+    action_context: str | None = None
+    relationship_direction: str = "performed_by_to_governing"
+
+
+_RELATIONSHIP_DIRECTIONS = frozenset({"performed_by_to_governing", "governing_to_performed_by"})
+_FIELD_REFS = frozenset({"subject_id", "object_id"})
+
+
+def _valid_field_ref(value: str) -> bool:
+    return value in _FIELD_REFS or value.startswith("metadata.")
+
+
+def load_logic_patterns(path: str | None = None) -> list[LogicPattern]:
+    """Load + validate rules/logic_patterns.yaml. Raises LogicPatternLoadError
+    (or lets yaml.YAMLError propagate) on any malformed input — a typo can
+    never quietly disable/misdefine a pattern without being noticed, same
+    discipline as memory/attack_graph.py's load_chain_rules()."""
+    path = path or DEFAULT_LOGIC_PATTERNS_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = yaml.safe_load(fh)
+    except OSError as exc:
+        raise LogicPatternLoadError(f"cannot read {path}: {exc}") from exc
+
+    if not isinstance(raw, list):
+        raise LogicPatternLoadError(f"{path}: top-level content must be a YAML list of patterns, got {type(raw).__name__}")
+
+    patterns: list[LogicPattern] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise LogicPatternLoadError(f"{path}: pattern #{i} is not a mapping")
+
+        pid = item.get("id")
+        if not isinstance(pid, str) or not pid.strip():
+            raise LogicPatternLoadError(f"{path}: pattern #{i} missing required non-empty 'id'")
+
+        description = item.get("description")
+        if not isinstance(description, str) or not description.strip():
+            raise LogicPatternLoadError(f"pattern {pid!r}: missing required non-empty 'description'")
+
+        enabled = item.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise LogicPatternLoadError(f"pattern {pid!r}: 'enabled' must be a bool, got {enabled!r}")
+
+        required = item.get("required_relationships")
+        if not isinstance(required, list) or not required or any(r not in RELATIONSHIP_TYPES for r in required):
+            raise LogicPatternLoadError(
+                f"pattern {pid!r}: 'required_relationships' must be a non-empty list drawn from "
+                f"{sorted(RELATIONSHIP_TYPES)}, got {required!r}"
+            )
+
+        action_event = item.get("action_event")
+        if action_event not in OBSERVATION_EVENTS:
+            raise LogicPatternLoadError(
+                f"pattern {pid!r}: 'action_event' {action_event!r} not in {sorted(OBSERVATION_EVENTS)}"
+            )
+
+        action_context = item.get("action_context")
+        if action_context is not None and not isinstance(action_context, str):
+            raise LogicPatternLoadError(f"pattern {pid!r}: 'action_context' must be a string if present")
+
+        performed_by = item.get("performed_by")
+        if not isinstance(performed_by, str) or not _valid_field_ref(performed_by):
+            raise LogicPatternLoadError(
+                f"pattern {pid!r}: 'performed_by' must be 'subject_id', 'object_id', or 'metadata.<key>', "
+                f"got {performed_by!r}"
+            )
+
+        governing_object = item.get("governing_object")
+        if not isinstance(governing_object, str) or not _valid_field_ref(governing_object):
+            raise LogicPatternLoadError(
+                f"pattern {pid!r}: 'governing_object' must be 'subject_id', 'object_id', or 'metadata.<key>', "
+                f"got {governing_object!r}"
+            )
+
+        requires_active_relationship = item.get("requires_active_relationship")
+        if requires_active_relationship not in RELATIONSHIP_TYPES:
+            raise LogicPatternLoadError(
+                f"pattern {pid!r}: 'requires_active_relationship' {requires_active_relationship!r} "
+                f"not in {sorted(RELATIONSHIP_TYPES)}"
+            )
+
+        relationship_direction = item.get("relationship_direction", "performed_by_to_governing")
+        if relationship_direction not in _RELATIONSHIP_DIRECTIONS:
+            raise LogicPatternLoadError(
+                f"pattern {pid!r}: 'relationship_direction' must be one of {sorted(_RELATIONSHIP_DIRECTIONS)}, "
+                f"got {relationship_direction!r}"
+            )
+
+        skill = item.get("skill")
+        if not isinstance(skill, str) or not skill.startswith("hunt-"):
+            raise LogicPatternLoadError(f"pattern {pid!r}: 'skill' must be a 'hunt-*' string, got {skill!r}")
+
+        vuln_type = item.get("vuln_type")
+        if not isinstance(vuln_type, str) or not vuln_type.strip():
+            raise LogicPatternLoadError(f"pattern {pid!r}: missing required non-empty 'vuln_type'")
+
+        violation = item.get("violation")
+        if not isinstance(violation, str) or not violation.strip():
+            raise LogicPatternLoadError(f"pattern {pid!r}: missing required non-empty 'violation'")
+
+        vp = item.get("validation_plan")
+        if (not isinstance(vp, dict) or "steps" not in vp or "expected" not in vp
+                or "stop_condition" not in vp):
+            raise LogicPatternLoadError(
+                f"pattern {pid!r}: 'validation_plan' must be a mapping with steps/expected/stop_condition"
+            )
+
+        patterns.append(LogicPattern(
+            id=pid, description=description, enabled=enabled,
+            required_relationships=tuple(required), action_event=action_event,
+            performed_by=performed_by, requires_active_relationship=requires_active_relationship,
+            governing_object=governing_object, skill=skill, vuln_type=vuln_type,
+            violation=violation, validation_plan=vp, action_context=action_context,
+            relationship_direction=relationship_direction,
+        ))
+
+    return patterns
+
+
+def _resolve_field(obs: dict, ref: str):
+    if ref == "subject_id":
+        return obs.get("subject_id")
+    if ref == "object_id":
+        return obs.get("object_id")
+    if ref.startswith("metadata."):
+        return (obs.get("metadata") or {}).get(ref[len("metadata."):])
+    return None
+
+
+def _relationship_active_before(observations: list[dict], ts: str, subject: str, rel: str, obj: str) -> bool:
+    """Point-in-time check: was (subject, rel, obj) active in the
+    relationship graph as it stood strictly BEFORE `ts`? Used instead of
+    the final/current state so a pattern's own action (e.g. an ownership
+    transfer) is never evaluated against the state it just changed."""
+    prior = [o for o in observations if o.get("ts", "") < ts]
+    state = compute_relationships(prior)
+    entry = state.get((subject, rel, obj))
+    return entry is not None and entry["status"] == "active"
+
+
+def detect_logic_pattern_violations(
+    observations: list[dict],
+    patterns: list[LogicPattern] | None = None,
+    target: str | None = None,
+) -> list[dict]:
+    """The Part 2 generic executor. For each enabled pattern: GATE first —
+    if the object model has no observed instance (any status) of every one
+    of the pattern's required_relationships, the pattern does NOT execute
+    (Part 2, non-negotiable: "Missing relationship evidence means: Pattern
+    does NOT execute. Never guess."). Otherwise, scan observations matching
+    action_event (+ action_context, if the pattern declares one) and flag
+    any where `performed_by` did NOT hold `requires_active_relationship`
+    against `governing_object` immediately beforehand. Emits Candidates —
+    same "inconsistent with the observed graph, not asserted as a
+    vulnerability" discipline as detect_relationship_violations()."""
+    patterns = load_logic_patterns() if patterns is None else patterns
+    present_types = {k[1] for k in compute_relationships(observations)}
+    candidates: list[dict] = []
+
+    for pattern in patterns:
+        if not pattern.enabled:
+            continue
+        if not set(pattern.required_relationships).issubset(present_types):
+            continue
+
+        for obs in sorted(observations, key=lambda o: o.get("ts", "")):
+            if obs["event"] != pattern.action_event:
+                continue
+            if pattern.action_context is not None and (obs.get("metadata") or {}).get("context") != pattern.action_context:
+                continue
+            status = obs.get("outcome_status")
+            if status is not None and not (_SUCCESS_STATUS_LOW <= status < _SUCCESS_STATUS_HIGH):
+                continue
+
+            performed_by = _resolve_field(obs, pattern.performed_by)
+            governing_object = _resolve_field(obs, pattern.governing_object)
+            if not performed_by or not governing_object:
+                continue  # can't evaluate without both — never guess
+
+            if pattern.relationship_direction == "governing_to_performed_by":
+                rel_subject, rel_object = governing_object, performed_by
+            else:
+                rel_subject, rel_object = performed_by, governing_object
+            if _relationship_active_before(observations, obs["ts"], rel_subject,
+                                            pattern.requires_active_relationship, rel_object):
+                continue
+
+            rationale = pattern.violation.format(
+                object_id=obs["object_id"], performed_by=performed_by, governing_object=governing_object,
+            ).strip()
+            candidates.append(make_candidate(
+                source="object-model",
+                type_=pattern.vuln_type,
+                evidence=list(obs["evidence"]),
+                rationale=rationale,
+                validation_plan=dict(pattern.validation_plan),
+                provenance={"origin_lead_id": obs["id"], "origin_source": f"logic_patterns.yaml#{pattern.id}"},
+                metadata={
+                    "target": target, "pattern_id": pattern.id,
+                    "performed_by": performed_by, "governing_object": governing_object,
+                },
+            ))
 
     return candidates
