@@ -166,6 +166,80 @@ class TestDuplicateProbability:
         result = sc.check_duplicate_probability(candidate, report_outcomes=outcomes)
         assert result["details"]["dedup_probability"] == expected
 
+    # ── HIGH-severity fix: a bare non-empty string is no longer enough to
+    # defeat an elevated-duplicate-probability BLOCK; it must clear a real
+    # minimum length (MIN_NOVEL_IMPACT_ARGUMENT_LENGTH, reused from
+    # secrets_scanner.py's ENTROPY_MIN_LENGTH convention), and verbatim
+    # reuse across Candidates for the same target is now flagged.
+
+    def test_too_short_novel_impact_argument_blocks(self):
+        assert sc.MIN_NOVEL_IMPACT_ARGUMENT_LENGTH == 20
+        outcomes = self._outcomes(n_dup=4, n_total=5)
+        candidate = _candidate(metadata={"target": "example.com", "novel_impact_argument": "yes it is novel"})
+        assert len(candidate["metadata"]["novel_impact_argument"]) < sc.MIN_NOVEL_IMPACT_ARGUMENT_LENGTH
+        result = sc.check_duplicate_probability(candidate, report_outcomes=outcomes)
+        assert result["status"] == "block"
+        assert "20 characters" in result["reason"]
+
+    def test_exactly_min_length_novel_impact_argument_warns(self):
+        outcomes = self._outcomes(n_dup=4, n_total=5)
+        text = "x" * sc.MIN_NOVEL_IMPACT_ARGUMENT_LENGTH
+        candidate = _candidate(metadata={"target": "example.com", "novel_impact_argument": text})
+        result = sc.check_duplicate_probability(candidate, report_outcomes=outcomes)
+        assert result["status"] == "warn"
+
+    def test_verbatim_reuse_across_candidates_flagged_not_blocked(self):
+        """Reuse is a signal to surface, never a hard BLOCK on its own —
+        even outside the elevated-duplicate-probability path."""
+        text = "this chains into full account takeover, unlike prior reports"
+        candidate = _candidate(metadata={"target": "example.com", "novel_impact_argument": text})
+        candidate["id"] = "cand-new"
+        prior = [_candidate(metadata={"target": "example.com", "novel_impact_argument": text})]
+        prior[0]["id"] = "cand-old"
+        result = sc.check_duplicate_probability(candidate, report_outcomes=[], prior_candidates=prior)
+        assert result["status"] == "warn"
+        assert result["details"]["novel_impact_argument_reused_verbatim"] is True
+        assert "reused" in result["reason"] or "not genuinely novel" in result["reason"]
+
+    def test_verbatim_reuse_on_different_target_not_flagged(self):
+        text = "this chains into full account takeover, unlike prior reports"
+        candidate = _candidate(metadata={"target": "example.com", "novel_impact_argument": text})
+        candidate["id"] = "cand-new"
+        prior = [_candidate(metadata={"target": "other.com", "novel_impact_argument": text})]
+        prior[0]["id"] = "cand-old"
+        result = sc.check_duplicate_probability(candidate, report_outcomes=[], prior_candidates=prior)
+        assert result["details"]["novel_impact_argument_reused_verbatim"] is False
+
+    def test_different_novel_impact_argument_text_not_flagged_as_reused(self):
+        candidate = _candidate(metadata={
+            "target": "example.com", "novel_impact_argument": "a genuinely different justification here",
+        })
+        candidate["id"] = "cand-new"
+        prior = [_candidate(metadata={
+            "target": "example.com", "novel_impact_argument": "a completely unrelated justification text",
+        })]
+        prior[0]["id"] = "cand-old"
+        result = sc.check_duplicate_probability(candidate, report_outcomes=[], prior_candidates=prior)
+        assert result["details"]["novel_impact_argument_reused_verbatim"] is False
+
+    def test_no_prior_candidates_never_flags_reuse(self):
+        candidate = _candidate(metadata={
+            "target": "example.com", "novel_impact_argument": "this chains into full account takeover",
+        })
+        result = sc.check_duplicate_probability(candidate, report_outcomes=[], prior_candidates=None)
+        assert result["details"]["novel_impact_argument_reused_verbatim"] is False
+
+    def test_elevated_and_reused_warns_with_reuse_note_not_block(self):
+        outcomes = self._outcomes(n_dup=4, n_total=5)
+        text = "this chains into full account takeover, unlike prior reports"
+        candidate = _candidate(metadata={"target": "example.com", "novel_impact_argument": text})
+        candidate["id"] = "cand-new"
+        prior = [_candidate(metadata={"target": "example.com", "novel_impact_argument": text})]
+        prior[0]["id"] = "cand-old"
+        result = sc.check_duplicate_probability(candidate, report_outcomes=outcomes, prior_candidates=prior)
+        assert result["status"] == "warn"
+        assert result["details"]["novel_impact_argument_reused_verbatim"] is True
+
 
 # ─── 3. Evidence completeness ─────────────────────────────────────────────
 
@@ -309,3 +383,89 @@ class TestSelfCritique:
         fetcher = _MockFetcher([403, 403])
         report = sc.self_critique(candidate, fetcher=fetcher, report_outcomes=[], observations=[])
         assert report["overall"] == "warn"
+
+    def test_prior_candidates_threaded_through_to_duplicate_check(self):
+        """self_critique()'s prior_candidates kwarg must actually reach
+        check_duplicate_probability()'s reuse flag, not just exist unused."""
+        text = "this chains into full account takeover, unlike prior reports"
+        candidate = _candidate(metadata={"target": "example.com", "novel_impact_argument": text})
+        candidate["id"] = "cand-new"
+        prior = [_candidate(metadata={"target": "example.com", "novel_impact_argument": text})]
+        prior[0]["id"] = "cand-old"
+        fetcher = _MockFetcher([403, 403])
+        report = sc.self_critique(
+            candidate, fetcher=fetcher, report_outcomes=[], observations=[], prior_candidates=prior,
+        )
+        assert report["details"]["duplicate_probability"]["details"]["novel_impact_argument_reused_verbatim"] is True
+
+
+# ─── CLI ───────────────────────────────────────────────────────────────────
+
+class TestCLI:
+    def _write_json(self, path, data):
+        import json
+        path.write_text(json.dumps(data))
+
+    def _write_jsonl(self, path, entries):
+        import json
+        path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    def test_cli_runs_without_fetcher_and_blocks_reproducibility(self, tmp_path, monkeypatch, capsys):
+        import sys as _sys
+
+        candidate_path = tmp_path / "candidate.json"
+        self._write_json(candidate_path, _candidate())
+        monkeypatch.setattr(_sys, "argv", [
+            "self_critique.py", "--candidate", str(candidate_path), "--no-fetch",
+        ])
+        assert sc.main() == 1  # overall == "block" (no fetcher -> reproducibility blocks)
+        out = capsys.readouterr().out
+        import json as _json
+        report = _json.loads(out)
+        assert report["overall"] == "block"
+
+    def test_cli_output_flag_writes_hash_bound_artifact(self, tmp_path, monkeypatch, capsys):
+        """--output must persist the report via the SAME write_report_artifact()
+        memory/finding_state.py's REPORT_READY check verifies against."""
+        import sys as _sys
+
+        candidate_path = tmp_path / "candidate.json"
+        self._write_json(candidate_path, _candidate())
+        report_path = tmp_path / "report.json"
+        monkeypatch.setattr(_sys, "argv", [
+            "self_critique.py", "--candidate", str(candidate_path), "--no-fetch",
+            "--output", str(report_path),
+        ])
+        sc.main()
+        out = capsys.readouterr().out
+        assert report_path.exists()
+        assert "self_critique_report_path=" in out
+        assert "self_critique_report_hash=" in out
+
+        from memory.finding_state import verify_report_artifact
+        report_hash = [line for line in out.splitlines() if line.startswith("self_critique_report_hash=")][0].split("=", 1)[1]
+        result = verify_report_artifact(report_path, report_hash, {"overall": "block"})
+        assert result["ok"] is True
+
+    def test_cli_prior_candidates_flag_flows_into_reuse_flag(self, tmp_path, monkeypatch, capsys):
+        import sys as _sys
+        import json as _json
+
+        text = "this chains into full account takeover, unlike prior reports"
+        candidate = _candidate(metadata={"target": "example.com", "novel_impact_argument": text})
+        candidate["id"] = "cand-new"
+        prior = _candidate(metadata={"target": "example.com", "novel_impact_argument": text})
+        prior["id"] = "cand-old"
+
+        candidate_path = tmp_path / "candidate.json"
+        self._write_json(candidate_path, candidate)
+        prior_path = tmp_path / "prior.jsonl"
+        self._write_jsonl(prior_path, [prior])
+
+        monkeypatch.setattr(_sys, "argv", [
+            "self_critique.py", "--candidate", str(candidate_path), "--no-fetch",
+            "--prior-candidates", str(prior_path),
+        ])
+        sc.main()
+        report = _json.loads(capsys.readouterr().out)
+        assert report["details"]["duplicate_probability"]["details"]["novel_impact_argument_reused_verbatim"] is True
