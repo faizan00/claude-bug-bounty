@@ -50,16 +50,19 @@ without losing findings.
 `/autopilot` is **the same pipeline as running `/scope → /recon → /surface → /hunt → /validate → /report` back-to-back, but driven by one agent loop instead of you re-prompting at each step.** Same scripts. Same outputs. No new capabilities — just less typing and built-in checkpoints.
 
 ```
-1. SCOPE     Load and confirm program scope                       (≡ /scope)
+1. SCOPE     Load and confirm program scope + a session hour budget (≡ /scope)
 2. RECON     bash tools/recon_engine.sh <target>                  (≡ /recon, reuses cache if < 7 days old)
-3. RANK      Prioritize attack surface (recon-ranker agent)       (≡ /surface)
+3. RANK      Prioritize attack surface into an executable plan     (≡ /surface, plus research-director's
+             (research-director agent)                              dependency/falsifier/time-box layer)
 4. HUNT      python3 tools/hunt.py --target <target> --scan-only  (≡ /hunt)
 5. VALIDATE  7-Question Gate on findings                          (≡ /validate)
 6. REPORT    Draft reports for validated findings                 (≡ /report — never auto-submits)
 7. CHECKPOINT  Present to human for review                        (frequency depends on mode flag)
 ```
 
-Same 6 commands, same outputs — but RANK and HUNT are no longer single opaque steps internally. The agent loop (`agents/autopilot.md`) now runs each as its own reasoned phase: RANK is Surface Understanding (js-intelligence + vulnerability-intelligence) → Hypothesis Generation (hypothesis-engine) → Decision (recon-ranker's priority/EV scoring); HUNT is Experiment Selection (`memory/experiment_memory.py`'s continue/pivot/stop, not a hand-eyeballed clock); VALIDATE now enforces the finding's lifecycle state (`memory/finding_state.py`: TESTING → VALIDATED → CONFIRMED, "weak evidence cannot become CONFIRMED") and auto-logs the outcome to `patterns.jsonl`/`failed_patterns.jsonl` on confirm/reject with no manual `/remember` step. See `agents/autopilot.md`'s "The Loop" for the full ten-phase breakdown and the reasoning behind each one.
+`/autopilot` asks for a time budget (hours) alongside the scope confirmation at Step 1 — `research-director`'s plan is built and time-boxed against it, so there's no default to skip this prompt with.
+
+Same 6 commands, same outputs — but RANK and HUNT are no longer single opaque steps internally. The agent loop (`agents/autopilot.md`) now runs each as its own reasoned phase: RANK is Surface Understanding (js-intelligence + vulnerability-intelligence) → Hypothesis Generation (hypothesis-engine) → Decision (`research-director` calling `tools/director.py build-plan` — the same `priority_score()`/EV formula recon-ranker always used, now assembled into one ordered, dependency-aware, falsifiable, time-boxed plan instead of a flat scored list); HUNT is Experiment Selection, working that plan's `READY` attacks in EV/hour order — `memory/experiment_memory.py`'s continue/pivot/stop still decides when to give up on the *current technique* (not a hand-eyeballed clock), and `director.py replan()` folds every outcome back into the plan instead of a fresh re-scan. VALIDATE now enforces the finding's lifecycle state (`memory/finding_state.py`: TESTING → VALIDATED → CONFIRMED, "weak evidence cannot become CONFIRMED") and auto-logs the outcome to `patterns.jsonl`/`failed_patterns.jsonl` on confirm/reject with no manual `/remember` step. See `agents/autopilot.md`'s "The Loop" for the full ten-phase breakdown and the reasoning behind each one.
 
 ### When to pick `/autopilot` vs running the steps yourself
 

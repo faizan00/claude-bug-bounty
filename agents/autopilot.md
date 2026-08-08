@@ -68,22 +68,27 @@ Ten phases, not four. The old `RECON -> HUNT -> VALIDATE -> REPORT` shorthand hi
                             just poking at the app. A hypothesis is checkable and prioritizable;
                             a hunch is neither.
 
-5.  DECISION                recon-ranker scores every hypothesis via priority_score()/
-                            expected_value_per_hour(), renders format_decision() for
-                            the top candidate
-                            WHY: many hypotheses, limited time -- this is the single
-                            formula (impact + historical success + tech match + chain
-                            probability - failure penalty) that decides what gets tested
-                            first, instead of two agents drifting toward two different
-                            answers.
+5.  DECISION                research-director (tools/director.py build-plan) scores
+                            every candidate via priority_score()/expected_value_per_hour()
+                            -- the same formula recon-ranker always used -- and assembles
+                            an ordered, dependency-aware, falsifiable, time-boxed Plan
+                            instead of a flat scored list
+                            WHY: many hypotheses, limited time, and candidates that depend
+                            on each other completing first -- a Plan built once, with an
+                            explicit SKIPPED section for everything left out and a
+                            mandatory falsifier on everything kept in, replaces re-deriving
+                            "what's next" from scratch every turn.
 
-6.  EXPERIMENT SELECTION   For the current candidate: pick a technique, test it, let
-                            evaluate_experiment()/should_stop() call continue/pivot/stop
+6.  EXPERIMENT SELECTION   Work the Plan's READY attacks in EV/hour order; on each
+                            outcome, evaluate_experiment()/should_stop() call
+                            continue/pivot/stop for the current technique, and
+                            director.py replan() folds the result back into the Plan
                             WHY: "5 minutes with no signal, rotate" used to mean eyeballing
-                            a clock. Now it's an actual count against experiments.jsonl,
-                            and evaluate_experiment() folds in "has this failed here
-                            before" and "has it worked on similar tech" too, not just
-                            elapsed time.
+                            a clock and re-scoring the remaining candidates by hand. Now
+                            should_stop() is an actual count against experiments.jsonl,
+                            and replan() is the one place the queue actually updates --
+                            unlocking dependents, dropping what no longer fits the time
+                            budget, never silently discarding in-progress work.
 
 7.  VALIDATION              validation-engine (technical proof: reproducible, impact
                             proven, PoC clean) -> 7-Question Gate (policy: scope,
@@ -178,6 +183,20 @@ SCOPE LOADED for target.com:
 Confirm scope is correct? [y/n]
 ```
 
+Then ask for a session time budget — `tools/director.py build-plan` (Step 5) requires
+`--hours` and there is no default mapping from checkpoint mode to a number of hours;
+inventing one (e.g. "--quick = 1hr") would be an unjustified heuristic constant of
+exactly the kind this codebase's scoring functions already refuse to add without
+real data behind them. Ask directly instead of guessing:
+```
+Time budget for this session (hours)? This sets research-director's plan budget at
+Step 5 — attacks are ordered and time-boxed against it, and Step 6's replan() drops
+anything that no longer fits as the clock runs down.
+```
+Store the answer as the session's hour budget; every `build-plan`/`replan` call in
+Steps 5–6 uses it (`replan` reads it back from the saved plan file, so only the
+Step 5 `build-plan` call needs it typed in).
+
 ## Step 2: Recon
 
 Check for cached recon at `recon/<target>/`. If found and < 7 days old, skip.
@@ -199,14 +218,29 @@ Invoke `hypothesis-engine` (writes `recon/<target>/hypotheses.md` — ranked, ev
 
 ## Step 5: Decision
 
-Invoke `recon-ranker` (scores every hypothesis above plus the lead board, including any chain/hypothesis leads `lead_board.py` detected during recon ingest). Final output:
-- P1 targets (score ≥ 60 — start here)
-- P2 targets (score 30–59, after P1 exhausted)
-- Kill list (score < 30, or a hard failed-pattern match)
+Invoke `research-director` — it turns everything Steps 3–4 produced (plus the lead
+board and Phase 1 browser intelligence) into an executable, time-boxed plan, instead
+of a flat scored list you'd have to re-rank yourself every turn:
+
+```bash
+python3 tools/director.py build-plan <target> --hours <hours from Step 1> --memory-dir hunt-memory --write
+```
+
+This writes `recon/<target>/hunt-plan.md` (read this — it's the plan, the stdout
+summary is only a sanity check) and a `hunt-plan.json` sidecar Step 6 uses for
+`replan()`. Every attack in it already carries: an EV/hour-ordered position, a
+`state` (`READY` now, `PENDING`/`BLOCKED` if it depends on another attack completing
+first), a mandatory falsifier, and a `risk_level` heuristic tier. Everything that
+*didn't* become an attack is in the SKIPPED section with a machine-checkable reason
+(`BELOW_EV_FLOOR`, `MATCHES_FAILED_PATTERN`, `DUPLICATE`, `TIME_CONSTRAINT`,
+`DEPENDENCY_UNMET`, `INSUFFICIENT_EVIDENCE`) — an empty SKIPPED section is suspicious,
+not clean; say so if you see one instead of treating it as a good sign.
 
 ### Decision Engine
 
-This is what "which target/endpoint/vuln-class to test first" actually means in code, not just prose — the same formula backs both `recon-ranker`'s scoring and your own in-loop decisions:
+This is what "which target/endpoint/vuln-class to test first" actually means in
+code, not just prose — `build-plan` scores every candidate with the same formula
+`recon-ranker`/your own in-loop decisions always used:
 
 ```
 Priority = impact_potential + historical_success_probability
@@ -214,28 +248,79 @@ Priority = impact_potential + historical_success_probability
          - failure_penalty
 ```
 
-Call it directly instead of eyeballing:
-```bash
-python3 -m memory.vuln_intelligence priority --vuln-class idor --tech "express,postgresql" \
-  --target target.com --technique numeric_id_swap --memory-dir hunt-memory
-```
-`failure_penalty` is 100 (hard kill, `hard_kill: true` in the output) when this exact target+technique already failed — treat that as non-negotiable, not a mere deprioritization. Pass `--chain-detected` when the candidate is a lead-board chain/hypothesis lead.
+You don't call this yourself anymore for ranking — `director.py` already did, for
+every candidate, before you read `hunt-plan.md`. A hard-kill candidate
+(`failure_penalty` 100 because this exact target+technique already failed) never
+becomes an attack at all — it's filtered into SKIPPED (`MATCHES_FAILED_PATTERN`)
+before the plan is written, so nothing in `hunt-plan.md` needs a manual hard-kill
+check. `impact_potential` isn't a fixed constant forever either — once
+`report_outcomes.jsonl` has 5+ samples for a vuln_class, it's bounded-blended toward
+that class's real observed acceptance rate, same as it always was; `director.py
+explain <target> <lead_id> --hours <N> --memory-dir hunt-memory` shows the full
+breakdown (including `impact_recalibration`) for any one attack if a hunter asks why
+it ranked where it did.
 
-`impact_potential` isn't a fixed constant forever — once `report_outcomes.jsonl` has 5+ samples for a vuln_class, it's bounded-blended toward that class's real observed acceptance rate (capped at pulling the static prior at most halfway, never fully overwritten by a handful of outcomes). Check the output's `impact_recalibration` field: `recalibrated: true` means real data is already nudging this score, `static_prior` vs `impact` shows how far.
-
-**Abandon a path when:**
-- `priority --technique X` comes back `hard_kill: true` — don't start it
-- 5 minutes pass with no signal on the current endpoint (the standing 5-minute rule, `rules/hunting.md`) — after abandoning, log it: `python3 -m memory.vuln_intelligence save-failed --target <target> --vuln-class <class> --technique <technique> --tech-stack <stack> --reason "<why>" --memory-dir hunt-memory`, so the next run's `priority` call already reflects it
-- 5 consecutive requests to the host return 403/429/timeout — this is the existing Circuit Breaker below, not a new rule
-
-**Pivot to the next candidate when** the current one is abandoned or exhausted: re-run `priority` across the remaining P1 queue (scores shift as failures accumulate) and take the highest score that isn't a hard kill. A hypothesis-lead or chain-lead candidate (`attack_chain_probability` 60–90) should usually win a pivot over a same-score single-signal candidate — more independent evidence backs it.
+Abandon/pivot mechanics — what to do when an attack stalls or finishes — now live in
+Step 6, via `replan()`, not a manual re-run of `priority` here.
 
 ## Step 6: Experiment Selection
 
-The abandon/pivot rules above ("5 minutes pass with no signal", "pivot to the next candidate") shouldn't be a vibe call — log every payload/technique attempt and let `memory/experiment_memory.py` answer "stop?" from an actual count:
+Work `hunt-plan.json`'s attacks in the same order `director.py` itself uses when it
+re-sorts the queue: `state == "READY"`, ordered by `ev_per_hour` desc (tie-break
+`priority` desc). Each attack already names its `vuln_class`, `endpoint`/`evidence`,
+`falsifier`, and `maximum_time_minutes` — you don't select a vuln class or re-check
+`failed_patterns.jsonl` yourself here, `build-plan` already did that before this
+attack could reach `READY` at all.
+
+For each READY attack, in order:
+
+1. Register the finding's lifecycle state before testing it:
+   `python3 -m memory.finding_state advance --target <target> --vuln-class <attack.vuln_class> --endpoint <attack.endpoint> --state SUSPECTED --memory-dir hunt-memory`,
+   then `--state TESTING` once you actually start. `finding_state current` tells you
+   if it's already past this point instead of guessing.
+2. Test with the attack's named technique against its own falsifier — the falsifier
+   is what tells you when to stop calling this "inconclusive" and call it `FAILED`.
+3. Log every request to audit.jsonl.
+4. **If a finding confirms (HIGH/CRITICAL), immediately invoke the `chain-builder`
+   agent** — don't just mentally "check the chain table." `chain-builder` already
+   consults `chains --tech --rank` and the lead-board graph before falling back to
+   its static A→B table, and saves whatever it confirms back to `chains.jsonl`.
+   Running it inline, right when this attack is fresh, is strictly better than
+   noting "chain candidate" and coming back later.
+5. Close out the attack and refresh the plan before starting the next one:
+   ```bash
+   # results.json keys are Attack.id (from hunt-plan.json), not lead_id, and every
+   # key is optional -- only include what actually changed this cycle:
+   # {"completed": ["atk-xxxxxx"], "failed": [], "abandoned": [], "in_progress": [],
+   #  "revive": [], "notes": {"atk-xxxxxx": "confirmed, filing report"}}
+   python3 tools/director.py replan --plan-file recon/<target>/hunt-plan.json \
+     --results-file results.json --write
+   ```
+   `revive` un-abandons an attack you'd previously marked `abandoned` (its id must
+   already be in that state) — use it if new evidence (a fresh chain leg, a changed
+   endpoint) makes a previously-dropped attack worth reconsidering; otherwise leave
+   it empty. Every id you list must be a real `Attack.id` from the plan currently at
+   `--plan-file` — `replan()` only updates attacks it finds by matching id against
+   `plan.attacks`; an id that doesn't match anything (a typo, or one left over from
+   a plan `build-plan` already regenerated) is silently skipped, not rejected, so
+   double-check an id against the plan you're editing before writing `results.json`,
+   especially after `build-plan` has run again since you last read it.
+
+   Then take the next `READY` attack from the refreshed `hunt-plan.json` —
+   `replan()` re-sorts by the same `(ev_per_hour, priority)` order, unlocks any
+   attack whose dependencies just completed, and moves anything that no longer
+   fits the remaining time budget to `SKIPPED` (`TIME_CONSTRAINT`) automatically.
+   Never re-run `build-plan` mid-hunt to get an updated queue — that discards every
+   `IN_PROGRESS`/`COMPLETED` attack's state; `replan()` is the only way to update
+   the plan once Step 5 has run.
+
+**Within one attack**, whether to keep pushing on the current technique or call it
+done is still a finer-grained call than the plan tracks — log every payload/technique
+attempt and let `memory/experiment_memory.py` answer "stop?" from an actual count,
+not a vibe:
 
 ```bash
-# After each payload category attempt on the current endpoint:
+# After each payload category attempt:
 python3 -m memory.experiment_memory record --target <target> --endpoint <endpoint> \
   --vuln-class <class> --payload-category <category> --result success|fail|inconclusive \
   --tech-stack "<stack>" --time-spent <minutes> --memory-dir hunt-memory
@@ -248,9 +333,9 @@ python3 -m memory.experiment_memory should-stop --target <target> --endpoint <en
   --elapsed-minutes <n> --memory-dir hunt-memory
 ```
 
-`should-stop` returns `stop: true` once 5 minutes have passed with zero successes OR 3 distinct payload categories have been burned with zero successes — whichever comes first — and `stop: false` immediately if any experiment on this endpoint already succeeded. `payload-stats` is the "GraphQL + Node + missing authorization checks produced findings before" learning made concrete: a payload category with wins on 2+ overlapping technologies outranks one with a single overlapping technology or none.
-
-`should-stop` only answers "abandon the current endpoint or not" — it doesn't say what to do next. For the full continue/pivot/stop call (has this exact technique already failed here, has it worked on similar tech elsewhere, is the EV still worth it), use `evaluate` instead of eyeballing the three signals yourself:
+`should-stop` returns `stop: true` once 5 minutes have passed with zero successes OR
+3 distinct payload categories have been burned with zero successes — whichever comes
+first. For the full continue/pivot/stop call on the current technique:
 
 ```bash
 python3 -m memory.experiment_memory evaluate --target <target> --technique <technique> \
@@ -258,17 +343,13 @@ python3 -m memory.experiment_memory evaluate --target <target> --technique <tech
   --elapsed-minutes <n> --memory-dir hunt-memory
 ```
 
-It returns `{decision: continue|pivot|stop, reason, confidence, recommended_next_step}` — `stop` means kill the technique on this target and log it via `save-failed`; `pivot` means the current technique/endpoint is done but the vuln class or target isn't (move to the next candidate via the pivot rule above); `continue` means keep testing. This doesn't replace `priority`/`should-stop` — it's the composed decision that reads the same underlying data (`failed_patterns.jsonl`, `experiments.jsonl`, and optionally `expected_value_per_hour()` when `--vuln-class` is set) so you don't have to reconcile three separate signals by hand mid-hunt.
-
-For each P1 target endpoint:
-
-1. Check hunt memory — "Have I tested this before?" Run `python3 -m memory.vuln_intelligence failed-check --target <target> --technique <technique> --memory-dir hunt-memory` before testing a technique the ranker didn't already kill; a hit means skip it, no exceptions.
-2. Select vuln class based on tech stack + URL pattern + memory, using the Decision Engine's `priority` score. Prefer P1 entries the ranker flagged as hypothesis- or chain-boosted — those are correlated signals, not isolated guesses.
-3. Register the finding's lifecycle state before testing it: `python3 -m memory.finding_state advance --target <target> --vuln-class <class> --endpoint <endpoint> --state SUSPECTED --memory-dir hunt-memory`, then `--state TESTING` once you actually start. `python3 -m memory.finding_state current --target <target> --vuln-class <class> --endpoint <endpoint> --memory-dir hunt-memory` tells you if it's already past this point instead of guessing.
-4. Test with appropriate technique
-5. Log every request to audit.jsonl
-6. **If a finding confirms (HIGH/CRITICAL), immediately invoke the `chain-builder` agent** — don't just mentally "check the chain table." `chain-builder` already consults `chains --tech --rank` (confirmed chains from other targets on this stack, ranked by impact/probability/effort) and the lead-board graph before falling back to its static A→B table, and it saves whatever it confirms back to `chains.jsonl` for the next target. Running it inline, right when A is fresh, is strictly better than noting "chain candidate" and coming back to it later — the session context for A is warmest right now.
-7. If 5 minutes with no progress → rotate to next endpoint (see Decision Engine's abandon/pivot rules)
+`{decision: continue|pivot|stop, ...}` — `stop` means kill the technique on this
+target and log it via `save-failed` (this feeds `notes` in the `replan` call above,
+and the next `build-plan` on a different target will already see it via
+`failed_patterns.jsonl`); `pivot` means this technique/endpoint is done but the
+*attack* isn't necessarily — mark it `abandoned` in `results.json` above and let
+`replan()`, not a manual re-scan, decide what's next; `continue` means keep testing
+the current technique.
 
 ## Step 7: Validation
 
@@ -299,7 +380,7 @@ Present findings based on checkpoint mode. Wait for human decision.
 
 If 5 consecutive requests to the same host return 403/429/timeout:
 - **--paranoid/--normal:** Pause and ask: "Getting blocked on {host}. Continue / back off 5 min / skip host?"
-- **--yolo:** Auto-back-off 60 seconds, retry once. If still blocked, skip host and move to next P1.
+- **--yolo:** Auto-back-off 60 seconds, retry once. If still blocked, skip host and move to the next READY attack.
 
 ## Connection Resilience
 
