@@ -167,12 +167,50 @@ python3 -m memory.vuln_intelligence save-hypothesis --target <target> --vuln-cla
 ```
 `--impact`/`--probability`/`--effort` are your own assessment of the *chain*, not the base vuln_class — a hypothesis can be `idor`-classed with `impact: critical` because the chain it enables goes all the way to account takeover, even though a bare IDOR alone might not be critical.
 
+## Route P1 Hypotheses Into the Lead Board Too
+
+`save-hypothesis` above logs to `hunt-memory/hypotheses.jsonl` — a calibration
+record for `hypothesis_calibration()`, read later to check whether your stated
+confidence matched what actually happened. It is **not** read by
+`tools/director.py build-plan` (`research-director`'s planning tool) as a source of
+attack candidates — `build-plan` only scores what's already on the lead board. A
+hypothesis that lives solely in `hypotheses.jsonl`/`hypotheses.md` will never become
+a planned attack; it just sits there until a hunter happens to read the markdown.
+
+So: for every hypothesis under `## P1 Hypotheses` in the file you just wrote, if you
+logged it with `--source hypothesis-engine` (i.e. it's genuinely new — not already
+promoted from a `source: "hypothesis"`/`source: "chain"` lead-board entry, which is
+on the board by construction and needs no re-adding), also add it as a real lead:
+
+```bash
+python3 tools/lead_board.py add <target> --skill hunt-<vuln_class> \
+  --evidence "<affected endpoint>" --signal "<hypothesis name>" --priority high
+```
+
+Use `hunt-<vuln_class>` directly (e.g. `idor` → `hunt-idor`) — this is the same
+skill-naming convention `tools/lead_board.py`'s own `ROUTES` table already uses for
+every single-vuln-class skill. For a chain-shaped hypothesis (a named multi-step
+`--attack-chain`, not a single `vuln_class`), use the skill of its first leg — the
+initial access vector is what a hunter would actually start testing.
+
+Don't re-add a P1 hypothesis you logged with `--source lead-board-chain` or
+`--source lead-board-hypothesis` — by definition it already came from the lead board
+and re-adding it would just create a duplicate lead for the same evidence.
+`lead_board.py add` already refuses an exact skill+evidence duplicate on its own, so
+this is a belt-and-suspenders note, not a hard requirement to track separately.
+
+This is why the P1/P2 split in the output format above isn't just presentation —
+only P1 is intentionally the bar for "becomes a real, scoreable attack candidate,"
+reusing that existing split instead of inventing a second confidence threshold that
+means almost the same thing.
+
 ## Rules
 
 1. Every hypothesis needs an affected endpoint. "This tech stack is generally risky" is not a hypothesis — pin it to a specific URL or lead-board entry.
 2. Confidence isn't vibes. Ground it in `priority_score`'s numeric output, the number of matching memory patterns, whether a lead-board correlation backs it, and the calibration check above — state which of those you used, and whether calibration pulled the number down.
 3. A `source: "hypothesis"` lead on the board (3-way same-host correlation) always outranks a single-signal hypothesis at the same confidence level — it has more independent evidence behind it.
 4. Never generate a hypothesis for a target+technique combination already in `failed_patterns.jsonl` — list it under "Killed / Not Generated" instead, with the reason.
-5. You generate hypotheses; you do not test them and you do not decide final P1/P2 ordering — that's `recon-ranker`'s job, using your output as one of its inputs.
+5. You generate hypotheses; you do not test them and you do not decide final ordering — that's `recon-ranker`'s job when invoked via `/surface`, or `research-director`'s job when invoked via `/autopilot`, using your output as one of their inputs.
 6. Log every hypothesis via `save-hypothesis`, even ones you're not fully confident in — an unresolved or wrong hypothesis is still a calibration data point. Only exception: don't log ones you suppressed under "Killed / Not Generated" (those never became a real confidence claim).
 7. A `hunt-browser-required` lead is not the same as a dead end — don't file it under "Killed / Not Generated" (that's for things actively ruled out). File it under "Needs Browser-Driven Testing" instead, so it stays visible as untested surface rather than silently disappearing because the curl-based pipeline has no strategy for it.
+8. `save-hypothesis` alone is not enough for a P1 hypothesis to ever get tested by `research-director`'s plan — also `lead_board.py add` it (see "Route P1 Hypotheses Into the Lead Board Too" above), unless it's already sourced from a lead-board entry. `recon-ranker` reads `hypotheses.md` directly so this step doesn't change anything for `/surface`; it only matters for `/autopilot`, which reads the lead board, not this file.
