@@ -63,6 +63,7 @@ from memory.vuln_intelligence import (  # noqa: E402
     expected_value_per_hour,
     extract_rejection_lessons,
     hypothesis_calibration,
+    normalize_endpoint,
     priority_score,
     tech_vuln_affinity,
 )
@@ -710,6 +711,120 @@ def object_model_leads(target: str, memory_dir: str) -> list[dict]:
     return leads
 
 
+# ─── Cross-source dedup (HIGH-severity fix) ─────────────────────────────────
+#
+# Problem: build_plan() concatenates six independent lead sources into
+# all_leads (board_leads + bi_leads + graph_leads + secret_leads +
+# object_model_leads_list + tool_leads) and scores every one of them —
+# duplicate_or_noise_check() only catches a repeat against CROSS-SESSION
+# memory (journal/report_outcomes/failed_patterns), never a collision
+# WITHIN this same all_leads list. attack_graph_leads() literally builds
+# its Endpoint/Credential nodes FROM board_leads, so the same real
+# vulnerability surfacing independently from object-model, attack-graph,
+# and the plain lead board is the expected case on a well-instrumented
+# target, not an edge case — without this, it becomes 2-3 separately
+# scored Attacks in one plan, each burning its own time-budget slot on
+# what is really one finding.
+#
+# ORDERING (highest confidence wins a collision), justified by what each
+# source's evidence-collection mechanism actually is — not an arbitrary
+# number (Rule 4):
+#   5  object-model    — memory/object_model.py only ever fires on a REAL
+#                         2xx cross-actor access recorded in
+#                         observations.jsonl (module discipline: "no
+#                         evidence means no relationship") — the strongest
+#                         evidence class this repo has.
+#   4  secret-scan      — tools/secrets_scanner.py's pattern/entropy match
+#      takeover-scan       or confirmed-exposed-sourcemap-directory check
+#      cloud-recon         over ALREADY-RECOVERED source, and real scanner
+#      graphql-audit       tool output (dnsReaper/subjack/S3Scanner/
+#                          gqlmap/graphql-cop) — an actual DNS/HTTP round
+#                          trip already ran; not an inference over other
+#                          leads.
+#   3  browser-intel    — real Phase 1 browser-recon artifacts
+#                         (routes.json/auth-model.json/never-called.json),
+#                         but heuristic extraction (documented
+#                         false-positive tradeoff in browser_recon.py).
+#   2  attack-graph     — top_paths()'s INFERRED multi-leg path: real
+#                         confidence-scored, contradiction-discounted
+#                         reasoning, but a chain of inference OVER other
+#                         leads, not a fresh observation of its own — the
+#                         FIX brief's own example ranks this below every
+#                         directly-observed tier above it.
+#   0  everything else  — plain lead-board recon-ingested observations
+#      (default)          ("url", "tech", "nuclei", "ai", "manual", and any
+#                         future source this table doesn't yet name) — a
+#                         raw recon hit with no additional confirmation
+#                         layered on top yet. The FIX brief's own example:
+#                         "plain lead-board entry" is the bottom tier,
+#                         matched here by simply not needing an entry.
+#
+# "chain"/"hypothesis" leads (lead_board.py's own 2-signal/3-signal
+# correlation synthesis over ALREADY-INGESTED leads) are deliberately
+# EXCLUDED from this dedup pass entirely, not merely ranked low — a
+# composite chain/hypothesis represents a genuinely different Attack (the
+# correlation itself, evidenced by chain_of pointing at its constituent
+# leads) than any single leg's own vuln_class+endpoint, and collapsing one
+# into a single-endpoint bucket by coincidental evidence-string overlap
+# would discard the correlation, not de-duplicate a repeat. Same
+# "chain/hypothesis leads are their own synthesis, not raw legs" precedent
+# memory/attack_graph.py's build_capability_graph() already established
+# (its own raw-lead pass skips source in ("chain", "hypothesis") for the
+# identical reason).
+_SOURCE_CONFIDENCE_RANK: dict[str, int] = {
+    "object-model": 5,
+    "secret-scan": 4,
+    "takeover-scan": 4,
+    "cloud-recon": 4,
+    "graphql-audit": 4,
+    "browser-intel": 3,
+    "attack-graph": 2,
+}
+_DEFAULT_SOURCE_CONFIDENCE_RANK = 0
+_DEDUP_EXCLUDED_SOURCES = frozenset({"chain", "hypothesis"})
+
+
+def _lead_confidence_rank(lead: dict) -> int:
+    return _SOURCE_CONFIDENCE_RANK.get(lead.get("source"), _DEFAULT_SOURCE_CONFIDENCE_RANK)
+
+
+def dedup_leads(leads: list[dict]) -> list[dict]:
+    """Collapse leads referencing the SAME (vuln_class, normalized-endpoint
+    shape) surface across DIFFERENT sources down to one — the
+    highest-confidence source wins (_SOURCE_CONFIDENCE_RANK above), ties
+    broken by keeping whichever was seen first (stable, deterministic).
+    Reuses vuln_intelligence.normalize_endpoint() — the SAME shape-matching
+    function duplicate_or_noise_check() already uses for cross-SESSION
+    dedup — for cross-SOURCE dedup within a single build_plan() call; not a
+    second normalization scheme.
+
+    A lead whose skill doesn't map to a vuln_class, or that carries no
+    evidence string, can't have a real dedup key computed — it is kept
+    as its own singleton bucket rather than silently dropped or grouped
+    under a fabricated key. Preserves the first-seen order of all_leads
+    for whichever lead wins each bucket, so build_plan()'s downstream
+    EV/hour sort remains the only thing that reorders the plan.
+    """
+    best_by_key: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for lead in leads:
+        source = lead.get("source")
+        skill = lead.get("skill")
+        evidence = lead.get("evidence") or ""
+        if source in _DEDUP_EXCLUDED_SOURCES or not skill or not evidence:
+            key = ("__no_dedup__", lead.get("id") or id(lead))
+        else:
+            key = (skill_to_vuln_class(skill), normalize_endpoint(evidence))
+
+        if key not in best_by_key:
+            best_by_key[key] = lead
+            order.append(key)
+        elif _lead_confidence_rank(lead) > _lead_confidence_rank(best_by_key[key]):
+            best_by_key[key] = lead
+
+    return [best_by_key[k] for k in order]
+
+
 # ─── Risk level (static heuristic tier — NOT a measured value) ─────────────
 
 # Skills whose test plan implies an authenticated session is needed at all.
@@ -1072,6 +1187,12 @@ class Director:
             tool_leads += graphql_audit_leads(target, graphql_findings_dir, recon_dir)
 
         all_leads = board_leads + bi_leads + graph_leads + secret_leads + object_model_leads_list + tool_leads
+        # HIGH-severity fix — collapse the same real vulnerability
+        # independently surfaced by multiple lead sources (e.g. object-model
+        # + attack-graph + the plain lead board all pointing at the same
+        # endpoint) into one, highest-confidence-source-wins. See
+        # dedup_leads()'s docstring for the full ordering + exclusions.
+        all_leads = dedup_leads(all_leads)
 
         candidates: list[dict] = []
         for lead in all_leads:

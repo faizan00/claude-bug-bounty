@@ -63,7 +63,10 @@ for _p in (REPO_ROOT, TOOLS_ROOT):
 import lead_board as lb  # tools/ on sys.path via conftest.py
 from tools.scope_checker import ScopeChecker
 from tools import validation_core as vcore
-from memory.finding_state import FindingStateDB
+from tools.browser_recon import Fetcher
+from tools.self_critique import self_critique
+from memory.candidate import make_candidate
+from memory.finding_state import FindingStateDB, write_report_artifact
 from memory.vuln_intelligence import priority_score
 
 TARGET = "demo.local"  # the "domain" this synthetic hunt targets
@@ -299,6 +302,36 @@ def _env_leak_finding(base_url: str) -> dict:
     }
 
 
+def _run_real_self_critique(base_url: str) -> dict:
+    """Runs the REAL tools/self_critique.py gate (check #1, reproducibility)
+    against the live demo app -- two genuine GET /.env round trips through a
+    real tools/browser_recon.py Fetcher, not a mock. Used by the REPORT_READY
+    stage below so the self_critique_report_path/hash evidence
+    memory/finding_state.py now requires is backed by an actual gate run,
+    the same "no fetcher/fabricated evidence sneaks a finding through"
+    property test_self_critique.py's own suite already exercises."""
+    checker = ScopeChecker(["localhost"])
+    fetcher = Fetcher(checker, max_requests=10)
+    candidate = make_candidate(
+        source="test-e2e",
+        type_="info-disclosure",
+        evidence=[{
+            "type": "Observed-HTTP-Response",
+            "detail": "GET /.env returns 200 with AWS_SECRET_ACCESS_KEY in plaintext",
+            "artifact": f"{base_url}/.env",
+        }],
+        rationale="Exposed .env file leaks AWS access key/secret, DB creds, JWT signing key",
+        validation_plan={
+            "steps": [{"method": "GET", "url": f"{base_url}/.env"}],
+            "expected": "200",
+            "stop_condition": "non-200 on a retry",
+        },
+        provenance={"origin_lead_id": None, "origin_source": "test-e2e"},
+        metadata={"target": TARGET, "endpoint": "/.env"},
+    )
+    return self_critique(candidate, fetcher=fetcher)
+
+
 class TestStage4Validate:
     def test_confirmed_env_leak_passes_all_gates(self, demo_app):
         base_url, _demo = demo_app
@@ -340,7 +373,19 @@ class TestStage5Report:
 
         validation = vcore.evaluate_finding(_env_leak_finding(base_url))
         assert validation["overall_pass"] is True
-        evidence = {"verdict": "STRONG", "reproducible": True}
+
+        # HIGH-severity fix: CONFIRMED/REPORT_READY now require a persisted,
+        # hash-bound report artifact, not just a bare verdict/reproducible
+        # label. Persist the REAL evaluate_finding() result computed above
+        # (not a synthetic stand-in) via write_report_artifact() -- the same
+        # function tools/validate.py's --report-output flag uses.
+        validation_report_path = tmp_path / "validation_report.json"
+        validation_report_hash = write_report_artifact(validation, validation_report_path)
+        confirm_evidence = {
+            "verdict": "STRONG", "reproducible": True,
+            "validation_report_path": str(validation_report_path),
+            "validation_report_hash": validation_report_hash,
+        }
 
         db = FindingStateDB(tmp_path / "hunt-memory" / "finding_states.jsonl")
 
@@ -348,22 +393,31 @@ class TestStage5Report:
                     notes="found via robots.txt Disallow crawl")
         db.advance(TARGET, vuln_class, endpoint, "TESTING",
                     notes="confirmed live via curl -s <base>/.env")
-        db.advance(TARGET, vuln_class, endpoint, "VALIDATED", evidence=evidence,
+        db.advance(TARGET, vuln_class, endpoint, "VALIDATED", evidence=confirm_evidence,
                     notes="tools/validation_core.py evaluate_finding() overall_pass=True")
         confirmed = db.advance(
-            TARGET, vuln_class, endpoint, "CONFIRMED", evidence=evidence,
+            TARGET, vuln_class, endpoint, "CONFIRMED", evidence=confirm_evidence,
             technique="exposed-config-file", tech_stack=["python", "http.server"],
             payout=500,
         )
+
         # Phase 7 — the self-critique gate now sits between CONFIRMED and
-        # REPORT_READY; a real caller would pass tools/self_critique.py's
-        # self_critique()["overall"] here.
-        db.advance(TARGET, vuln_class, endpoint, "SELF_CRITIQUED",
-                    evidence={**evidence, "self_critique_overall": "pass"})
-        report_ready = db.advance(
-            TARGET, vuln_class, endpoint, "REPORT_READY",
-            evidence={**evidence, "self_critique_overall": "pass"},
-        )
+        # REPORT_READY. This runs the REAL tools/self_critique.py gate
+        # (reproducibility check #1 included) against the live demo app --
+        # two genuine GET /.env round trips, not a mock -- then persists
+        # that real report the same hash-bound way.
+        self_critique_report = _run_real_self_critique(base_url)
+        assert self_critique_report["overall"] in ("pass", "warn"), self_critique_report
+        self_critique_report_path = tmp_path / "self_critique_report.json"
+        self_critique_report_hash = write_report_artifact(self_critique_report, self_critique_report_path)
+        sc_evidence = {
+            **confirm_evidence,
+            "self_critique_overall": self_critique_report["overall"],
+            "self_critique_report_path": str(self_critique_report_path),
+            "self_critique_report_hash": self_critique_report_hash,
+        }
+        db.advance(TARGET, vuln_class, endpoint, "SELF_CRITIQUED", evidence=sc_evidence)
+        report_ready = db.advance(TARGET, vuln_class, endpoint, "REPORT_READY", evidence=sc_evidence)
 
         assert db.current_state(TARGET, vuln_class, endpoint) == "REPORT_READY"
         assert report_ready["state"] == "REPORT_READY"
@@ -430,18 +484,34 @@ class TestFullSequence:
         validation = vcore.evaluate_finding(_env_leak_finding(base_url))
         assert validation["overall_pass"] is True, f"validate stage rejected a real finding: {validation}"
 
-        # 5. REPORT
+        # 5. REPORT — real, hash-bound validation_core.py + self_critique.py
+        # report artifacts, not bare verdict/reproducible labels.
         db = FindingStateDB(isolated_memory / "hunt-memory" / "finding_states.jsonl")
-        evidence = {"verdict": "STRONG", "reproducible": True}
+        validation_report_path = isolated_memory / "hunt-memory" / "validation_report.json"
+        validation_report_hash = write_report_artifact(validation, validation_report_path)
+        confirm_evidence = {
+            "verdict": "STRONG", "reproducible": True,
+            "validation_report_path": str(validation_report_path),
+            "validation_report_hash": validation_report_hash,
+        }
         db.advance(TARGET, "info-disclosure", "/.env", "SUSPECTED")
         db.advance(TARGET, "info-disclosure", "/.env", "TESTING")
-        db.advance(TARGET, "info-disclosure", "/.env", "VALIDATED", evidence=evidence)
-        db.advance(TARGET, "info-disclosure", "/.env", "CONFIRMED", evidence=evidence,
+        db.advance(TARGET, "info-disclosure", "/.env", "VALIDATED", evidence=confirm_evidence)
+        db.advance(TARGET, "info-disclosure", "/.env", "CONFIRMED", evidence=confirm_evidence,
                     technique="exposed-config-file", tech_stack=["python", "http.server"])
-        db.advance(TARGET, "info-disclosure", "/.env", "SELF_CRITIQUED",
-                    evidence={**evidence, "self_critique_overall": "pass"})
-        db.advance(TARGET, "info-disclosure", "/.env", "REPORT_READY",
-                    evidence={**evidence, "self_critique_overall": "pass"})
+
+        self_critique_report = _run_real_self_critique(base_url)
+        assert self_critique_report["overall"] in ("pass", "warn"), self_critique_report
+        self_critique_report_path = isolated_memory / "hunt-memory" / "self_critique_report.json"
+        self_critique_report_hash = write_report_artifact(self_critique_report, self_critique_report_path)
+        sc_evidence = {
+            **confirm_evidence,
+            "self_critique_overall": self_critique_report["overall"],
+            "self_critique_report_path": str(self_critique_report_path),
+            "self_critique_report_hash": self_critique_report_hash,
+        }
+        db.advance(TARGET, "info-disclosure", "/.env", "SELF_CRITIQUED", evidence=sc_evidence)
+        db.advance(TARGET, "info-disclosure", "/.env", "REPORT_READY", evidence=sc_evidence)
 
         assert db.current_state(TARGET, "info-disclosure", "/.env") == "REPORT_READY", (
             "report stage failed to reach a submittable state"

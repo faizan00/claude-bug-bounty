@@ -37,17 +37,22 @@ If the `validation-engine` agent hasn't already run on this finding, run its dup
 python3 -m memory.vuln_intelligence duplicate-check --target <target> --vuln-class <class> --endpoint <endpoint> --memory-dir hunt-memory
 ```
 
-Once you answered all four questions above concretely (especially #1 and #4 — that's what "reproducible" means here), run `tools/self_critique.py` and advance the finding through `SELF_CRITIQUED` to `REPORT_READY`. Phase 7 gates `REPORT_READY` behind `SELF_CRITIQUED` — `memory/finding_state.py` hard-blocks a direct `CONFIRMED` → `REPORT_READY` jump, and blocks `SELF_CRITIQUED` itself without a recorded `pass`/`warn` overall, so a finding you're not actually ready to write can't be marked ready by accident:
+Once you answered all four questions above concretely (especially #1 and #4 — that's what "reproducible" means here), run `tools/self_critique.py` and advance the finding through `SELF_CRITIQUED` to `REPORT_READY`. Phase 7 gates `REPORT_READY` behind `SELF_CRITIQUED` — `memory/finding_state.py` hard-blocks a direct `CONFIRMED` → `REPORT_READY` jump, blocks `SELF_CRITIQUED` itself without a recorded `pass`/`warn` overall, and (as of the artifact-binding fix) blocks `REPORT_READY` itself unless it's backed by the ACTUAL persisted `self_critique.py` report you just ran — not a bare `--reproducible` flag. Pass `--output` to persist that report and get the `(path, hash)` pair the next command needs:
 ```bash
 python3 -m tools.self_critique --candidate <candidate.json> --report-outcomes hunt-memory/report_outcomes.jsonl \
-  --observations hunt-memory/observations.jsonl --allowed-domain <target>
-# read the printed report's "overall" (pass/warn/block), then:
+  --observations hunt-memory/observations.jsonl --allowed-domain <target> \
+  --output hunt-memory/reports/<target>-<class>-self_critique.json
+# stdout ends with two lines: self_critique_report_path=... and
+# self_critique_report_hash=... -- capture both, plus the report's own
+# "overall" (pass/warn/block) from the printed JSON, then:
 python3 -m memory.finding_state advance --target <target> --vuln-class <class> --endpoint <endpoint> \
   --state SELF_CRITIQUED --self-critique-overall <overall> --memory-dir hunt-memory
 python3 -m memory.finding_state advance --target <target> --vuln-class <class> --endpoint <endpoint> \
-  --state REPORT_READY --reproducible --memory-dir hunt-memory
+  --state REPORT_READY --reproducible \
+  --self-critique-report-path <self_critique_report_path> --self-critique-report-hash <self_critique_report_hash> \
+  --memory-dir hunt-memory
 ```
-If either command errors, it's telling you something upstream is missing — either `validator` never ran (finding never reached `CONFIRMED`), `validation-engine` never recorded a STRONG verdict, or the self-critique gate returned `block`. Don't write the report until both succeed.
+If either command errors, it's telling you something upstream is missing — either `validator` never ran (finding never reached `CONFIRMED`), `validation-engine` never recorded a STRONG verdict, the self-critique gate returned `block`, or you forgot `--self-critique-report-path`/`--self-critique-report-hash` on the final command (the finding_state.py error message names exactly which one). Don't write the report until both succeed.
 
 ## Memory-Informed Writing
 

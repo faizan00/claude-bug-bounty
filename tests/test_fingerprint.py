@@ -206,6 +206,13 @@ class TestPhase1Priority:
         # both tiers fired and agree on nothing, but tier 2 always wins regardless
         assert "browser/routes.json" in result["sources"]
         assert "live/httpx_full.txt" in result["sources"]
+        # HIGH-severity fix: the WINNER doesn't change (tier 2 still wins on
+        # WHICH framework), but the active contradiction must now be
+        # recorded and discounted -- this was previously silent, confidence
+        # stayed a flat 0.85 as if httpx had said nothing at all.
+        assert result["tier_disagreement"] == [{"tier": 3, "said": "django"}]
+        assert result["confidence"] < 0.85
+        assert result["confidence"] == round(0.85 * fp.TIER_DISAGREEMENT_PENALTY, 2)
 
     def test_corroboration_boosts_confidence(self, tmp_path):
         rd = tmp_path / "recon" / "t.example"
@@ -215,6 +222,97 @@ class TestPhase1Priority:
         assert result["framework"] == "laravel"
         # tier 3 base (0.6) + 0.1 corroboration from tier 4 cookie match
         assert result["confidence"] == 0.7
+        # No disagreement in this scenario -- must not be silently penalized.
+        assert result["tier_disagreement"] == []
+
+
+# ─── HIGH-severity fix: tier disagreement is discounted, not silent ───────
+#
+# Direct unit tests on _detect_framework() (faster/more precise than going
+# through build_fingerprint()'s file-writing helpers for every case) mirror
+# memory/attack_graph.py's _apply_contradiction() approach: an active
+# contradiction from a non-winning tier must lower confidence and be
+# recorded, never just silently outvoted.
+
+
+class TestTierDisagreement:
+    def test_no_signal_from_other_tiers_is_not_a_disagreement(self):
+        """Tier 2 wins alone, nothing else fired -- staying silent is not
+        the same as contradicting."""
+        result = fp._detect_framework({"framework_detected": "nextjs"}, "", None)
+        assert result["tier_disagreement"] == []
+        assert result["confidence"] == 0.85
+
+    def test_agreement_across_all_tiers_no_disagreement(self):
+        result = fp._detect_framework(
+            {"framework_detected": "nextjs"}, "[nextjs webpack chunk]",
+            {"cookies": [{"name": "next-auth.session-token"}]},
+        )
+        # tier3's httpx text matches the next.?js marker and corroborates
+        # (+0.1); tier4 has no _COOKIE_FRAMEWORK_MARKERS rule for nextjs at
+        # all, so it stays silent rather than agreeing OR disagreeing.
+        # Silence from one tier + real corroboration from another must
+        # never register as a disagreement.
+        assert result["tier_disagreement"] == []
+        assert result["confidence"] == 0.95  # 0.85 base + 0.10 corroboration, no discount
+
+    def test_single_disagreeing_tier_penalizes_and_records_it(self):
+        result = fp._detect_framework(
+            {"framework_detected": "nextjs"}, "[Django Admin Login] [gunicorn]", None,
+        )
+        assert result["framework"] == "nextjs"  # winner unchanged
+        assert result["tier_disagreement"] == [{"tier": 3, "said": "django"}]
+        assert result["confidence"] == round(0.85 * fp.TIER_DISAGREEMENT_PENALTY, 2)
+
+    def test_disagreement_from_lowest_tier_still_penalizes_the_winner(self):
+        """Even the WEAKEST tier (4, cookie names) actively contradicting
+        the winner must be recorded/discounted -- not dismissed just
+        because it's the lowest-confidence tier in isolation."""
+        result = fp._detect_framework(
+            {"framework_detected": "react"}, "", {"cookies": [{"name": "laravel_session"}]},
+        )
+        assert result["framework"] == "react"
+        assert result["tier_disagreement"] == [{"tier": 4, "said": "laravel"}]
+        assert result["confidence"] == round(0.85 * fp.TIER_DISAGREEMENT_PENALTY, 2)
+
+    def test_mixed_corroboration_and_disagreement_applies_both(self):
+        """tier3 corroborates the tier2 winner while tier4 disagrees --
+        both real signals must be reflected: the corroboration bonus is
+        still earned, then the disagreement penalty is applied on top
+        (composition of two already-justified adjustments, not a new
+        formula)."""
+        result = fp._detect_framework(
+            {"framework_detected": "nextjs"}, "[nextjs webpack chunk]",
+            {"cookies": [{"name": "laravel_session"}]},
+        )
+        assert result["framework"] == "nextjs"
+        assert result["tier_disagreement"] == [{"tier": 4, "said": "laravel"}]
+        # tier3's httpx text ("nextjs webpack chunk") matches the next.?js
+        # marker and corroborates the tier2 winner (+0.1), WHILE tier4's
+        # cookie name disagrees -- both real signals land on the same
+        # result: (0.85 base + 0.10 corroboration) * 0.3 disagreement
+        # discount. Exact value asserted, not a vague inequality, so this
+        # stays a precise regression on the composition, not just "lower".
+        assert result["confidence"] == round((0.85 + 0.10) * fp.TIER_DISAGREEMENT_PENALTY, 2)
+
+    def test_cold_start_no_tier_fires_empty_disagreement_list(self):
+        result = fp._detect_framework(None, "", None)
+        assert result == {"framework": "unknown", "version": None, "confidence": 0.0, "tier_disagreement": []}
+
+    def test_disagreement_field_reaches_build_fingerprint_output(self, tmp_path):
+        rd = tmp_path / "recon" / "t.example"
+        _write_routes(rd, "react")
+        _write_httpx(rd, ["https://t.example [200] [Home] [django]"])
+        result = fp.build_fingerprint("t.example", str(rd))
+        assert result["tier_disagreement"] == [{"tier": 3, "said": "django"}]
+
+    def test_confidence_never_goes_negative_or_above_one(self):
+        # winner_tier=2 (0.85) + corroboration would exceed 1.0 without the
+        # cap; disagreement discount must still land inside [0, 1].
+        result = fp._detect_framework(
+            {"framework_detected": "nextjs"}, "[Django Admin Login]", None,
+        )
+        assert 0.0 <= result["confidence"] <= 1.0
 
 
 # ─── infra / api_style / spa_framework — reuse, not reimplementation ──────

@@ -40,6 +40,23 @@ finding through:
   * "Missing reproduction blocks REPORT_READY" — a transition to
     REPORT_READY requires evidence["reproducible"] is True.
 
+  Both of the above are necessary but no longer sufficient. A bare
+  evidence["verdict"]/["reproducible"] value is just a string/bool the
+  calling agent constructs itself — nothing tied it to a real
+  validation-engine or self_critique.py run. CONFIRMED additionally
+  requires evidence["validation_report_path"] + ["validation_report_hash"]
+  naming a persisted tools/validation_core.py evaluate_finding()-shaped
+  JSON report (overall_pass: true) whose CURRENT on-disk sha256 matches
+  the hash; REPORT_READY additionally requires evidence
+  ["self_critique_report_path"] + ["self_critique_report_hash"] naming a
+  persisted tools/self_critique.py self_critique()-shaped JSON report
+  (overall in "pass"/"warn") under the same hash-bound scheme. See
+  write_report_artifact()/verify_report_artifact() below — the hash binds
+  the evidence to the EXACT bytes on disk at verification time, so a
+  missing file, a wrong path, or a file edited/swapped after the hash was
+  recorded all fail closed with a clear reason instead of silently
+  trusting a label.
+
 Self-learning (FindingStateDB.advance()'s auto_learn, default on): landing
 on REJECTED or CONFIRMED automatically writes to failed_patterns.jsonl /
 patterns.jsonl (the same two files vuln_intelligence.py's
@@ -53,6 +70,7 @@ through the CLI at the bottom: `python3 -m memory.finding_state <cmd>`.
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -91,6 +109,93 @@ class FindingStateError(Exception):
     """Raised when a transition is illegal — wrong order, or blocked by weak/missing evidence."""
 
 
+# ─── Report-artifact binding (closes the "bare string is trusted" gap) ─────
+#
+# A caller-supplied evidence["verdict"]=="STRONG" or evidence["reproducible"]
+# is-True on its own is unverifiable — it's just a value the calling agent
+# wrote, with nothing tying it back to an actual validation-engine or
+# self_critique.py run. write_report_artifact() persists a real
+# tools/validation_core.py evaluate_finding() / tools/self_critique.py
+# self_critique() result dict to disk and returns its sha256 hex digest;
+# verify_report_artifact() re-reads the file at transition time, recomputes
+# the hash, and only then trusts specific fields inside it. This is
+# file-existence + content-hash binding, not cryptographic signing — it
+# closes "the calling agent typed a string" without needing a signing key,
+# per the FIX brief: a mismatched/missing/malformed artifact fails closed.
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def write_report_artifact(report: dict, path: str | Path) -> str:
+    """Persist ``report`` (a validation_core.evaluate_finding() or
+    self_critique.self_critique() return dict) as canonical JSON at
+    ``path`` and return its sha256 hex digest — the exact
+    (path, hash) pair can_transition()'s CONFIRMED/REPORT_READY checks
+    require as evidence. Canonical serialization (sort_keys, fixed
+    indent) so re-serializing the same dict always reproduces the same
+    bytes/hash."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    p.write_bytes(encoded)
+    return _sha256_bytes(encoded)
+
+
+def verify_report_artifact(path: str | Path, expected_hash: str, required_fields: dict) -> dict:
+    """Read the report artifact at ``path``, verify its CURRENT raw-byte
+    sha256 matches ``expected_hash`` (a missing file, wrong path, or a file
+    edited/swapped since the hash was recorded all fail here), then verify
+    every ``required_fields`` entry — a dotted field path (e.g.
+    "overall_pass") mapped to either an exact expected value or a
+    set/frozenset of acceptable values (e.g. {"pass", "warn"}) — is present
+    in the parsed JSON with a matching value. Returns
+    {"ok": bool, "reason": str}; never raises — every failure mode
+    (missing file, hash mismatch, invalid JSON, missing/wrong field) is a
+    reported reason, not an exception, so can_transition() can fold this
+    into its existing {"allowed", "reason"} shape."""
+    p = Path(path)
+    if not p.exists():
+        return {"ok": False, "reason": f"report artifact not found: {path}"}
+    try:
+        raw = p.read_bytes()
+    except OSError as exc:
+        return {"ok": False, "reason": f"report artifact unreadable at {path}: {exc}"}
+
+    actual_hash = _sha256_bytes(raw)
+    if actual_hash != expected_hash:
+        return {
+            "ok": False,
+            "reason": (
+                f"report artifact hash mismatch at {path} "
+                f"(expected {expected_hash}, got {actual_hash}) — file is missing, "
+                "was edited/swapped since the hash was recorded, or the wrong path was given"
+            ),
+        }
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return {"ok": False, "reason": f"report artifact at {path} is not valid JSON: {exc}"}
+    if not isinstance(data, dict):
+        return {"ok": False, "reason": f"report artifact at {path} is not a JSON object"}
+
+    for field_path, expected_value in required_fields.items():
+        val = data
+        for part in field_path.split("."):
+            if not isinstance(val, dict) or part not in val:
+                return {"ok": False, "reason": f"report artifact at {path} missing field {field_path!r}"}
+            val = val[part]
+        matches = (val in expected_value) if isinstance(expected_value, (set, frozenset)) else (val == expected_value)
+        if not matches:
+            return {
+                "ok": False,
+                "reason": f"report artifact at {path} field {field_path!r} = {val!r}, expected {expected_value!r}",
+            }
+
+    return {"ok": True, "reason": "report artifact verified"}
+
+
 def can_transition(current_state: str, next_state: str, evidence: dict | None = None) -> dict:
     """Is ``current_state`` -> ``next_state`` legal right now?
 
@@ -120,14 +225,35 @@ def can_transition(current_state: str, next_state: str, evidence: dict | None = 
     # Weak-finding auto-rejection — independent of ordering, gated on the
     # evidence itself. A missing verdict is treated the same as a non-STRONG
     # one: CONFIRMED requires *positive* proof, not merely "not proven weak."
-    if next_state == "CONFIRMED" and evidence.get("verdict") != "STRONG":
-        return {
-            "allowed": False,
-            "reason": (
-                f"validation-engine verdict is {evidence.get('verdict')!r}, not STRONG — "
-                "weak evidence cannot become CONFIRMED"
-            ),
-        }
+    if next_state == "CONFIRMED":
+        if evidence.get("verdict") != "STRONG":
+            return {
+                "allowed": False,
+                "reason": (
+                    f"validation-engine verdict is {evidence.get('verdict')!r}, not STRONG — "
+                    "weak evidence cannot become CONFIRMED"
+                ),
+            }
+        # A bare "STRONG" string is not itself proof — require a persisted,
+        # hash-bound validation_core.evaluate_finding() artifact showing the
+        # real 4-gate result actually passed. See write_report_artifact()/
+        # verify_report_artifact() above.
+        report_path = evidence.get("validation_report_path")
+        report_hash = evidence.get("validation_report_hash")
+        if not report_path or not report_hash:
+            return {
+                "allowed": False,
+                "reason": (
+                    "CONFIRMED requires a persisted validation report — evidence must carry "
+                    "validation_report_path + validation_report_hash referencing a real "
+                    "tools/validation_core.py evaluate_finding() artifact "
+                    "(see memory.finding_state.write_report_artifact()); a bare verdict string "
+                    "is not itself proof"
+                ),
+            }
+        artifact = verify_report_artifact(report_path, report_hash, {"overall_pass": True})
+        if not artifact["ok"]:
+            return {"allowed": False, "reason": f"CONFIRMED validation-report check failed: {artifact['reason']}"}
 
     # Phase 7 — nothing reaches SELF_CRITIQUED without tools/self_critique.py's
     # gate having actually run and cleared it (pass or warn; block means at
@@ -141,11 +267,31 @@ def can_transition(current_state: str, next_state: str, evidence: dict | None = 
             ),
         }
 
-    if next_state == "REPORT_READY" and not evidence.get("reproducible", False):
-        return {
-            "allowed": False,
-            "reason": "no reproducible evidence recorded — missing reproduction blocks REPORT_READY",
-        }
+    if next_state == "REPORT_READY":
+        if not evidence.get("reproducible", False):
+            return {
+                "allowed": False,
+                "reason": "no reproducible evidence recorded — missing reproduction blocks REPORT_READY",
+            }
+        # Same discipline as CONFIRMED above: a bare reproducible=True is not
+        # itself proof — require a persisted, hash-bound self_critique.py
+        # self_critique() artifact showing the gate actually cleared.
+        report_path = evidence.get("self_critique_report_path")
+        report_hash = evidence.get("self_critique_report_hash")
+        if not report_path or not report_hash:
+            return {
+                "allowed": False,
+                "reason": (
+                    "REPORT_READY requires a persisted self-critique report — evidence must carry "
+                    "self_critique_report_path + self_critique_report_hash referencing a real "
+                    "tools/self_critique.py self_critique() artifact "
+                    "(see memory.finding_state.write_report_artifact()); a bare reproducible flag "
+                    "is not itself proof"
+                ),
+            }
+        artifact = verify_report_artifact(report_path, report_hash, {"overall": {"pass", "warn"}})
+        if not artifact["ok"]:
+            return {"allowed": False, "reason": f"REPORT_READY self-critique-report check failed: {artifact['reason']}"}
 
     return {"allowed": True, "reason": "legal transition"}
 
@@ -306,6 +452,10 @@ class FindingStateDB:
             verdict=evidence.get("verdict"),
             reproducible=evidence.get("reproducible"),
             self_critique_overall=evidence.get("self_critique_overall"),
+            validation_report_path=evidence.get("validation_report_path"),
+            validation_report_hash=evidence.get("validation_report_hash"),
+            self_critique_report_path=evidence.get("self_critique_report_path"),
+            self_critique_report_hash=evidence.get("self_critique_report_hash"),
             notes=notes,
         )
         self.save(entry)
@@ -393,7 +543,7 @@ def _cmd_history(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_can_transition(args: argparse.Namespace) -> int:
+def _evidence_from_args(args: argparse.Namespace) -> dict:
     evidence = {}
     if args.verdict is not None:
         evidence["verdict"] = args.verdict
@@ -401,19 +551,26 @@ def _cmd_can_transition(args: argparse.Namespace) -> int:
         evidence["reproducible"] = True
     if args.self_critique_overall is not None:
         evidence["self_critique_overall"] = args.self_critique_overall
+    if getattr(args, "validation_report_path", None) is not None:
+        evidence["validation_report_path"] = args.validation_report_path
+    if getattr(args, "validation_report_hash", None) is not None:
+        evidence["validation_report_hash"] = args.validation_report_hash
+    if getattr(args, "self_critique_report_path", None) is not None:
+        evidence["self_critique_report_path"] = args.self_critique_report_path
+    if getattr(args, "self_critique_report_hash", None) is not None:
+        evidence["self_critique_report_hash"] = args.self_critique_report_hash
+    return evidence
+
+
+def _cmd_can_transition(args: argparse.Namespace) -> int:
+    evidence = _evidence_from_args(args)
     result = can_transition(args.current_state, args.next_state, evidence)
     print(json.dumps(result, indent=2))
     return 0
 
 
 def _cmd_advance(args: argparse.Namespace) -> int:
-    evidence = {}
-    if args.verdict is not None:
-        evidence["verdict"] = args.verdict
-    if args.reproducible:
-        evidence["reproducible"] = True
-    if args.self_critique_overall is not None:
-        evidence["self_critique_overall"] = args.self_critique_overall
+    evidence = _evidence_from_args(args)
 
     db = FindingStateDB(_finding_states_path(args.memory_dir))
     try:
@@ -463,6 +620,10 @@ def main() -> int:
     p.add_argument("--verdict", default=None, choices=("STRONG", "WEAK", "REJECT"), help="validation-engine's verdict")
     p.add_argument("--reproducible", action="store_true", help="Reproducible evidence is on hand")
     p.add_argument("--self-critique-overall", default=None, choices=("pass", "warn", "block"), help="tools/self_critique.py's self_critique()['overall']")
+    p.add_argument("--validation-report-path", default=None, help="Path to a persisted tools/validation_core.py evaluate_finding() JSON artifact (required for CONFIRMED, alongside --validation-report-hash)")
+    p.add_argument("--validation-report-hash", default=None, help="sha256 hex digest of --validation-report-path's exact bytes (from memory.finding_state.write_report_artifact())")
+    p.add_argument("--self-critique-report-path", default=None, help="Path to a persisted tools/self_critique.py self_critique() JSON artifact (required for REPORT_READY, alongside --self-critique-report-hash)")
+    p.add_argument("--self-critique-report-hash", default=None, help="sha256 hex digest of --self-critique-report-path's exact bytes (from memory.finding_state.write_report_artifact())")
     p.set_defaults(func=_cmd_can_transition)
 
     p = sub.add_parser("advance", help="Validate + persist a transition for a specific finding")
@@ -473,6 +634,10 @@ def main() -> int:
     p.add_argument("--verdict", default=None, choices=("STRONG", "WEAK", "REJECT"), help="validation-engine's verdict")
     p.add_argument("--reproducible", action="store_true", help="Reproducible evidence is on hand")
     p.add_argument("--self-critique-overall", default=None, choices=("pass", "warn", "block"), help="tools/self_critique.py's self_critique()['overall']")
+    p.add_argument("--validation-report-path", default=None, help="Path to a persisted tools/validation_core.py evaluate_finding() JSON artifact (required for CONFIRMED, alongside --validation-report-hash)")
+    p.add_argument("--validation-report-hash", default=None, help="sha256 hex digest of --validation-report-path's exact bytes (from memory.finding_state.write_report_artifact())")
+    p.add_argument("--self-critique-report-path", default=None, help="Path to a persisted tools/self_critique.py self_critique() JSON artifact (required for REPORT_READY, alongside --self-critique-report-hash)")
+    p.add_argument("--self-critique-report-hash", default=None, help="sha256 hex digest of --self-critique-report-path's exact bytes (from memory.finding_state.write_report_artifact())")
     p.add_argument("--notes", default=None)
     p.add_argument("--technique", default=None, help="Enables self-learning auto-save on REJECTED/CONFIRMED (needs --tech-stack too)")
     p.add_argument("--tech-stack", default=None, help="Comma-separated, required alongside --technique for auto-save")

@@ -146,11 +146,40 @@ ACTION: [What researcher should do next]
 
 ## Update the Finding's Lifecycle State
 
-On PASS, advance the finding from `VALIDATED` to `CONFIRMED` — this is the transition `memory/finding_state.py` blocks unless `validation-engine` already recorded a STRONG verdict for it, so run `validation-engine` first if that step got skipped. Pass `--technique`/`--tech-stack`/`--payout` too: this is what auto-saves a `patterns.jsonl` entry (Phase 7 self-learning) so the confirmed technique feeds `tech_vuln_affinity()`/`priority_score()` on the next target with no manual `/remember` step:
+On PASS, advance the finding from `VALIDATED` to `CONFIRMED` — this is the transition `memory/finding_state.py` blocks unless `validation-engine` already recorded a STRONG verdict for it, so run `validation-engine` first if that step got skipped. As of the artifact-binding fix, a bare `--verdict STRONG` is no longer sufficient on its own: CONFIRMED also requires a persisted, hash-bound `tools/validation_core.py` `evaluate_finding()` report showing `overall_pass: true`. Run it first:
+
+```bash
+cat > /tmp/finding.json <<'JSON'
+{
+  "vuln_type": "<vuln class, e.g. IDOR>",
+  "gate1": {
+    "repro_3_3": true, "works_without_proxy": true,
+    "no_special_state": true, "not_documented_behavior": true
+  },
+  "gate2": {"asset_in_scope": true, "not_excluded": true, "version_ok": true},
+  "gate3": {
+    "concrete_impact": true, "no_unrealistic_preconditions": true,
+    "curl_poc": "<the exact curl PoC>", "impact_description": "<one line>"
+  },
+  "gate4": {"not_in_h1_disclosed": true, "not_in_github_issues": true, "checked_git_history": true}
+}
+JSON
+python3 -m tools.validate --non-interactive --json --input /tmp/finding.json \
+  --report-output hunt-memory/reports/<target>-<class>-validation.json
+# stdout ends with two lines: validation_report_path=... and
+# validation_report_hash=... -- capture both.
+```
+
+`vuln_type` matters, not just documentation: `validate.py` auto-detects auth-related classes (idor/ato/auth/session/login/privilege/account/bypass/takeover/permission/"access control"/"broken auth"/bac/"broken access"/"insecure direct") from the string itself and, ONLY for those, additionally requires three identity-check booleans inside `gate1` — `cross_account_tested`, `fresh_session_tested`, `anon_vs_auth_delta` (this is what Q3's "Session A reached session B's data, both real and distinct" check above already establishes; just add the three fields to `gate1` when `vuln_type` is one of those classes). Omitting them on an auth-related finding fails the command with `missing required field: cross_account_tested` — don't guess the shape, that error message names exactly what's missing.
+
+Map your 7-Question answers onto this shape rather than re-answering from scratch: Q1 → `gate1.repro_3_3` + `gate3.curl_poc`, Q3 → `gate2.asset_in_scope`, Q4 → `gate1.no_special_state`, Q5 → `gate1.not_documented_behavior` (+ the duplicate-check preflight above covers `gate4`), Q6 → `gate3.concrete_impact`. Q2 (accepted bug class) and Q7 (never-submit list) are program-policy questions `validate.py`'s 4 gates deliberately don't encode — they stay your own PASS/KILL judgment; only answer the CONFIRMED command below if BOTH the machine gates above passed AND your own Q2/Q7 judgment was PASS. Pass `--technique`/`--tech-stack`/`--payout` too: this is what auto-saves a `patterns.jsonl` entry (Phase 7 self-learning) so the confirmed technique feeds `tech_vuln_affinity()`/`priority_score()` on the next target with no manual `/remember` step:
 
 ```bash
 python3 -m memory.finding_state advance --target <target> --vuln-class <class> --endpoint <endpoint> \
-  --state CONFIRMED --verdict STRONG --technique <technique> --tech-stack "<stack>" \
+  --state CONFIRMED --verdict STRONG \
+  --validation-report-path hunt-memory/reports/<target>-<class>-validation.json \
+  --validation-report-hash <validation_report_hash> \
+  --technique <technique> --tech-stack "<stack>" \
   --payout <est_or_actual> --memory-dir hunt-memory
 ```
 

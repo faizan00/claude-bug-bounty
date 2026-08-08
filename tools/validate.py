@@ -714,6 +714,12 @@ def _run_non_interactive(args) -> int:
         return 2
 
     print(json.dumps(result, indent=2, sort_keys=True))
+    if getattr(args, "report_output", None):
+        from memory.finding_state import write_report_artifact
+
+        report_hash = write_report_artifact(result, args.report_output)
+        print(f"validation_report_path={args.report_output}")
+        print(f"validation_report_hash={report_hash}")
     return 0 if result["overall_pass"] else 1
 
 
@@ -753,6 +759,14 @@ def main() -> int:
         default="",
         help="Path to a finding JSON file (required with --non-interactive). "
              "See validation_core.evaluate_finding() for the expected shape.",
+    )
+    parser.add_argument(
+        "--report-output", default=None,
+        help="--non-interactive only. Persist the evaluate_finding() result as canonical "
+             "JSON at this path and print its sha256 hex digest -- the (path, hash) pair "
+             "memory/finding_state.py's CONFIRMED transition requires as evidence "
+             "(validation_report_path / validation_report_hash). Distinct from --output "
+             "(the human-readable report skeleton this same CLI's interactive mode writes).",
     )
     args = parser.parse_args()
 
