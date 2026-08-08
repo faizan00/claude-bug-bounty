@@ -25,6 +25,11 @@ SCHEMA — recon/<target>/fingerprint.json:
   "framework": str,                 # e.g. "nextjs" | "rails" | ... | "unknown"
   "version": str | null,
   "confidence": float,              # 0.0-1.0, see CONFIDENCE below
+  "tier_disagreement": [{"tier": int, "said": str}, ...],  # non-winning tiers
+                                     # that named a DIFFERENT framework than
+                                     # the winner — see CONFIDENCE below.
+                                     # [] when nothing disagreed (including
+                                     # the framework="unknown" cold-start case).
   "sources": [str, ...],            # artifacts that actually had usable data,
                                      # e.g. ["browser/routes.json", "live/httpx_full.txt"]
   "infra": {"cdn": str | null, "waf": str | null},
@@ -54,15 +59,25 @@ higher tier left silent; it NEVER overrides a higher tier's answer.
      names are not a guarantee.
 
 CONFIDENCE — derived from something real, not fabricated: (a) which tier
-supplied the winning framework value, and (b) whether a second, independent,
-lower tier names the same framework family.
+supplied the winning framework value, (b) whether a second, independent,
+lower tier names the same framework family, and (c) whether a second,
+independent tier ACTIVELY CONTRADICTS the winner by naming a different one.
     tier 2 win: 0.85 base   tier 3 win: 0.6 base   tier 4 win: 0.3 base
     tier 1 win: 0.95 base (unreachable today — no source feeds it yet)
     +0.10 if a lower tier corroborates the same framework, capped at 1.0
-    no tier fires at all -> framework="unknown", confidence=0.0
+    x TIER_DISAGREEMENT_PENALTY (0.3) if ANY non-winning tier names a
+      DIFFERENT framework — a tier staying silent isn't a disagreement
+      (nothing to weigh), but an active contradiction is a materially
+      different signal than "no corroboration yet" and must not cascade
+      through at full confidence. Mirrors memory/attack_graph.py's
+      _apply_contradiction() explicitly (same 0.3 multiplicative discount,
+      same "an observed contradicting signal discounts an inferred claim"
+      shape) rather than inventing a second contradiction formula.
+    no tier fires at all -> framework="unknown", confidence=0.0, tier_disagreement=[]
 This mirrors memory/vuln_intelligence.py's _recalibrated_impact(): a
 static/heuristic prior that only ever gets more trust when independent real
-evidence agrees, never a hand-waved number.
+evidence agrees, never a hand-waved number — and now, symmetrically, gets
+LESS trust when independent real evidence actively disagrees.
 
 UNKNOWN STACK: when no tier fires, framework/version/confidence go to their
 null/unknown/0.0 state, but infra/auth_model/api_style/spa_framework are
@@ -232,6 +247,27 @@ def _framework_from_cookies(auth_model: dict | None) -> str | None:
 
 _TIER_BASE_CONFIDENCE = {2: 0.85, 3: 0.6, 4: 0.3}
 
+# HIGH-severity fix — tier DISAGREEMENT (a non-winning tier naming a
+# DIFFERENT framework, not just staying silent) previously produced no
+# penalty and no signal at all: only agreement ever moved confidence
+# (+0.1 corroboration bonus), so a wrong winning-tier detection cascaded
+# into fingerprint.json's framework/cves/tech_stack unchanged, even when a
+# second real signal actively contradicted it.
+#
+# Mirrors memory/attack_graph.py's _apply_contradiction() approach
+# explicitly, not a new formula: SAME 0.3 multiplicative discount that
+# module already established for "a lower-priority signal contradicts a
+# higher-priority one" (there: an observed runtime 401/403 discounting an
+# inferred `grants` edge; here: a non-winning detection tier naming a
+# different framework than the winning tier). Reused by value + citation
+# rather than a live import: memory/attack_graph.py imports tools.director,
+# and tools.director imports tools.fingerprint (see this file's own
+# DEFAULT_MATRIX_PATH neighborhood — director.py's
+# `from tools import fingerprint`) — importing memory.attack_graph from
+# here would create an import cycle. Same number, same justification,
+# cited per Rule 4 rather than reinvented or silently duplicated.
+TIER_DISAGREEMENT_PENALTY = 0.3
+
 
 def _detect_framework(routes: dict | None, httpx_text: str, auth_model: dict | None) -> dict:
     tier2 = None
@@ -247,7 +283,7 @@ def _detect_framework(routes: dict | None, httpx_text: str, auth_model: dict | N
     winner_tier = next((t for t in (2, 3, 4) if tiers[t]), None)
 
     if winner_tier is None:
-        return {"framework": "unknown", "version": None, "confidence": 0.0}
+        return {"framework": "unknown", "version": None, "confidence": 0.0, "tier_disagreement": []}
 
     framework = tiers[winner_tier]
     version = tier3_version if winner_tier == 3 else None
@@ -255,8 +291,23 @@ def _detect_framework(routes: dict | None, httpx_text: str, auth_model: dict | N
     corroborated = any(
         tiers[t] == framework for t in (2, 3, 4) if t != winner_tier and tiers[t] is not None
     )
+    # A non-winning tier that stayed silent (None) says nothing and can't
+    # disagree; a non-winning tier that named a framework OTHER than the
+    # winner is an active contradiction, not just missing corroboration.
+    disagreements = [
+        {"tier": t, "said": tiers[t]}
+        for t in (2, 3, 4)
+        if t != winner_tier and tiers[t] is not None and tiers[t] != framework
+    ]
+
     confidence = _TIER_BASE_CONFIDENCE[winner_tier] + (0.1 if corroborated else 0.0)
-    return {"framework": framework, "version": version, "confidence": round(min(confidence, 1.0), 2)}
+    if disagreements:
+        confidence = confidence * TIER_DISAGREEMENT_PENALTY
+    return {
+        "framework": framework, "version": version,
+        "confidence": round(min(confidence, 1.0), 2),
+        "tier_disagreement": disagreements,
+    }
 
 
 # ─── Infra (CDN/WAF) — reuses WAFSignatureDB, never reimplements it ────────
@@ -558,6 +609,7 @@ def build_fingerprint(
         "framework": fw_result["framework"],
         "version": fw_result["version"],
         "confidence": fw_result["confidence"],
+        "tier_disagreement": fw_result["tier_disagreement"],
         "sources": sources,
         "infra": infra,
         "auth_model": auth_model,
