@@ -349,6 +349,15 @@ def main() -> int:
     ap.add_argument("--no-fetch", action="store_true", help="Skip live reproduction — reproducibility check BLOCKs (no fetcher)")
     ap.add_argument("--recon-rps", type=float, default=None)
     ap.add_argument("--max-requests", type=int, default=None)
+    ap.add_argument(
+        "--output", default=None,
+        help="Persist the report as canonical JSON at this path and print its sha256 hex "
+             "digest on the last stdout line -- the (path, hash) pair "
+             "memory/finding_state.py's REPORT_READY transition requires as evidence "
+             "(self_critique_report_path / self_critique_report_hash). Uses the same "
+             "memory.finding_state.write_report_artifact() the transition check verifies "
+             "against, so there is exactly one place that decides what 'the same bytes' means.",
+    )
     args = ap.parse_args()
 
     candidate = _load_json(args.candidate)
@@ -370,6 +379,12 @@ def main() -> int:
 
     report = self_critique(candidate, fetcher=fetcher, report_outcomes=report_outcomes, observations=observations)
     print(json.dumps(report, indent=2, sort_keys=True))
+    if args.output:
+        from memory.finding_state import write_report_artifact
+
+        report_hash = write_report_artifact(report, args.output)
+        print(f"self_critique_report_path={args.output}")
+        print(f"self_critique_report_hash={report_hash}")
     return 0 if report["overall"] != "block" else 1
 
 

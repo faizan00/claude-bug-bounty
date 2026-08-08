@@ -97,6 +97,13 @@ FINDING_STATE_OPTIONAL = {
     "verdict",         # validation-engine's STRONG/WEAK/REJECT verdict, if this transition cited one
     "reproducible",    # bool -- whether reproducible evidence was on hand at this transition
     "self_critique_overall",  # Phase 7 -- tools/self_critique.py's pass/warn/block, if this transition cited one
+    # HIGH-severity fix follow-up -- the (path, hash) pair can_transition()'s
+    # CONFIRMED/REPORT_READY artifact-binding check actually verified,
+    # recorded here so the append-only audit trail shows WHICH persisted
+    # validation_core.py/self_critique.py report backed this transition, not
+    # just a bare verdict/reproducible label.
+    "validation_report_path", "validation_report_hash",
+    "self_critique_report_path", "self_critique_report_hash",
     "notes", "tags", "session_id",
 }
 FINDING_STATE_ALL = FINDING_STATE_REQUIRED | FINDING_STATE_OPTIONAL
@@ -555,6 +562,11 @@ def validate_finding_state_entry(entry: dict) -> dict:
             f"{sorted(VALID_SELF_CRITIQUE_OVERALLS)}, got {entry['self_critique_overall']!r}"
         )
 
+    for field in ("validation_report_path", "validation_report_hash",
+                  "self_critique_report_path", "self_critique_report_hash"):
+        if field in entry and (not isinstance(entry[field], str) or not entry[field].strip()):
+            raise SchemaError(f"Finding-state entry: {field!r} must be a non-empty string")
+
     if "tags" in entry:
         if not isinstance(entry["tags"], list) or not all(isinstance(t, str) for t in entry["tags"]):
             raise SchemaError("Finding-state entry: 'tags' must be a list of strings")
@@ -927,6 +939,10 @@ def make_finding_state_entry(
     notes: str | None = None,
     tags: list[str] | None = None,
     session_id: str | None = None,
+    validation_report_path: str | None = None,
+    validation_report_hash: str | None = None,
+    self_critique_report_path: str | None = None,
+    self_critique_report_hash: str | None = None,
 ) -> dict:
     """Create and validate a new finding-state transition event with current timestamp."""
     entry = {
@@ -945,6 +961,14 @@ def make_finding_state_entry(
         entry["reproducible"] = reproducible
     if self_critique_overall is not None:
         entry["self_critique_overall"] = self_critique_overall
+    if validation_report_path is not None:
+        entry["validation_report_path"] = validation_report_path
+    if validation_report_hash is not None:
+        entry["validation_report_hash"] = validation_report_hash
+    if self_critique_report_path is not None:
+        entry["self_critique_report_path"] = self_critique_report_path
+    if self_critique_report_hash is not None:
+        entry["self_critique_report_hash"] = self_critique_report_hash
     if notes is not None:
         entry["notes"] = notes
     if tags is not None:
