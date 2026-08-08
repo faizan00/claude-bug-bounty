@@ -71,6 +71,15 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+# brain.py IS the repo root (this file's own directory) -- guard sys.path the
+# same way every memory/*.py and tools/*.py module in this repo already does
+# (e.g. memory/attack_graph.py, memory/object_model.py) so `import memory.*`
+# below works regardless of the caller's cwd, not just `python3 brain.py`
+# invoked from the repo root.
+_REPO = os.path.dirname(os.path.abspath(__file__))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
 try:
     import ollama as _ollama_lib
 except ImportError:
@@ -854,55 +863,45 @@ Keep it under 80 words total."""
                 return True
         return False
 
-    def _finding_score(self, category: str, line: str) -> int:
-        lower = self._clean_finding_line(line).lower()
-        score = {
-            "rce": 100,
-            "cves": 90,
-            "sqli": 85,
-            "sqlmap": 88,
-            "auth_bypass": 80,
-            "idor": 75,
-            "ssrf": 74,
-            "exposure": 72,
-            "jwt": 68,
-            "xss": 64,
-            "cors": 56,
-            "graphql": 54,
-            "redirects": 42,
-            "takeover": 40,
-            "misconfig": 35,
-            "cloud": 35,
-            "cms": 70,
-        }.get(category, 20)
-        keyword_bonuses = (
-            ("rce", 40),
-            ("injectable", 35),
-            ("unauth", 30),
-            ("idor", 28),
-            ("sqli", 28),
-            ("ssrf", 26),
-            ("takeover", 20),
-            ("default creds", 18),
-            ("exposed", 18),
-            ("critical", 15),
-            ("[high]", 10),
-            ("cve-", 25),
-            ("uid=", 25),
-            ("meterpreter session", 40),
-        )
-        for token, bonus in keyword_bonuses:
-            if token in lower:
-                score += bonus
-        if "http://" in lower or "https://" in lower:
-            score += 8
-        return score
+    def _finding_score(self, category: str, line: str, *,
+                        target: str = "", tech_stack: list[str] | None = None,
+                        memory_dir: str = "hunt-memory") -> tuple[float, int]:
+        """Delegates to memory/finding_score.py's score_finding() -- the
+        canonical priority_score()-wrapping formula (tech-stack affinity,
+        historical success rate, chain probability, failed-pattern hard-kill,
+        self-learning acceptance-rate blending) -- instead of the static
+        hand-rolled table this method used to carry. memory/finding_score.py
+        was built specifically to replace this exact table and was never
+        wired up (see AGENTS.md's own "not yet wired to brain.py" note,
+        confirmed true before this fix); this closes that gap.
 
-    def _collect_candidate_findings(self, findings_dir: str) -> list[tuple[str, str]]:
+        Returns score_finding()'s own (priority_score, line_signal) sort_key
+        tuple -- this method's only caller, _collect_candidate_findings()
+        below, only ever uses the return value to sort, never displays,
+        logs, or compares it against a threshold, so no other shape is owed
+        here (verified: grepped for every call site in this file first).
+
+        target/tech_stack default to "no context yet" (empty target/tech
+        stack) when called standalone -- the same cold-start state
+        priority_score() itself already handles gracefully, reproducing a
+        sensible score rather than crashing. _collect_candidate_findings()
+        supplies real values via its own batch call instead of calling this
+        per line (see below for why: memoization + one memory-dir read).
+        """
+        from memory.finding_score import score_finding
+
+        result = score_finding(
+            category=category, line=self._clean_finding_line(line),
+            tech_stack=tech_stack or [], target=target,
+        )
+        return tuple(result["sort_key"])
+
+    def _collect_candidate_findings(self, findings_dir: str, target: str = "",
+                                     memory_dir: str = "hunt-memory") -> list[tuple[str, str]]:
         findings_path = Path(findings_dir)
         if not findings_path.exists():
             return []
-        candidates: list[tuple[int, str, str]] = []
+        candidates: list[dict] = []
         seen: set[tuple[str, str]] = set()
         allowed_categories = {
             "xss", "sqli", "lfi", "ssti", "ssrf", "cves", "cors",
@@ -929,9 +928,34 @@ Keep it under 80 words total."""
                     if key in seen:
                         continue
                     seen.add(key)
-                    candidates.append((self._finding_score(cat_dir.name, line), cat_dir.name, line))
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return [(category, line) for _, category, line in candidates[:25]]
+                    candidates.append({"category": cat_dir.name, "line": line})
+
+        if not candidates:
+            return []
+
+        # Batch through the canonical formula ONCE for the whole candidate
+        # set (memory/finding_score.py's rank_findings() memoizes
+        # priority_score() per vuln_class internally -- K categories, not N
+        # lines, same discipline director.py's own memory loading already
+        # follows) instead of re-deriving score/sort/dedup/top-25 by hand.
+        from memory.finding_score import rank_findings
+        from memory.pattern_db import PatternDB
+        from memory.vuln_intelligence import ChainDB, FailedPatternDB, ReportOutcomeDB
+        from tools.director import load_tech_stack
+
+        mem_path = Path(memory_dir)
+        tech_stack = load_tech_stack(target, memory_dir) if target else []
+        patterns = PatternDB(mem_path / "patterns.jsonl").read_all()
+        failed_patterns = FailedPatternDB(mem_path / "failed_patterns.jsonl").read_all()
+        chains = ChainDB(mem_path / "chains.jsonl").read_all()
+        report_outcomes = ReportOutcomeDB(mem_path / "report_outcomes.jsonl").read_all()
+
+        ranked = rank_findings(
+            candidates, tech_stack=tech_stack, target=target,
+            patterns=patterns, failed_patterns=failed_patterns,
+            chains=chains, report_outcomes=report_outcomes, top_n=25,
+        )
+        return [(r["category"], r["line"]) for r in ranked]
 
     def _build_report_evidence(self, findings_dir: str, recon_dir: str = "") -> str:
         findings_path = Path(findings_dir)
@@ -2092,7 +2116,7 @@ Based on this:
 
         print(f"\n{MAGENTA}{BOLD}[BRAIN] Auto-triage + exploit loop → {target}{NC}")
 
-        all_findings = self._collect_candidate_findings(findings_dir)
+        all_findings = self._collect_candidate_findings(findings_dir, target=target)
 
         if not all_findings:
             print(f"{YELLOW}[Brain] No findings to triage in {findings_dir}{NC}")
