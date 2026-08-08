@@ -5,6 +5,9 @@ skill, re-ingesting never wipes a lead's status, and the privileged-path router
 does not false-positive on keywords that appear inside a query value.
 """
 
+import json
+import multiprocessing as mp
+
 import pytest
 
 import lead_board as lb  # tools/ is on sys.path via tests/conftest.py
@@ -15,6 +18,36 @@ def isolated(tmp_path, monkeypatch):
     """Point the ledger at a tmp dir so tests never touch real memory/leads/."""
     monkeypatch.setattr(lb, "LEADS_DIR", str(tmp_path / "leads"))
     return tmp_path
+
+
+def _lead_writer_proc(leads_dir: str, target: str, marker: str, count: int) -> None:
+    """Worker for the concurrent-write stress test (top-level so `spawn` can
+    pickle it -- mirrors tests/test_rotation.py's _writer_proc convention).
+
+    Sets LEADS_DIR directly rather than relying on inherited/monkeypatched
+    module state: under the "fork" start method a child inherits the
+    parent's already-patched lb.LEADS_DIR for free, but under "spawn" the
+    child re-imports lead_board fresh, so the patch wouldn't survive --
+    setting it explicitly here is correct under either start method.
+    """
+    import lead_board as lb2
+
+    lb2.LEADS_DIR = leads_dir
+    for i in range(count):
+        lb2.add(target, "hunt-idor", f"https://{target}/api/{marker}/{i}",
+                f"{marker}-{i}", "med")
+
+
+def _lead_touch_proc(leads_dir: str, target: str, lead_id: str, status: str, note: str) -> None:
+    """Worker for the touch-vs-add race test -- same explicit-LEADS_DIR
+    portability reasoning as _lead_writer_proc above. A bare
+    `ctx.Process(target=lb.touch, ...)` would silently operate on the real
+    memory/leads/ dir under a "spawn" start method, since a spawned child
+    re-imports lead_board fresh and loses the isolated fixture's monkeypatch."""
+    import lead_board as lb2
+
+    lb2.LEADS_DIR = leads_dir
+    lb2.touch(target, lead_id, status, note)
 
 
 def _make_recon(tmp_path, urls):
@@ -256,3 +289,99 @@ class TestAttackGraph:
         out = capsys.readouterr().out
         assert "ATTACK SURFACE GRAPH" in out
         assert "no correlated hypotheses" in out
+
+
+class TestConcurrentWrites:
+    """Critical finding (security review, 2026-08-08): save_ledger() was a
+    plain unlocked open(path, "w") full-rewrite and load_ledger() an
+    unlocked read -- two concurrent add()/touch()/ingest() calls on the
+    same target could each read the same pre-mutation state and the
+    second writer's save_ledger() would silently clobber the first
+    writer's leads. _locked_ledger() now holds a single fcntl.flock(LOCK_EX)
+    (mirroring memory/rotation.py's rotate_if_needed() exactly) across the
+    whole load -> mutate -> save cycle, so this must hold under REAL
+    concurrent OS processes, not sequential calls in one test process.
+    """
+
+    def test_concurrent_add_no_lost_leads(self, isolated):
+        target = "race.example"
+        leads_dir = str(isolated / "leads")
+        n_writers = 4
+        per_writer = 25
+
+        ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+        procs = [
+            ctx.Process(target=_lead_writer_proc, args=(leads_dir, target, f"w{i}", per_writer))
+            for i in range(n_writers)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=60)
+            assert p.exitcode == 0, f"writer {p.pid} crashed: {p.exitcode}"
+
+        # Every writer's leads must have survived -- this is the actual
+        # "no lead is lost" assertion. Without the lock, concurrent
+        # save_ledger() overwrites make this count come up short and flaky.
+        leads = lb.load_ledger(target)
+        assert len(leads) == n_writers * per_writer, (
+            f"expected {n_writers * per_writer} leads, got {len(leads)} -- "
+            "a concurrent save_ledger() overwrite lost leads"
+        )
+
+        # No duplicates, no truncated/corrupted lines, every (marker, i)
+        # pair present -- proves the ledger file itself is intact, not
+        # just the right line count by coincidence.
+        seen = {tuple(ld["signal"].split("-")) for ld in leads}
+        expected = {(f"w{w}", str(i)) for w in range(n_writers) for i in range(per_writer)}
+        assert seen == expected
+
+        # File on disk must also be well-formed JSONL end to end (no torn
+        # writes interleaved by the race).
+        with open(lb.ledger_path(target)) as fh:
+            lines = [ln for ln in fh if ln.strip()]
+        assert len(lines) == n_writers * per_writer
+        for ln in lines:
+            json.loads(ln)  # must not raise
+
+    def test_concurrent_ingest_and_touch_no_lost_leads(self, isolated):
+        """ingest() and touch() share the same lock as add() -- prove a
+        write-heavy ingest race doesn't drop leads either, using the same
+        real-process harness as the add() test above."""
+        target = "race2.example"
+        leads_dir = str(isolated / "leads")
+        n_writers = 3
+        per_writer = 20
+
+        ctx = mp.get_context("fork") if "fork" in mp.get_all_start_methods() else mp.get_context()
+        procs = [
+            ctx.Process(target=_lead_writer_proc, args=(leads_dir, target, f"m{i}", per_writer))
+            for i in range(n_writers)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=60)
+            assert p.exitcode == 0
+
+        leads = lb.load_ledger(target)
+        assert len(leads) == n_writers * per_writer
+
+        # Concurrently touch a lead that definitely exists (written by w0)
+        # while re-adding more leads -- same race shape ingest() hits when
+        # a hunter re-runs recon while marking leads investigating.
+        first_id = next(l["id"] for l in leads if l["signal"] == "m0-0")
+        touch_procs = [
+            ctx.Process(target=_lead_writer_proc, args=(leads_dir, target, "extra", 10)),
+            ctx.Process(target=_lead_touch_proc, args=(leads_dir, target, first_id, "investigating", "racing")),
+        ]
+        for p in touch_procs:
+            p.start()
+        for p in touch_procs:
+            p.join(timeout=60)
+            assert p.exitcode == 0
+
+        final = lb.load_ledger(target)
+        assert len(final) == n_writers * per_writer + 10  # no leads lost to the touch race
+        touched = next(l for l in final if l["id"] == first_id)
+        assert touched["status"] == "investigating"

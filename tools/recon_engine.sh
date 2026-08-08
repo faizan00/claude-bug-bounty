@@ -323,6 +323,69 @@ log_ok "Total unique subdomains: $TOTAL_SUBS"
 
 fi  # end of domain-only subdomain enum block
 
+# Phase 1's initial merge (or the list/cidr/ip branch above) has already
+# written subdomains/all.txt by this point, so the emergency-merge watchdog
+# (registered at the top of the script to survive a kill mid-Phase-1, before
+# that first merge happens) has done its job. Clear it now: otherwise, if
+# the scope filter below correctly reduces all.txt to zero in-scope hosts,
+# the watchdog would see an "empty" file at script exit and silently
+# re-populate it from the raw, UNFILTERED per-tool files — undoing the
+# filter on the way out.
+trap - EXIT
+
+# ============================================================
+# Scope enforcement — BEFORE Phase 2 fires the first live request.
+#
+# Every active phase from here on (httpx, nmap, katana, ffuf, nuclei) reads
+# subdomains/all.txt directly or via live/urls.txt derived from it, so
+# filtering this one file here gates the entire rest of the pipeline.
+#
+# Allowlist resolution:
+#   BB_SCOPE_DOMAINS (comma-separated patterns, e.g. "target.com,*.target.com")
+#     always wins when set.
+#   else, for a plain domain target: defaults to "$TARGET,*.$TARGET" — the
+#     operator asked to recon this domain, so this default is always
+#     correct and needs no caller changes to take effect.
+#   else (list/ip/cidr targets, or a domain target with scope filtering
+#     explicitly opted out via BB_SCOPE_DOMAINS=off): no default is safe to
+#     guess. A list-mode target's input file already IS the vetted scope,
+#     and scope_checker.py does not support IP/CIDR matching at all (every
+#     entry would be dropped as "unsupported"), so filtering is skipped.
+#
+# BB_SCOPE_EXCLUDE (comma-separated patterns, e.g. "blog.target.com") is
+# always honored when set, on top of whichever allowlist applies above.
+# ============================================================
+echo ""
+log_info "Phase 1.5: Scope Enforcement"
+
+SCOPE_DOMAINS="${BB_SCOPE_DOMAINS:-}"
+SCOPE_EXCLUDE="${BB_SCOPE_EXCLUDE:-}"
+if [ -z "$SCOPE_DOMAINS" ] && [ "$TARGET_TYPE" = "domain" ]; then
+    SCOPE_DOMAINS="$TARGET,*.$TARGET"
+fi
+if [ "$SCOPE_DOMAINS" = "off" ]; then
+    SCOPE_DOMAINS=""
+fi
+
+if [ -n "$SCOPE_DOMAINS" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
+    log_step "Filtering discovered hosts (allow: $SCOPE_DOMAINS${SCOPE_EXCLUDE:+; exclude: $SCOPE_EXCLUDE})..."
+    PRE_SCOPE_COUNT=$(wc -l < "$RECON_DIR/subdomains/all.txt" 2>/dev/null || echo 0)
+    SCOPE_ARGS=(--input-file "$RECON_DIR/subdomains/all.txt" --domain "$SCOPE_DOMAINS")
+    [ -n "$SCOPE_EXCLUDE" ] && SCOPE_ARGS+=(--exclude-domain "$SCOPE_EXCLUDE")
+    if python3 "$(dirname "$0")/scope_checker.py" "${SCOPE_ARGS[@]}"; then
+        POST_SCOPE_COUNT=$(wc -l < "$RECON_DIR/subdomains/all.txt" 2>/dev/null || echo 0)
+        log_done "In scope: $POST_SCOPE_COUNT / $PRE_SCOPE_COUNT discovered host(s) — Phase 2 onward only touches these"
+        if [ "$POST_SCOPE_COUNT" -eq 0 ]; then
+            log_warn "Every discovered host was filtered out of scope — check BB_SCOPE_DOMAINS/BB_SCOPE_EXCLUDE. Phase 2+ will find nothing live, by design."
+        fi
+    else
+        log_err "scope_checker.py failed to run — proceeding WITHOUT automated scope filtering."
+        log_err "Verify $RECON_DIR/subdomains/all.txt against program scope by hand before trusting Phase 2+ output."
+    fi
+else
+    log_warn "No scope allowlist resolved for target type '$TARGET_TYPE' — automated pre-probe filter skipped (list/ip/cidr targets are assumed already scope-vetted; set BB_SCOPE_DOMAINS to filter them anyway)."
+fi
+
 # ============================================================
 # Phase 2: HTTP Probing
 # ============================================================
