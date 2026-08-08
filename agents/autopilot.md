@@ -278,7 +278,7 @@ Then, for anything `validation-engine` marked STRONG or WEAK-but-fixable, run th
 - Q1: Can attacker do this RIGHT NOW? (must have exact request/response)
 - Q2-Q7: Standard validation gates
 
-`validator` advances `VALIDATED` → `CONFIRMED` on PASS (this transition is hard-blocked by `memory/finding_state.py` unless `validation-engine` already recorded a STRONG verdict — "weak evidence cannot become CONFIRMED" is enforced, not just written in a doc), or → `REJECTED` on KILL.
+`validator` advances `VALIDATED` → `CONFIRMED` on PASS (this transition is hard-blocked by `memory/finding_state.py` unless `validation-engine` already recorded a STRONG verdict AND a persisted, hash-bound `tools/validation_core.py` report showing `overall_pass: true` — "weak evidence cannot become CONFIRMED" is enforced, not just written in a doc, and a bare verdict string alone is no longer enough; see `agents/validator.md`'s exact commands), or → `REJECTED` on KILL.
 
 KILL weak findings immediately. Don't accumulate noise.
 
@@ -288,7 +288,7 @@ No separate action here — this is what already happened automatically in Step 
 
 ## Step 9: Report
 
-Once a finding is `CONFIRMED`, `report-writer` runs `tools/self_critique.py` and advances it to `SELF_CRITIQUED` (requires a recorded `pass`/`warn` overall — `finding_state.py` blocks `CONFIRMED` → `REPORT_READY` directly now) and then to `REPORT_READY` (requires `--reproducible`) right before drafting. Draft reports for validated findings using the report-writer format.
+Once a finding is `CONFIRMED`, `report-writer` runs `tools/self_critique.py` and advances it to `SELF_CRITIQUED` (requires a recorded `pass`/`warn` overall — `finding_state.py` blocks `CONFIRMED` → `REPORT_READY` directly now) and then to `REPORT_READY` (requires `--reproducible` PLUS a persisted, hash-bound self-critique report artifact — see `agents/report-writer.md`'s exact commands, including `tools/self_critique.py --output`) right before drafting. Draft reports for validated findings using the report-writer format.
 Do NOT submit — queue for human review.
 
 ## Step 10: Checkpoint
