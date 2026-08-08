@@ -25,12 +25,15 @@ Claude reads `show`, says "I see X -> run skill Y", and `touch`es leads as it wo
 """
 
 import argparse
+import contextlib
+import fcntl
 import glob
 import itertools
 import json
 import os
 import re
 import secrets
+import sys
 from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -401,18 +404,46 @@ def ledger_path(target):
     return os.path.join(LEADS_DIR, re.sub(r"[^\w.-]", "_", target) + ".jsonl")
 
 
+@contextlib.contextmanager
+def _locked_ledger(target):
+    """Hold an exclusive lock across a full load -> mutate -> save cycle.
+
+    Mirrors memory/rotation.py's rotate_if_needed() flock pattern exactly:
+    the same O_RDONLY|O_CREAT open, the same fcntl.flock(LOCK_EX), the same
+    nested try/finally (unlock, then close). Locking only save_ledger()'s
+    write (as before) doesn't close the race: the TOCTOU window is between
+    one caller's load_ledger() read and another caller's save_ledger()
+    write landing in between. Only holding one lock across the whole
+    read-modify-write critical section -- so a second writer's load_ledger()
+    can't run until the first writer's save_ledger() has fully landed --
+    closes it. Every function that does load_ledger() -> mutate -> save_ledger()
+    must wrap that sequence in this context manager.
+    """
+    os.makedirs(LEADS_DIR, exist_ok=True)
+    fd = os.open(ledger_path(target), os.O_RDONLY | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def load_ledger(target):
     p = ledger_path(target)
     leads = []
     if os.path.exists(p):
         with open(p, errors="replace") as fh:
-            for line in fh:
+            for lineno, line in enumerate(fh, 1):
                 line = line.strip()
-                if line:
-                    try:
-                        leads.append(json.loads(line))
-                    except ValueError:
-                        pass
+                if not line:
+                    continue
+                try:
+                    leads.append(json.loads(line))
+                except ValueError as e:
+                    print(f"WARNING: {p} line {lineno} corrupted (skipping): {e}", file=sys.stderr)
     return leads
 
 
@@ -484,52 +515,55 @@ def route_observation(text, source):
 
 
 def ingest(target, recon_dir):
-    leads = load_ledger(target)
-    index = {dedup_key(l["skill"], l["evidence"]): l for l in leads}
     rec = gather_recon(recon_dir)
     added = updated = 0
 
-    def upsert(skill, prio, label, why, evidence, source):
-        nonlocal added, updated
-        if not skill:
-            return
-        key = dedup_key(skill, evidence)
-        if key in index:
-            ld = index[key]
-            ld["last_seen"] = now_iso()
-            ld["seen_count"] = ld.get("seen_count", 1) + 1
-            updated += 1
-            return
-        ld = {
-            "id": "lb-" + secrets.token_hex(3),
-            "target": target, "skill": skill, "priority": prio,
-            "signal": label, "why": why, "evidence": norm_evidence(evidence),
-            "source": source, "status": "new", "note": "",
-            "created": now_iso(), "last_seen": now_iso(), "seen_count": 1,
-        }
-        leads.append(ld)
-        index[key] = ld
-        added += 1
+    with _locked_ledger(target):
+        leads = load_ledger(target)
+        index = {dedup_key(l["skill"], l["evidence"]): l for l in leads}
 
-    for u in rec["urls"]:
-        for skill, prio, label, why in route_observation(u, "url"):
-            upsert(skill, prio, label, why, u, "url")
-    for line in rec["hostlines"]:
-        for skill, prio, label, why in route_observation(line, "tech"):
-            host = (re.search(r"https?://[^\s\]]+", line) or [None])
-            ev = host.group(0) if hasattr(host, "group") else line[:120]
-            upsert(skill, prio, label, why, ev, "tech")
-    for n in rec["nuclei"]:
-        for skill, prio, label, why in route_observation(n, "nuclei"):
-            upsert(skill, prio, label, why, n[:200], "nuclei")
-    for a in rec["ai"]:
-        upsert("hunt-llm-ai", P_HIGH, "confirmed AI endpoint",
-               "ai_surface confirmed -> run ai_gauntlet.sh", a, "ai")
+        def upsert(skill, prio, label, why, evidence, source):
+            nonlocal added, updated
+            if not skill:
+                return
+            key = dedup_key(skill, evidence)
+            if key in index:
+                ld = index[key]
+                ld["last_seen"] = now_iso()
+                ld["seen_count"] = ld.get("seen_count", 1) + 1
+                updated += 1
+                return
+            ld = {
+                "id": "lb-" + secrets.token_hex(3),
+                "target": target, "skill": skill, "priority": prio,
+                "signal": label, "why": why, "evidence": norm_evidence(evidence),
+                "source": source, "status": "new", "note": "",
+                "created": now_iso(), "last_seen": now_iso(), "seen_count": 1,
+            }
+            leads.append(ld)
+            index[key] = ld
+            added += 1
 
-    chains_added = detect_chains(target, leads)
-    hypotheses_added = detect_hypotheses(target, leads)
+        for u in rec["urls"]:
+            for skill, prio, label, why in route_observation(u, "url"):
+                upsert(skill, prio, label, why, u, "url")
+        for line in rec["hostlines"]:
+            for skill, prio, label, why in route_observation(line, "tech"):
+                host = (re.search(r"https?://[^\s\]]+", line) or [None])
+                ev = host.group(0) if hasattr(host, "group") else line[:120]
+                upsert(skill, prio, label, why, ev, "tech")
+        for n in rec["nuclei"]:
+            for skill, prio, label, why in route_observation(n, "nuclei"):
+                upsert(skill, prio, label, why, n[:200], "nuclei")
+        for a in rec["ai"]:
+            upsert("hunt-llm-ai", P_HIGH, "confirmed AI endpoint",
+                   "ai_surface confirmed -> run ai_gauntlet.sh", a, "ai")
 
-    save_ledger(target, leads)
+        chains_added = detect_chains(target, leads)
+        hypotheses_added = detect_hypotheses(target, leads)
+
+        save_ledger(target, leads)
+
     print(f"[+] ingest {target}: +{added} new leads, {updated} re-seen "
           f"(total {len(leads)}). Ledger: {ledger_path(target)}")
     if hypotheses_added:
@@ -634,34 +668,36 @@ def show_next(target):
 
 
 def touch(target, lead_id, status, note):
-    leads = load_ledger(target)
-    hit = None
-    for l in leads:
-        if l["id"] == lead_id:
-            if status:
-                l["status"] = status
-            if note is not None:
-                l["note"] = note
-            l["updated"] = now_iso()
-            hit = l
-    if not hit:
-        print(f"[!] lead {lead_id} not found for {target}")
-        return
-    save_ledger(target, leads)
+    with _locked_ledger(target):
+        leads = load_ledger(target)
+        hit = None
+        for l in leads:
+            if l["id"] == lead_id:
+                if status:
+                    l["status"] = status
+                if note is not None:
+                    l["note"] = note
+                l["updated"] = now_iso()
+                hit = l
+        if not hit:
+            print(f"[!] lead {lead_id} not found for {target}")
+            return
+        save_ledger(target, leads)
     print(f"[+] {lead_id} -> {hit['status']}" + (f"  ({hit['note']})" if hit.get("note") else ""))
 
 
 def add(target, skill, evidence, signal, priority):
-    leads = load_ledger(target)
-    if any(dedup_key(l["skill"], l["evidence"]) == dedup_key(skill, evidence) for l in leads):
-        print("[!] lead already exists (same skill+evidence)")
-        return
-    ld = {"id": "lb-" + secrets.token_hex(3), "target": target, "skill": skill,
-          "priority": priority, "signal": signal or "manual", "why": "manually added",
-          "evidence": norm_evidence(evidence), "source": "manual", "status": "new",
-          "note": "", "created": now_iso(), "last_seen": now_iso(), "seen_count": 1}
-    leads.append(ld)
-    save_ledger(target, leads)
+    with _locked_ledger(target):
+        leads = load_ledger(target)
+        if any(dedup_key(l["skill"], l["evidence"]) == dedup_key(skill, evidence) for l in leads):
+            print("[!] lead already exists (same skill+evidence)")
+            return
+        ld = {"id": "lb-" + secrets.token_hex(3), "target": target, "skill": skill,
+              "priority": priority, "signal": signal or "manual", "why": "manually added",
+              "evidence": norm_evidence(evidence), "source": "manual", "status": "new",
+              "note": "", "created": now_iso(), "last_seen": now_iso(), "seen_count": 1}
+        leads.append(ld)
+        save_ledger(target, leads)
     print(f"[+] added {ld['id']}  {skill}  {evidence}")
 
 
