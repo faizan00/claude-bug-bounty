@@ -408,6 +408,146 @@ class TestBuildPlanSecretScanWiring:
         assert any("AKIA" in e for e in flat)
 
 
+_lead_id_counter = iter(range(1_000_000))
+
+
+def _lead(source, skill="hunt-idor", evidence="/api/orders/482", **overrides):
+    # A unique id per call by default (real lead_board ids are random hex
+    # tokens -- never colliding across distinct leads) so tests that build
+    # several leads with the same source/evidence on purpose (to prove
+    # dedup_leads()'s no-real-key fallback bucket, or that chain/hypothesis
+    # leads are never collapsed even when literally identical) don't
+    # accidentally collide on id instead of on the intended key.
+    base = {
+        "id": f"test-{source}-{next(_lead_id_counter)}", "target": "t.example", "skill": skill,
+        "priority": "high", "signal": "test", "why": "test", "evidence": evidence,
+        "source": source, "status": "new", "note": "",
+        "created": "2026-01-01T00:00:00Z", "last_seen": "2026-01-01T00:00:00Z", "seen_count": 1,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestDedupLeads:
+    """Direct unit tests for director.dedup_leads() -- the HIGH-severity fix
+    closing build_plan()'s cross-source duplicate gap (duplicate_or_noise_check()
+    only ever caught a repeat against cross-SESSION memory, never a collision
+    WITHIN one all_leads list built from six concatenated sources)."""
+
+    def test_same_vuln_class_and_endpoint_from_two_sources_collapses(self):
+        leads = [
+            _lead("url", evidence="/api/orders/482"),
+            _lead("object-model", evidence="/api/orders/482"),
+        ]
+        result = director.dedup_leads(leads)
+        assert len(result) == 1
+
+    def test_higher_confidence_source_wins(self):
+        weak = _lead("url", evidence="/api/orders/482")
+        strong = _lead("object-model", evidence="/api/orders/482")
+        result = director.dedup_leads([weak, strong])
+        assert result[0]["source"] == "object-model"
+        # Order shouldn't matter -- same result reversed.
+        result_reversed = director.dedup_leads([strong, weak])
+        assert result_reversed[0]["source"] == "object-model"
+
+    def test_confidence_ordering_matches_documented_tiers(self):
+        assert director._lead_confidence_rank(_lead("object-model")) == 5
+        assert director._lead_confidence_rank(_lead("secret-scan")) == 4
+        assert director._lead_confidence_rank(_lead("takeover-scan")) == 4
+        assert director._lead_confidence_rank(_lead("cloud-recon")) == 4
+        assert director._lead_confidence_rank(_lead("graphql-audit")) == 4
+        assert director._lead_confidence_rank(_lead("browser-intel")) == 3
+        assert director._lead_confidence_rank(_lead("attack-graph")) == 2
+        assert director._lead_confidence_rank(_lead("url")) == 0
+        assert director._lead_confidence_rank(_lead("some-future-source-not-yet-ranked")) == 0
+
+    def test_normalized_endpoint_shapes_still_collapse(self):
+        """Reuses vuln_intelligence.normalize_endpoint() -- /api/orders/482
+        and /api/orders/9107 are the same shape."""
+        leads = [
+            _lead("url", evidence="/api/orders/482"),
+            _lead("object-model", evidence="/api/orders/9107"),
+        ]
+        result = director.dedup_leads(leads)
+        assert len(result) == 1
+        assert result[0]["source"] == "object-model"
+
+    def test_different_vuln_class_never_collapses(self):
+        leads = [
+            _lead("url", skill="hunt-idor", evidence="/api/orders/482"),
+            _lead("url", skill="hunt-ssrf", evidence="/api/orders/482"),
+        ]
+        assert len(director.dedup_leads(leads)) == 2
+
+    def test_different_endpoint_never_collapses(self):
+        leads = [
+            _lead("url", evidence="/api/orders/482"),
+            _lead("url", evidence="/api/users/482"),
+        ]
+        assert len(director.dedup_leads(leads)) == 2
+
+    def test_chain_and_hypothesis_leads_never_collapsed(self):
+        """A composite chain/hypothesis lead represents the correlation
+        itself, not a repeat of any single leg -- excluded from dedup
+        entirely, same precedent memory/attack_graph.py's raw-lead pass
+        already established for these two sources."""
+        leads = [
+            _lead("chain", evidence="/api/orders/482"),
+            _lead("chain", evidence="/api/orders/482"),  # even an exact duplicate
+            _lead("hypothesis", evidence="/api/orders/482"),
+        ]
+        assert len(director.dedup_leads(leads)) == 3
+
+    def test_missing_skill_or_evidence_never_crashes_or_silently_drops(self):
+        leads = [
+            {**_lead("url"), "skill": None},
+            {**_lead("url"), "evidence": ""},
+            _lead("url", evidence="/api/orders/482"),
+        ]
+        result = director.dedup_leads(leads)
+        assert len(result) == 3  # no real key computable -> each kept as its own bucket
+
+    def test_empty_input_returns_empty(self):
+        assert director.dedup_leads([]) == []
+
+    def test_no_collision_preserves_first_seen_order(self):
+        leads = [
+            _lead("url", evidence="/api/a"),
+            _lead("url", evidence="/api/b"),
+            _lead("url", evidence="/api/c"),
+        ]
+        result = director.dedup_leads(leads)
+        assert [ld["evidence"] for ld in result] == ["/api/a", "/api/b", "/api/c"]
+
+
+class TestBuildPlanCrossSourceDedup:
+    """Integration proof through the real build_plan() pipeline: the same
+    real finding, surfaced independently by the plain lead board AND
+    secret_scan_leads(), must produce exactly ONE Attack/skip entry, not
+    two -- the actual failure scenario the review found."""
+
+    def test_secret_scan_and_manual_board_lead_collapse_to_one(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        bundle = Path(rd) / "browser" / "sources" / "main.bundle"
+        bundle.mkdir(parents=True)
+        secret_text = "AKIAIOSFODNN7EXAMPLE"
+        (bundle / "app.ts").write_text(f'const k = "{secret_text}";')
+
+        # A plain lead-board entry independently referencing the EXACT same
+        # secret string under the SAME skill secret_scan_leads() routes AWS
+        # keys to (hunt-source-leak) -- the manual-add path is source="manual",
+        # the lowest-confidence tier, so secret-scan (tier 4) must win.
+        lb.add("t.example", "hunt-source-leak", secret_text, "manually noted AWS key", lb.P_HIGH)
+
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+
+        matching = [a for a in plan.attacks if any(secret_text in e for e in a.evidence)]
+        matching += [s for s in plan.skipped if secret_text in s.get("evidence", "")]
+        assert len(matching) == 1, f"expected exactly one collapsed entry, got {len(matching)}: {matching}"
+
+
 class TestBuildPlanToolAdapterWiring:
     """The three Part B adapters are additive/opt-in on build_plan() —
     omitting their *_findings_dir params must reproduce prior behavior
