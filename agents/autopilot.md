@@ -278,6 +278,20 @@ For each READY attack, in order:
    `python3 -m memory.finding_state advance --target <target> --vuln-class <attack.vuln_class> --endpoint <attack.endpoint> --state SUSPECTED --memory-dir hunt-memory`,
    then `--state TESTING` once you actually start. `finding_state current` tells you
    if it's already past this point instead of guessing.
+
+   Mark the attack `IN_PROGRESS` in `hunt-plan.json` at the same moment, not just
+   when you close it out in step 5 — write `{"in_progress": ["<attack.id>"]}` to a
+   small `starting.json` and run:
+   ```bash
+   python3 tools/director.py replan --plan-file recon/<target>/hunt-plan.json \
+     --results-file starting.json --write
+   ```
+   `finding_state.py`'s TESTING above is durable the instant it's written, but
+   `hunt-plan.json` — the file `/pickup` reads to resume a killed session — only
+   updated at close-out before this; a hard kill between step 1 and step 5 left it
+   showing the attack as `READY`, silently dropping which attack was actually
+   in flight. This call is a no-op on state (an attack already `IN_PROGRESS` stays
+   `IN_PROGRESS`) — it exists purely to persist that fact immediately.
 2. Test with the attack's named technique against its own falsifier — the falsifier
    is what tells you when to stop calling this "inconclusive" and call it `FAILED`.
 3. Log every request to audit.jsonl.
