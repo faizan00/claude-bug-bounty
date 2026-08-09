@@ -34,6 +34,22 @@ log_vuln()  { echo -e "    ${RED}${BOLD}[$(ts)] [VULN]${NC} $1"; }
 log_crit()  { echo -e "    ${MAGENTA}${BOLD}[$(ts)] [CRITICAL]${NC} $1"; }
 ts()        { date '+%Y-%m-%d %H:%M:%S'; }
 
+# log_tool_result <rc> <outfile> <label>
+# Same convention as tools/recon_engine.sh's helper of the same name: a
+# batch scanner (nuclei, dalfox) that exits nonzero with no output used to
+# look identical to one that ran fine and genuinely found nothing -- both
+# just silently moved on. Distinguishes them without changing control flow
+# (this script has no `set -e`, a bare nonzero exit already doesn't abort
+# it). Deliberately not applied to the many per-URL probe curls elsewhere
+# in this script -- one URL 404ing/timing out mid-loop is normal, expected
+# variance, not a "the whole check silently failed" event.
+log_tool_result() {
+    local rc="$1" outfile="$2" label="$3"
+    if [ "$rc" -ne 0 ] && [ ! -s "$outfile" ]; then
+        log_warn "$label exited $rc with no output -- treating as a FAILED run, not a genuinely empty result (check network/auth/rate-limits/binary version)"
+    fi
+}
+
 # ── Config ────────────────────────────────────────────────────────────────────
 RECON_DIR=""
 QUICK_MODE=""
@@ -257,7 +273,8 @@ if ! skip_has sqli; then
     # 2a. Nuclei
     if tool_ok nuclei; then
         log_step "nuclei SQLi templates..."
-        nuclei -l "$ORDERED_SCAN" -tags sqli -severity medium,high,critical -silent ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} -o "$FINDINGS_DIR/sqli/nuclei_sqli.txt" || true
+        nuclei -l "$ORDERED_SCAN" -tags sqli -severity medium,high,critical -silent ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} -o "$FINDINGS_DIR/sqli/nuclei_sqli.txt"
+        log_tool_result $? "$FINDINGS_DIR/sqli/nuclei_sqli.txt" "nuclei (sqli)"
     fi
     # 2b. Manual Linear-Scaling Probes
     PARAMS_FILE="$RECON_DIR/urls/with_params.txt"
@@ -331,7 +348,10 @@ PYEOF
             --worker 20 \
             --timeout 10 \
             ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
-            --output "$FINDINGS_DIR/xss/dalfox_results.txt" 2>/dev/null || true
+            --output "$FINDINGS_DIR/xss/dalfox_results.txt" 2>/dev/null
+        # PIPESTATUS[1] is dalfox's own exit code (index 0 is `head`, which
+        # always succeeds here).
+        log_tool_result "${PIPESTATUS[1]}" "$FINDINGS_DIR/xss/dalfox_results.txt" "dalfox"
         rm -f "$DAL_DEDUP_FILE"
 
         # Prefix every dalfox line with [POSSIBLE] — dalfox labels its own output;
