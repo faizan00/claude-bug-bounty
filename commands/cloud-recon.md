@@ -14,6 +14,14 @@ Find cloud-storage misconfigurations and origin IPs that bypass CloudFlare.
 /cloud-recon --cf-bypass api.target.com
 ```
 
+## Scope
+
+`--cf-bypass` requires `BB_SCOPE_DOMAINS` (e.g.
+`export BB_SCOPE_DOMAINS='*.target.com,target.com'`) — refuses to run
+otherwise. `--keyword` has no scope requirement: it searches third-party
+cloud-storage namespaces (S3/Azure/GCP bucket names), not the target's own
+infrastructure.
+
 ## What it runs
 
 | Tool | Mode | What it finds |

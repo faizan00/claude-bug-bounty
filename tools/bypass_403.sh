@@ -48,6 +48,15 @@ done
 OUT_DIR="${BYPASS_OUT_DIR:-$(pwd)/findings/bypass/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT_DIR"
 
+# Scope gate before any header/method/encoding probe fires.
+if [ -n "$URL" ]; then
+  _scope_gate_asset "$URL" || exit 1
+else
+  SCOPE_FILTERED_LIST="$OUT_DIR/scope_filtered_urls.txt"
+  _scope_gate_filter_file "$LIST" "$SCOPE_FILTERED_LIST" || exit 1
+  LIST="$SCOPE_FILTERED_LIST"
+fi
+
 # shellcheck source=banner.sh
 . "$SCRIPT_DIR/banner.sh"
 print_banner "403 / 401 Bypass Probe" "${URL:-$LIST}" \

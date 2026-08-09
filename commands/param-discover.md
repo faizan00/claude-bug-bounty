@@ -16,6 +16,12 @@ unlocks the real surface.
 /param-discover -l recon/target.com/live/urls.txt
 ```
 
+## Scope
+
+Requires `BB_SCOPE_DOMAINS` (e.g. `export BB_SCOPE_DOMAINS='*.target.com,target.com'`)
+before running — the script refuses to probe with no declared scope. Run
+`/scope <asset>` first if you haven't already.
+
 ## Tools
 
 `tools/param_discovery.sh` prefers `arjun` (richer JSON output, ML-driven diffing) and

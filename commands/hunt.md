@@ -6,6 +6,16 @@ description: Active vulnerability hunt against a target by invoking tools/hunt.p
 
 Active vulnerability hunting on a target. **Always invoke the production script directly** — do not re-interpret the methodology below as instructions to execute step-by-step. The methodology is reference material; the script is the entry point.
 
+## Scope (required before scanning)
+
+`tools/vuln_scanner.sh` — the active-exploitation stage `/hunt` runs (SQLi, RCE-upload PoC, SAML sig-strip, MFA flood) — refuses to run with no declared scope. Set it once per session:
+
+```bash
+export BB_SCOPE_DOMAINS='*.target.com,target.com'
+```
+
+Run `/scope <asset>` first if you haven't already confirmed the program's actual in-scope domains.
+
 ## Run This (the only required step)
 
 ```bash

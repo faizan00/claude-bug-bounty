@@ -50,6 +50,9 @@ done
 
 [ -z "$URL" ] && { err "GraphQL endpoint URL required"; exit 2; }
 
+# Scope gate before the Phase 0 connectivity probe and everything after it.
+_scope_gate_asset "$URL" || exit 1
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------

@@ -36,11 +36,36 @@ def _validation_report_evidence(tmp_path, overall_pass=True, name="validation_re
     return {"validation_report_path": str(path), "validation_report_hash": report_hash}
 
 
-def _self_critique_report_evidence(tmp_path, overall="pass", name="self_critique_report.json"):
-    report = {"candidate_id": "cand-test", "checks": [], "overall": overall, "details": {}}
+def _self_critique_report_evidence(
+    tmp_path, overall="pass", reproducibility_status="pass", name="self_critique_report.json",
+):
+    # Shape matches tools/self_critique.py's real self_critique() return
+    # value: details is {check_name: check_result}, and check_result has a
+    # "status" field. CONFIRMED's gate reads details.reproducibility.status
+    # specifically (see memory/finding_state.py); SELF_CRITIQUED/REPORT_READY
+    # read the top-level "overall" rollup — independent fields, so tests can
+    # exercise them separately.
+    report = {
+        "candidate_id": "cand-test",
+        "checks": [],
+        "overall": overall,
+        "details": {"reproducibility": {"name": "reproducibility", "status": reproducibility_status, "reason": "", "details": {}}},
+    }
     path = tmp_path / name
     report_hash = write_report_artifact(report, path)
     return {"self_critique_report_path": str(path), "self_critique_report_hash": report_hash}
+
+
+def _confirmed_evidence(tmp_path, overall_pass=True, reproducibility_status="pass"):
+    """Full evidence bundle needed to legally reach CONFIRMED: a STRONG
+    verdict, a validation_core.py artifact, AND a self_critique.py artifact
+    whose reproducibility check specifically passed (the live-verification
+    hardening fix)."""
+    return {
+        "verdict": "STRONG",
+        **_validation_report_evidence(tmp_path, overall_pass=overall_pass),
+        **_self_critique_report_evidence(tmp_path, reproducibility_status=reproducibility_status),
+    }
 
 
 class TestCanTransition:
@@ -95,7 +120,7 @@ class TestCanTransition:
         assert result["allowed"] is False
 
     def test_confirmed_with_strong_verdict_allowed(self, tmp_path):
-        evidence = {"verdict": "STRONG", **_validation_report_evidence(tmp_path)}
+        evidence = _confirmed_evidence(tmp_path)
         result = can_transition("VALIDATED", "CONFIRMED", evidence)
         assert result["allowed"] is True
 
@@ -133,6 +158,55 @@ class TestCanTransition:
         result = can_transition("VALIDATED", "CONFIRMED", evidence)
         assert result["allowed"] is False
         assert "overall_pass" in result["reason"]
+
+    # ── Live-verification fix: validation_core.py's gates are entirely
+    # self-reported booleans (gate3's curl_poc is only checked for being
+    # non-blank, never executed) -- a persisted validation report alone is
+    # not proof the bug is real. CONFIRMED now ALSO requires a
+    # self_critique.py artifact whose reproducibility check (real, live,
+    # twice-replayed HTTP reproduction) specifically passed.
+
+    def test_confirmed_with_validation_report_but_no_self_critique_blocked(self, tmp_path):
+        evidence = {"verdict": "STRONG", **_validation_report_evidence(tmp_path)}
+        result = can_transition("VALIDATED", "CONFIRMED", evidence)
+        assert result["allowed"] is False
+        assert "persisted self-critique report" in result["reason"]
+
+    def test_confirmed_self_critique_artifact_missing_file_blocked(self, tmp_path):
+        evidence = {
+            "verdict": "STRONG",
+            **_validation_report_evidence(tmp_path),
+            "self_critique_report_path": str(tmp_path / "does_not_exist.json"),
+            "self_critique_report_hash": "0" * 64,
+        }
+        result = can_transition("VALIDATED", "CONFIRMED", evidence)
+        assert result["allowed"] is False
+        assert "not found" in result["reason"]
+
+    def test_confirmed_self_critique_artifact_hash_mismatch_blocked(self, tmp_path):
+        evidence = _confirmed_evidence(tmp_path)
+        Path(evidence["self_critique_report_path"]).write_text(
+            '{"overall": "pass", "details": {"reproducibility": {"status": "pass"}}, "tampered": true}'
+        )
+        result = can_transition("VALIDATED", "CONFIRMED", evidence)
+        assert result["allowed"] is False
+        assert "hash mismatch" in result["reason"]
+
+    def test_confirmed_reproducibility_block_status_blocked(self, tmp_path):
+        # A self-critique artifact exists and is even hash-valid, but its
+        # reproducibility check itself did not pass (e.g. the live replay
+        # was non-reproducible or unverifiable) -- must still block
+        # CONFIRMED even though the OTHER three self-critique checks, or
+        # the "overall" rollup, might independently read "warn".
+        evidence = _confirmed_evidence(tmp_path, reproducibility_status="block")
+        result = can_transition("VALIDATED", "CONFIRMED", evidence)
+        assert result["allowed"] is False
+        assert "live-reproducibility check failed" in result["reason"]
+
+    def test_confirmed_with_both_artifacts_and_passing_reproducibility_allowed(self, tmp_path):
+        evidence = _confirmed_evidence(tmp_path)
+        result = can_transition("VALIDATED", "CONFIRMED", evidence)
+        assert result["allowed"] is True
 
     def test_report_ready_without_reproducible_blocked(self):
         # Phase 7: CONFIRMED must pass through SELF_CRITIQUED first.
@@ -235,12 +309,15 @@ class TestFindingStateCLI:
         from memory.finding_state import main
 
         validation_evidence = _validation_report_evidence(tmp_path)
+        sc_evidence = _self_critique_report_evidence(tmp_path)
         for state, extra in (
             ("SUSPECTED", []), ("TESTING", []), ("VALIDATED", []),
             ("CONFIRMED", [
                 "--verdict", "STRONG",
                 "--validation-report-path", validation_evidence["validation_report_path"],
                 "--validation-report-hash", validation_evidence["validation_report_hash"],
+                "--self-critique-report-path", sc_evidence["self_critique_report_path"],
+                "--self-critique-report-hash", sc_evidence["self_critique_report_hash"],
             ]),
         ):
             monkeypatch.setattr(_sys, "argv", [
@@ -271,12 +348,15 @@ class TestFindingStateCLI:
         from memory.finding_state import main
 
         evidence = _validation_report_evidence(tmp_path)
+        sc_evidence = _self_critique_report_evidence(tmp_path)
         monkeypatch.setattr(_sys, "argv", [
             "finding_state.py", "can-transition",
             "--current-state", "VALIDATED", "--next-state", "CONFIRMED",
             "--verdict", "STRONG",
             "--validation-report-path", evidence["validation_report_path"],
             "--validation-report-hash", evidence["validation_report_hash"],
+            "--self-critique-report-path", sc_evidence["self_critique_report_path"],
+            "--self-critique-report-hash", sc_evidence["self_critique_report_hash"],
         ])
         assert main() == 0
         out = json.loads(capsys.readouterr().out)
@@ -375,9 +455,10 @@ class TestReportArtifactBinding:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         artifact_evidence = _validation_report_evidence(tmp_path)
+        sc_evidence = _self_critique_report_evidence(tmp_path)
         entry = db.advance(
             "a.com", "idor", "/api/x", "CONFIRMED",
-            evidence={"verdict": "STRONG", **artifact_evidence},
+            evidence={"verdict": "STRONG", **artifact_evidence, **sc_evidence},
         )
         assert entry["validation_report_path"] == artifact_evidence["validation_report_path"]
         assert entry["validation_report_hash"] == artifact_evidence["validation_report_hash"]
@@ -446,7 +527,7 @@ class TestFindingStateDB:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         db.advance("a.com", "idor", "/api/x", "CONFIRMED",
-                   evidence={"verdict": "STRONG", **_validation_report_evidence(tmp_path)})
+                   evidence=_confirmed_evidence(tmp_path))
         db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "pass"})
         db.advance("a.com", "idor", "/api/x", "REPORT_READY",
                    evidence={"reproducible": True, **_self_critique_report_evidence(tmp_path)})
@@ -476,7 +557,7 @@ class TestFindingStateDB:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         db.advance("a.com", "idor", "/api/x", "CONFIRMED",
-                   evidence={"verdict": "STRONG", **_validation_report_evidence(tmp_path)})
+                   evidence=_confirmed_evidence(tmp_path))
         db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "pass"})
         with pytest.raises(FindingStateError, match="missing reproduction blocks REPORT_READY"):
             db.advance("a.com", "idor", "/api/x", "REPORT_READY")
@@ -488,7 +569,7 @@ class TestFindingStateDB:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         db.advance("a.com", "idor", "/api/x", "CONFIRMED",
-                   evidence={"verdict": "STRONG", **_validation_report_evidence(tmp_path)})
+                   evidence=_confirmed_evidence(tmp_path))
         with pytest.raises(FindingStateError, match="not a legal transition"):
             db.advance("a.com", "idor", "/api/x", "REPORT_READY", evidence={"reproducible": True})
         assert db.current_state("a.com", "idor", "/api/x") == "CONFIRMED"
@@ -499,7 +580,7 @@ class TestFindingStateDB:
         db.advance("a.com", "idor", "/api/x", "TESTING")
         db.advance("a.com", "idor", "/api/x", "VALIDATED")
         db.advance("a.com", "idor", "/api/x", "CONFIRMED",
-                   evidence={"verdict": "STRONG", **_validation_report_evidence(tmp_path)})
+                   evidence=_confirmed_evidence(tmp_path))
         with pytest.raises(FindingStateError, match="self-critique gate must run"):
             db.advance("a.com", "idor", "/api/x", "SELF_CRITIQUED", evidence={"self_critique_overall": "block"})
         assert db.current_state("a.com", "idor", "/api/x") == "CONFIRMED"
@@ -572,7 +653,7 @@ class TestSelfLearning:
         db.advance("b.com", "idor", "/api/orders/482", "VALIDATED")
         entry = db.advance(
             "b.com", "idor", "/api/orders/482", "CONFIRMED",
-            evidence={"verdict": "STRONG", **_validation_report_evidence(tmp_path)},
+            evidence=_confirmed_evidence(tmp_path),
             technique="numeric_id_swap", tech_stack=["express", "postgresql"], payout=1500,
         )
         assert entry["auto_learned"] == {"file": "patterns.jsonl", "saved": True}
@@ -597,7 +678,7 @@ class TestSelfLearning:
         db.advance("d.com", "idor", "/api/x", "VALIDATED")
         entry = db.advance(
             "d.com", "idor", "/api/x", "CONFIRMED",
-            evidence={"verdict": "STRONG", **_validation_report_evidence(tmp_path)},
+            evidence=_confirmed_evidence(tmp_path),
             technique="numeric_id_swap",
         )
         assert "auto_learned" not in entry

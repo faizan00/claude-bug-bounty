@@ -16,6 +16,12 @@ Generate a company-specific password wordlist by crawling the target website and
 /wordlist-gen target.com --min-len 6 --rate 3    # slower, longer-min crawl
 ```
 
+## Scope
+
+Requires `BB_SCOPE_DOMAINS` (e.g. `export BB_SCOPE_DOMAINS='*.target.com,target.com'`)
+before running — the script refuses to crawl with no declared scope. Run
+`/scope <asset>` first if you haven't already.
+
 ## Pipeline
 
 1. **cewler** crawls `https://<target>` (depth 2 by default, lowercase, polite rate limit) → `from-website.txt`
