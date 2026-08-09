@@ -40,6 +40,11 @@ from datetime import datetime, timezone
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEADS_DIR = os.path.join(ROOT, "memory", "leads")
 
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from memory.finding_state import FindingStateDB  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # ROUTING TABLE — the brain. (pattern, source, skill, priority, label, why)
 # source: "url" | "tech" | "nuclei" | "host" | "ai"
@@ -698,7 +703,29 @@ def show_next(target):
     print(f"  start it:  lead_board.py touch {target} {l['id']} --status investigating")
 
 
-def touch(target, lead_id, status, note):
+_REPORTED_GATE_STATES = ("CONFIRMED", "SELF_CRITIQUED", "REPORT_READY")
+
+
+def _reported_without_confirmed_finding(target, memory_dir):
+    """True if `target` has zero finding_state.py transitions that ever
+    reached CONFIRMED or later. Best-effort, not a hard block: lead_board's
+    leads (skill + evidence URL) and finding_state.py's findings (target +
+    vuln_class + endpoint) aren't keyed the same way, so this can't verify
+    that a SPECIFIC lead was the one confirmed -- only that *something* on
+    this target was. That's still real signal against the actual failure
+    mode this guards: touch --status reported used as a bookkeeping
+    shortcut with no validation ever run on this target at all. Never
+    raises -- a missing/corrupt finding_states.jsonl means "can't tell",
+    which is treated the same as "no confirmed finding" (warn, don't
+    silently pass)."""
+    try:
+        entries = FindingStateDB(os.path.join(memory_dir, "finding_states.jsonl")).read_all()
+    except (OSError, ValueError):
+        return True
+    return not any(e.get("target") == target and e.get("state") in _REPORTED_GATE_STATES for e in entries)
+
+
+def touch(target, lead_id, status, note, memory_dir="hunt-memory"):
     with _locked_ledger(target):
         leads = load_ledger(target)
         hit = None
@@ -715,6 +742,14 @@ def touch(target, lead_id, status, note):
             return
         save_ledger(target, leads)
     print(f"[+] {lead_id} -> {hit['status']}" + (f"  ({hit['note']})" if hit.get("note") else ""))
+    if status == "reported" and _reported_without_confirmed_finding(target, memory_dir):
+        print(
+            f"[!] WARNING: {target} has no finding_state.py CONFIRMED/SELF_CRITIQUED/REPORT_READY "
+            f"transition on record ({memory_dir}/finding_states.jsonl) -- 'reported' here is board "
+            f"bookkeeping only and does not itself mean tools/validate.py or tools/self_critique.py "
+            f"ever ran. If this lead wasn't actually validated, its status is misleading.",
+            file=sys.stderr,
+        )
 
 
 def add(target, skill, evidence, signal, priority):
@@ -743,6 +778,9 @@ def main():
     pt = sub.add_parser("touch"); pt.add_argument("target"); pt.add_argument("lead_id")
     pt.add_argument("--status", choices=["new", "investigating", "killed", "reported", "parked"])
     pt.add_argument("--note", default=None)
+    pt.add_argument("--memory-dir", default="hunt-memory",
+                     help="Where to check for a CONFIRMED+ finding_state.py record before warning "
+                          "on --status reported (default: hunt-memory, same convention as director.py)")
     pa = sub.add_parser("add"); pa.add_argument("target"); pa.add_argument("--skill", required=True)
     pa.add_argument("--evidence", required=True); pa.add_argument("--signal", default="")
     pa.add_argument("--priority", default="med", choices=["high", "med", "low"])
@@ -767,7 +805,7 @@ def main():
     elif args.cmd == "next":
         show_next(args.target)
     elif args.cmd == "touch":
-        touch(args.target, args.lead_id, args.status, args.note)
+        touch(args.target, args.lead_id, args.status, args.note, memory_dir=args.memory_dir)
     elif args.cmd == "add":
         add(args.target, args.skill, args.evidence, args.signal, args.priority)
     elif args.cmd == "graph":
