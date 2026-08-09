@@ -12,9 +12,30 @@ Pick up where you left off on a target.
 
 1. Reads the target profile from `hunt-memory/targets/<target>.json`
 2. Shows hunt history (sessions, findings, payouts)
-3. Lists untested endpoints from last recon
-4. Suggests techniques based on tech stack + pattern DB, and flags any technique already in `hunt-memory/failed_patterns.jsonl` for this target as a don't-retry
-5. Asks: continue hunting or re-run recon?
+3. **If `recon/<target>/hunt-plan.json` exists, this is the authoritative resume
+   point** — it's `director.py`'s own queue state, more precise than re-deriving
+   "what's untested" from recon output alone, because it already reflects every
+   `replan()` call (including one fired the moment an attack started testing, not
+   just when it finished — see `agents/autopilot.md` Step 6) from the interrupted
+   session:
+   ```bash
+   python3 -c "
+   import json
+   plan = json.load(open('recon/<target>/hunt-plan.json'))
+   for a in plan['attacks']:
+       if a['state'] in ('IN_PROGRESS', 'READY'):
+           print(f\"[{a['state']:11}] {a['id']}  {a['vuln_class']:20} {a['evidence'][:1] or a['skill']}\")
+   "
+   ```
+   An `IN_PROGRESS` attack here means the last session was killed mid-test on it —
+   resume there first, not from the top of `READY`. Then continue the queue with
+   `tools/director.py replan` exactly as Step 6 of `/autopilot` does; do **not**
+   re-run `build-plan`, which would discard this state and re-derive a fresh queue.
+   If `hunt-plan.json` doesn't exist (no `/autopilot` session ran, or recon was the
+   only thing done last time), fall through to step 4 below.
+4. Otherwise, lists untested endpoints from last recon
+5. Suggests techniques based on tech stack + pattern DB, and flags any technique already in `hunt-memory/failed_patterns.jsonl` for this target as a don't-retry
+6. Asks: continue hunting or re-run recon?
 
 ## Usage
 
@@ -34,7 +55,12 @@ Hunt History:
   Total time:  2h 00m
   Findings:    1 confirmed (IDOR, $1500 paid)
 
-Untested Surface:
+Resumable Plan (recon/target.com/hunt-plan.json):
+  [IN_PROGRESS] atk-a1b2c3  idor  /api/v2/users/{id}/export   <- killed mid-test, resume here first
+  [READY]       atk-d4e5f6  ssrf  /api/v2/webhooks/register
+  [READY]       atk-a7b8c9  idor  /api/v2/users/{id}/share
+
+Untested Surface (no hunt-plan.json — shown only when the above is empty):
   3 endpoints from last recon:
   1. /api/v2/users/{id}/export
   2. /api/v2/users/{id}/share
