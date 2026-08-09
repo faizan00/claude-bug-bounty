@@ -48,13 +48,22 @@ def stub_bin_dir(tmp_path):
 
 
 @pytest.fixture()
-def base_env(stub_bin_dir):
+def base_env(stub_bin_dir, tmp_path):
     env = dict(os.environ)
     env["PATH"] = str(stub_bin_dir) + os.pathsep + env.get("PATH", "")
     # Belt-and-suspenders: route any escaped HTTP call into a closed local
     # port rather than the real network.
     env["HTTP_PROXY"] = "http://127.0.0.1:1"
     env["HTTPS_PROXY"] = "http://127.0.0.1:1"
+    # Isolate hunt-memory writes from the real repo. Phase 2.6
+    # (fingerprint.py, wired in after this fixture was first written) now
+    # runs unconditionally on every recon_engine.sh invocation and syncs
+    # tech_stack into hunt-memory/targets/ -- without this override every
+    # test in this file was silently writing recon/hunt-memory/targets/
+    # example.com.json and testscopeguard.invalid.json into THIS repo's
+    # own hunt-memory/ on every test run (found and fixed alongside
+    # tools/incremental_recon.py's own Phase 5.5 wiring tests).
+    env["HUNT_MEMORY_OUT_DIR"] = str(tmp_path / "hunt-memory")
     return env
 
 
