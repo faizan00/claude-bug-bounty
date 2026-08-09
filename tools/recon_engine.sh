@@ -20,6 +20,25 @@ log_info()  { echo -e "${CYAN}[*]${NC} $1"; }
 log_step()  { echo -e "    ${CYAN}[>]${NC} $1"; }
 log_done()  { echo -e "    ${GREEN}[✓]${NC} $1"; }
 
+# log_tool_result <rc> <outfile> <label>
+# A tool that exits nonzero AND produced no output used to log identically
+# to a tool that ran fine and genuinely found nothing -- both just showed
+# up downstream as "0 findings" via `wc -l < outfile || echo 0`, so a
+# crashed/rate-limited/misconfigured/auth-failed tool could make a hunter
+# believe a target has no attack surface. Never changes control flow (this
+# script has no `set -e`, so a plain nonzero exit already doesn't abort
+# anything) -- this only makes the crash-vs-empty distinction visible.
+# A nonzero exit with SOME output on disk is left alone: some tools
+# (amass on a timeout, ffuf on a rate-limit) exit nonzero but still write
+# partial real results worth keeping, and that's not the failure mode this
+# guards against.
+log_tool_result() {
+    local rc="$1" outfile="$2" label="$3"
+    if [ "$rc" -ne 0 ] && [ ! -s "$outfile" ]; then
+        log_warn "$label exited $rc with no output -- treating as a FAILED run, not a genuinely empty result (check network/auth/rate-limits/binary version)"
+    fi
+}
+
 TARGET="${1:?Usage: $0 <target> [--quick]  (target = FQDN, IP, CIDR, or path to a file of domains/hosts)}"
 QUICK_MODE="${2:-}"
 BASE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -265,7 +284,8 @@ else
 # Subfinder (passive, fast)
 if command -v subfinder &>/dev/null; then
     log_step "Running subfinder..."
-    subfinder -d "$TARGET" -silent -all -t 50 -o "$RECON_DIR/subdomains/subfinder.txt" 2>/dev/null || true
+    subfinder -d "$TARGET" -silent -all -t 50 -o "$RECON_DIR/subdomains/subfinder.txt" 2>/dev/null
+    log_tool_result $? "$RECON_DIR/subdomains/subfinder.txt" "subfinder"
     log_done "subfinder: $(wc -l < "$RECON_DIR/subdomains/subfinder.txt" 2>/dev/null || echo 0) subdomains"
 else
     log_warn "subfinder not installed — skipping"
@@ -274,9 +294,11 @@ fi
 # Amass (passive)
 if command -v amass &>/dev/null && [ "$QUICK_MODE" != "--quick" ]; then
     log_step "Running amass (passive, 5min timeout)..."
-    timeout 300 amass enum -passive -d "$TARGET" -o "$RECON_DIR/subdomains/amass.txt" 2>/dev/null || true
+    timeout 300 amass enum -passive -d "$TARGET" -o "$RECON_DIR/subdomains/amass.txt" 2>/dev/null
+    amass_rc=$?
     # Ensure amass output file exists even if amass failed
     [ ! -f "$RECON_DIR/subdomains/amass.txt" ] && touch "$RECON_DIR/subdomains/amass.txt"
+    log_tool_result "$amass_rc" "$RECON_DIR/subdomains/amass.txt" "amass"
     log_done "amass: $(wc -l < "$RECON_DIR/subdomains/amass.txt" 2>/dev/null || echo 0) subdomains"
 else
     [ "$QUICK_MODE" = "--quick" ] && log_warn "Skipping amass (quick mode)"
@@ -288,7 +310,7 @@ fi
 # a target like  x'); __import__('os').system('id');#  would otherwise execute
 # arbitrary code inside the recon pipeline.
 log_step "Querying crt.sh..."
-BBHUNT_TARGET="$TARGET" curl -s "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null \
+BBHUNT_TARGET="$TARGET" curl -s --max-time 30 "https://crt.sh/?q=%25.$TARGET&output=json" 2>/dev/null \
     | python3 -c '
 import os, sys, json
 target = "." + os.environ.get("BBHUNT_TARGET", "")
@@ -306,14 +328,21 @@ try:
         print(n)
 except Exception:
     pass
-' > "$RECON_DIR/subdomains/crtsh.txt" 2>/dev/null || true
+' > "$RECON_DIR/subdomains/crtsh.txt" 2>/dev/null
+# PIPESTATUS[0] (curl's own exit code), not $? (the pipeline's aggregate
+# exit under pipefail) -- the python stage's `except Exception: pass`
+# means it exits 0 even when curl produced nothing/garbage, so $? alone
+# would never distinguish "curl failed" from "crt.sh genuinely has no
+# certs for this target."
+log_tool_result "${PIPESTATUS[0]}" "$RECON_DIR/subdomains/crtsh.txt" "crt.sh"
 log_done "crt.sh: $(wc -l < "$RECON_DIR/subdomains/crtsh.txt" 2>/dev/null || echo 0) subdomains"
 
 # Wayback subdomains
 log_step "Querying Wayback Machine for subdomains..."
-curl -s "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey" 2>/dev/null \
+curl -s --max-time 30 "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey" 2>/dev/null \
     | sed -nE "s|.*://([a-zA-Z0-9._-]+\.$TARGET).*|\1|p" \
-    | sort -u > "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null || true
+    | sort -u > "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null
+log_tool_result "${PIPESTATUS[0]}" "$RECON_DIR/subdomains/wayback_subs.txt" "wayback (subdomains)"
 log_done "wayback: $(wc -l < "$RECON_DIR/subdomains/wayback_subs.txt" 2>/dev/null || echo 0) subdomains"
 
 # Merge and deduplicate all subdomains
@@ -411,7 +440,8 @@ if [ -x "$HTTPX_BIN" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
         -threads "$THREADS" \
         -rate-limit "$RATE_LIMIT" \
         ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
-        -o "$RECON_DIR/live/httpx_full.txt" 2>/dev/null || true
+        -o "$RECON_DIR/live/httpx_full.txt" 2>/dev/null
+    log_tool_result $? "$RECON_DIR/live/httpx_full.txt" "httpx"
 
     # Extract just the URLs for other tools
     awk '{print $1}' "$RECON_DIR/live/httpx_full.txt" > "$RECON_DIR/live/urls.txt" 2>/dev/null || true
@@ -491,7 +521,8 @@ if command -v nmap &>/dev/null; then
         log_step "Running nmap (top 1000 ports) on $(wc -l < "$RECON_DIR/subdomains/all.txt" | tr -d ' ') scope-filtered host(s)..."
         nmap -sV --top-ports 1000 -T4 --open -iL "$RECON_DIR/subdomains/all.txt" \
             -oN "$RECON_DIR/ports/nmap_results.txt" \
-            -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
+            -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null
+        log_tool_result $? "$RECON_DIR/ports/nmap_greppable.txt" "nmap (port scan)"
         log_done "Nmap scan complete"
 
         # Extract open ports (macOS compatible - no grep -P)
@@ -516,12 +547,16 @@ log_info "Phase 4: URL Collection"
 if command -v gau &>/dev/null; then
     log_step "Running gau (historical URLs)..."
     echo "$TARGET" | gau --threads 20 --o "$RECON_DIR/urls/gau.txt" 2>/dev/null || \
-    echo "$TARGET" | gau > "$RECON_DIR/urls/gau.txt" 2>/dev/null || true
+    echo "$TARGET" | gau > "$RECON_DIR/urls/gau.txt" 2>/dev/null
+    # Reflects the whole `attempt1 || attempt2` construct -- nonzero only
+    # when BOTH the threaded and fallback invocations failed.
+    log_tool_result $? "$RECON_DIR/urls/gau.txt" "gau"
     log_done "gau: $(wc -l < "$RECON_DIR/urls/gau.txt" 2>/dev/null || echo 0) URLs"
 else
     log_warn "gau not installed — using wayback fallback"
-    curl -s "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey&limit=5000" \
-        > "$RECON_DIR/urls/wayback.txt" 2>/dev/null || true
+    curl -s --max-time 30 "https://web.archive.org/cdx/search/cdx?url=*.$TARGET/*&output=text&fl=original&collapse=urlkey&limit=5000" \
+        > "$RECON_DIR/urls/wayback.txt" 2>/dev/null
+    log_tool_result $? "$RECON_DIR/urls/wayback.txt" "wayback (urls fallback)"
     log_done "wayback: $(wc -l < "$RECON_DIR/urls/wayback.txt" 2>/dev/null || echo 0) URLs"
 fi
 
@@ -535,7 +570,8 @@ if command -v katana &>/dev/null && [ -s "$RECON_DIR/live/urls.txt" ]; then
         -d 3 -jc -kf all -silent \
         -c 50 -p 20 \
         ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
-        -o "$RECON_DIR/urls/katana.txt" 2>/dev/null || true
+        -o "$RECON_DIR/urls/katana.txt" 2>/dev/null
+    log_tool_result $? "$RECON_DIR/urls/katana.txt" "katana"
     log_done "katana: $(wc -l < "$RECON_DIR/urls/katana.txt" 2>/dev/null || echo 0) URLs"
 fi
 
@@ -746,7 +782,8 @@ GITHUB_ORGS=$(echo "$GITHUB_ORGS" | tr ' ' '\n' | grep -v '^$' | sort -u | head 
 if [ -n "$GITHUB_ORGS" ] && [ -x "$CICD_SCANNER" ] && command -v sisakulint &>/dev/null; then
     for ORG in $GITHUB_ORGS; do
         log_info "CI/CD scan: org:$ORG"
-        bash "$CICD_SCANNER" "org:$ORG" --output-dir "$RECON_DIR/cicd/$ORG/" || true
+        bash "$CICD_SCANNER" "org:$ORG" --output-dir "$RECON_DIR/cicd/$ORG/"
+        log_tool_result $? "$RECON_DIR/cicd/$ORG/summary.txt" "cicd_scanner.sh (org:$ORG)"
     done
 else
     if [ -z "$GITHUB_ORGS" ]; then
@@ -786,7 +823,8 @@ if command -v nuclei &>/dev/null && [ -s "$RECON_DIR/live/urls.txt" ]; then
         -stats \
         ${BB_AUTH_ARGS[@]+"${BB_AUTH_ARGS[@]}"} \
         -jsonl \
-        -o "$NUCLEI_OUT/findings.jsonl" 2>/dev/null || true
+        -o "$NUCLEI_OUT/findings.jsonl" 2>/dev/null
+    log_tool_result $? "$NUCLEI_OUT/findings.jsonl" "nuclei"
 
     if [ -s "$NUCLEI_OUT/findings.jsonl" ]; then
         # Severity buckets for human review
