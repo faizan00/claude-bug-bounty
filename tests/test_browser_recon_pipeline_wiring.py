@@ -119,3 +119,74 @@ def test_browser_intel_leads_is_empty_not_crashing_when_phase_never_ran():
     # than raise, exactly as before this wiring existed.
     leads = director.browser_intel_leads(TARGET, "/nonexistent/recon/dir")
     assert leads == []
+
+
+def test_api_capture_feeds_object_model_across_two_accounts(demo_app, tmp_path):
+    """memory/api_call_observer.py's observe_from_api_calls() was built and
+    tested in isolation (tests/test_api_call_observer.py) but, before this
+    hardening pass, nothing in the live pipeline ever called it -- so
+    memory/object_model/<target>.jsonl (which tools/director.py's
+    object_model_leads() reads) always stayed empty on a real hunt.
+
+    This proves the full, real, two-account wiring end to end: run the
+    actual browser_recon.py CLI --api-capture twice against the SAME
+    recon-dir under two different --bearer tokens (the real workflow a
+    hunter follows with two test accounts for IDOR testing), and confirm
+    (1) api-calls.json accumulates both runs' calls rather than the second
+    overwriting the first, and (2) a real cross-actor Observation lands in
+    memory/object_model/<target>.jsonl as a direct result -- no
+    reimplementation, the actual CLI subprocess and the actual on-disk
+    files both runs.
+    """
+    target = "demo-two-account.local"
+    recon_dir = tmp_path / "recon" / target
+    recon_dir.mkdir(parents=True)
+    memory_dir = tmp_path / "hunt-memory"
+
+    def run_capture(bearer_token):
+        return subprocess.run(
+            [
+                sys.executable, BROWSER_RECON, target,
+                "--recon-dir", str(recon_dir),
+                "--memory-dir", str(memory_dir),
+                "--domain", "localhost",
+                "--api-capture",
+                "--entry-url", demo_app + "/",
+                "--max-pages", "1",
+                "--page-timeout", "10",
+                "--bearer", bearer_token,
+            ],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=60,
+        )
+
+    proc_a = run_capture("account-a-token")
+    assert proc_a.returncode == 0, f"stdout={proc_a.stdout}\nstderr={proc_a.stderr}"
+    proc_b = run_capture("account-b-token")
+    assert proc_b.returncode == 0, f"stdout={proc_b.stdout}\nstderr={proc_b.stderr}"
+
+    api_calls = json.loads((recon_dir / "browser" / "api-calls.json").read_text())
+    root_hits = [c for c in api_calls["calls"] if c["url"].rstrip("/") == demo_app]
+    fingerprints = {
+        tuple(sorted(c["request_headers_auth_fingerprint"].items()))
+        for c in root_hits if c.get("request_headers_auth_fingerprint")
+    }
+    assert len(fingerprints) == 2, (
+        "expected both accounts' captures to survive in api-calls.json -- "
+        f"got {len(root_hits)} hit(s) with {len(fingerprints)} distinct auth fingerprint(s), "
+        "account B's run may have overwritten account A's"
+    )
+
+    observations_path = memory_dir / "object_model" / f"{target}.jsonl"
+    assert observations_path.exists(), "browser_recon.py --api-capture did not call observe_from_api_calls()"
+    observations = [json.loads(ln) for ln in observations_path.read_text().splitlines() if ln.strip()]
+    assert len(observations) >= 2, (
+        f"expected an 'accessed' observation per actor for the shared URL, got {len(observations)}"
+    )
+    assert {o["event"] for o in observations} == {"accessed"}
+
+    # And the consumer side still doesn't crash reading it (no relationship-
+    # establishing event exists yet in this test, so leads == [] is the
+    # correct, conservative-by-design outcome -- this asserts "doesn't
+    # crash", not "produces a lead here").
+    leads = director.object_model_leads(target, str(memory_dir))
+    assert leads == []

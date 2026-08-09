@@ -126,6 +126,8 @@ from tools.scope_checker import ScopeChecker  # noqa: E402
 from tools.recon_adapter import ReconAdapter  # noqa: E402
 from tools.auth_session import AuthSession, add_cli_args as add_auth_cli_args, session_from_args  # noqa: E402
 from memory.audit_log import AutopilotGuard, RateLimiter, AuditLog  # noqa: E402
+from memory.api_call_observer import observe_from_api_calls  # noqa: E402
+from memory.object_model import ObservationStore  # noqa: E402
 
 try:
     from playwright.sync_api import sync_playwright
@@ -851,13 +853,45 @@ def capture_runtime_api(
 
     out_dir = Path(recon_dir) / "browser"
     out_dir.mkdir(parents=True, exist_ok=True)
+    api_calls_file = out_dir / "api-calls.json"
+
+    # Merge with any calls already captured at this path rather than
+    # overwrite them. This matters specifically for
+    # memory/api_call_observer.py's cross-actor correlation: it needs 2+
+    # DIFFERENT authenticated actors hitting the same (method, url) in one
+    # api-calls.json, but capture_runtime_api() only ever drives one
+    # auth_session per call (a real two-account IDOR-testing workflow is
+    # "run --api-capture once per account"). Overwriting on each run would
+    # make that correlation structurally unreachable -- account B's run
+    # would always erase account A's captured calls before the observer
+    # ever saw both. Dedup on exact-entry equality so re-visiting the same
+    # page in a later run doesn't grow the file unboundedly, while two
+    # runs under different auth sessions (different
+    # request_headers_auth_fingerprint, or one is unauthenticated) still
+    # both survive since their entries differ.
+    existing_calls: list[dict] = []
+    try:
+        prior = json.loads(api_calls_file.read_text())
+        if isinstance(prior, dict) and isinstance(prior.get("calls"), list):
+            existing_calls = [c for c in prior["calls"] if isinstance(c, dict)]
+    except (OSError, ValueError):
+        pass
+
+    merged_calls = existing_calls[:]
+    seen = {json.dumps(c, sort_keys=True) for c in existing_calls}
+    for c in recorder.to_list():
+        key = json.dumps(c, sort_keys=True)
+        if key not in seen:
+            seen.add(key)
+            merged_calls.append(c)
+
     result = {
         "target": target,
         "pages_visited": pages_visited,
         "requests_captured": len(recorder.calls),
-        "calls": recorder.to_list(),
+        "calls": merged_calls,
     }
-    (out_dir / "api-calls.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    api_calls_file.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
 
 
@@ -1295,6 +1329,36 @@ def _split_patterns(values: list[str]) -> list[str]:
     return patterns
 
 
+def _observe_api_calls(target: str, recon_dir: str, memory_dir: str) -> int:
+    """Feed the api-calls.json just written by capture_runtime_api() into
+    memory/api_call_observer.py's observe_from_api_calls(), so
+    memory/object_model.py's detect_relationship_violations()/
+    detect_logic_pattern_violations() (consumed by tools/director.py's
+    object_model_leads()) get real behavioral data instead of sitting
+    permanently empty. Before this, observe_from_api_calls() was built and
+    tested but never called from anywhere in the live pipeline -- the
+    object model's authorization-violation detector was fully wired to its
+    consumer downstream but starved of input upstream.
+
+    observe_from_api_calls(target, recon_dir, store) expects `recon_dir` to
+    be the PARENT of `<target>/browser/api-calls.json` (matching
+    tools/lead_board.py's per-target-file-under-a-root convention), but
+    capture_runtime_api() writes to `<recon_dir>/browser/api-calls.json`
+    directly -- recon_dir here already ends in the target name under this
+    module's own `recon/<target>` default. Only proceed when that
+    assumption actually holds (recon_dir's basename == target); otherwise
+    skip rather than guess at a parent directory that might not resolve to
+    where api-calls.json actually landed. Returns the number of
+    observations recorded (0 on skip or no correlation found).
+    """
+    recon_path = Path(recon_dir)
+    if recon_path.name != target:
+        return 0
+    store = ObservationStore(Path(memory_dir) / "object_model" / f"{target}.jsonl")
+    recorded = observe_from_api_calls(target, str(recon_path.parent), store)
+    return len(recorded)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Browser intelligence layer — runtime API capture, source-map recovery, "
@@ -1302,6 +1366,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("target", help="Target domain (e.g. example.com)")
     parser.add_argument("--recon-dir", default=None, help="default: recon/<target>")
+    parser.add_argument("--memory-dir", default="hunt-memory",
+                         help="Where to record Object Model observations from --api-capture "
+                              "(default: hunt-memory, same convention as tools/director.py)")
     parser.add_argument("--domain", "-d", action="append", default=[],
                          help="Allowed domain pattern for the scope allowlist. Repeat or comma-separate.")
     parser.add_argument("--exclude-domain", "-x", action="append", default=[],
@@ -1393,6 +1460,9 @@ def main(argv: list[str] | None = None) -> int:
             page_timeout=args.page_timeout,
             max_links_per_page=args.max_links_per_page,
         )
+        result["object_model_observations"] = _observe_api_calls(
+            args.target, recon_dir, args.memory_dir
+        )
 
     if args.route_extraction:
         result["route_extraction"] = extract_framework_routes(
@@ -1423,6 +1493,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"API capture: {ac['pages_visited']} page(s) visited, "
                   f"{ac['requests_captured']} request(s) captured -> "
                   f"{recon_dir}/browser/api-calls.json")
+            om_count = result.get("object_model_observations", 0)
+            print(f"Object model: {om_count} cross-actor observation(s) recorded -> "
+                  f"{args.memory_dir}/object_model/{args.target}.jsonl")
         if "route_extraction" in result:
             re_ = result["route_extraction"]
             print(f"Route extraction: {len(re_['routes'])} route(s) found "
