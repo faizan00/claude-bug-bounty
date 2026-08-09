@@ -888,6 +888,46 @@ class TestReplan:
         )
         assert open_minutes <= remaining_budget + 1e-9
 
+    def test_replan_raises_on_unmatched_completed_id(self, isolated, tmp_path):
+        """Deferred finding from the 2026-08-08 security review: replan()
+        used to silently no-op on a results_so_far id that doesn't match any
+        Attack.id in the current plan -- a stale/typo'd id's completed/
+        failed/in_progress signal was just dropped with no trace. Every
+        other gate in this codebase fails loud on bad input; this must too."""
+        _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=3, recon_dir=str(isolated / "recon" / "t.example"))
+        with pytest.raises(ValueError, match="attack-id-that-does-not-exist"):
+            d.replan(plan, {"completed": ["attack-id-that-does-not-exist"]})
+
+    @pytest.mark.parametrize("field", ["completed", "failed", "abandoned", "in_progress", "revive"])
+    def test_replan_raises_for_unmatched_id_in_every_status_field(self, isolated, tmp_path, field):
+        _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=3, recon_dir=str(isolated / "recon" / "t.example"))
+        with pytest.raises(ValueError, match="bogus-id"):
+            d.replan(plan, {field: ["bogus-id"]})
+
+    def test_replan_raises_on_unmatched_note_id(self, isolated, tmp_path):
+        _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=3, recon_dir=str(isolated / "recon" / "t.example"))
+        with pytest.raises(ValueError, match="bogus-note-id"):
+            d.replan(plan, {"notes": {"bogus-note-id": "some note"}})
+
+    def test_replan_raises_before_mutating_any_state_on_partial_mismatch(self, isolated, tmp_path):
+        """A results_so_far payload that's a mix of one real id and one
+        unmatched id must raise -- not silently apply the real id's update
+        and drop the bad one, which would hide exactly the bug this fixes."""
+        _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=3, recon_dir=str(isolated / "recon" / "t.example"))
+        real_id = plan.attacks[0].id
+        with pytest.raises(ValueError, match="bogus-id"):
+            d.replan(plan, {"completed": [real_id, "bogus-id"]})
+        # The real attack's state must be untouched by the rejected call.
+        assert next(a for a in plan.attacks if a.id == real_id).state != "COMPLETED"
+
 
 class TestExplain:
 

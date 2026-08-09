@@ -1479,9 +1479,28 @@ class Director:
         note_updates = results_so_far.get("notes", {}) or {}
 
         by_id = {a.id: a for a in plan.attacks}
+
+        # Fail loud on an id that doesn't match any Attack in this plan,
+        # rather than silently no-op-ing it. Every other gate in this
+        # codebase fails loud on bad input (scope_checker.py warns,
+        # self_critique.py BLOCKs, and this same function already raises
+        # uncaught on malformed JSON / a missing --results-file) — only
+        # "valid JSON, unmatched id" was silent before this fix. A stale or
+        # typo'd id here (e.g. from a plan written before a lead got
+        # deduped/re-scored) would otherwise mean the caller's completed/
+        # failed/in_progress signal for that attack is just dropped with no
+        # trace, and the plan replans as if that work never happened.
+        referenced = completed | failed | abandoned | in_progress | revive | set(note_updates)
+        unmatched = sorted(referenced - by_id.keys())
+        if unmatched:
+            raise ValueError(
+                f"replan(): results_so_far references {len(unmatched)} attack id(s) not in this "
+                f"plan (target={plan.target!r}): {unmatched}. Check for a stale plan/results-file "
+                f"mismatch (e.g. replanning against an id from a plan that was since rebuilt)."
+            )
+
         for attack_id, note in note_updates.items():
-            if attack_id in by_id:
-                by_id[attack_id].notes.append(note)
+            by_id[attack_id].notes.append(note)
 
         for attack in plan.attacks:
             if attack.id in completed:
