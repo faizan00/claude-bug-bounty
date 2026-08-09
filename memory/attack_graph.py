@@ -370,6 +370,7 @@ class Edge:
     confidence: float
     origin_lead_id: str | None
     origin_source: str
+    confidence_source: str
     rule_id: str | None = None
     contradiction: str | None = None
 
@@ -378,6 +379,12 @@ class Edge:
             raise ValueError(f"invalid edge type {self.edge_type!r} on edge {self.from_id}->{self.to_id}")
         if not self.origin_source:
             raise ValueError(f"edge {self.from_id}->{self.to_id} has no origin_source — PROVENANCE guarantee violated")
+        if not self.confidence_source:
+            raise ValueError(
+                f"edge {self.from_id}->{self.to_id} has no confidence_source — every confidence number "
+                f"must say where it came from (measured vs. an uncalibrated heuristic/prior), same "
+                f"PROVENANCE guarantee origin_source already enforces for WHERE the edge came from"
+            )
 
 
 @dataclass
@@ -528,6 +535,9 @@ def apply_chain_rules(graph: Graph, leads: list[dict], rules: list[ChainRule] | 
                     cur_node_id, to_node_id, step.edge_type, confidence,
                     origin_lead_id=combo[0]["id"],
                     origin_source=f"rules/chain_rules.yaml#{rule.id}#step{i}",
+                    confidence_source="uncalibrated_prior: rules/chain_rules.yaml step confidence "
+                                       "(0.6 chain-shaped / 0.75 hypothesis-shaped, a fixed judgment call, "
+                                       "not derived from report_outcomes.jsonl)",
                     rule_id=rule.id, contradiction=note,
                 ))
                 cur_node_id = to_node_id
@@ -608,7 +618,9 @@ def build_capability_graph(target: str, recon_dir: str | None = None, leads: lis
                          vuln_class=vuln_class))
         g.add_edge(Edge(asset_id, node_id, "reveals",
                          confidence=_PRIORITY_CONFIDENCE.get(l.get("priority"), 0.4),
-                         origin_lead_id=l["id"], origin_source="lead_board"))
+                         origin_lead_id=l["id"], origin_source="lead_board",
+                         confidence_source=f"uncalibrated_prior: lead priority={l.get('priority', '?')} "
+                                            f"-> fixed _PRIORITY_CONFIDENCE mapping"))
 
     # 2. Phase 1 browser intelligence artifacts.
     auth_model = director._read_browser_json(recon_dir, "auth-model.json")
@@ -622,7 +634,9 @@ def build_capability_graph(target: str, recon_dir: str | None = None, leads: lis
                                  origin_source="browser/auth-model.json",
                                  confidence_source="role/permission constant extracted from client bundle"))
                 g.add_edge(Edge(asset_id, node_id, "grants", confidence=0.5,
-                                 origin_lead_id=None, origin_source="browser/auth-model.json"))
+                                 origin_lead_id=None, origin_source="browser/auth-model.json",
+                                 confidence_source="uncalibrated_prior: fixed heuristic for a "
+                                                    "role/permission constant extracted from client bundle"))
         for route in auth_model.get("candidate_privileged_client_routes", []) or []:
             if not route:
                 continue
@@ -633,7 +647,9 @@ def build_capability_graph(target: str, recon_dir: str | None = None, leads: lis
                                  confidence_source="client-side-only privileged-route heuristic "
                                                     "(browser_recon.py find_candidate_privileged_routes)"))
                 g.add_edge(Edge(asset_id, node_id, "crosses", confidence=0.4,
-                                 origin_lead_id=None, origin_source="browser/auth-model.json"))
+                                 origin_lead_id=None, origin_source="browser/auth-model.json",
+                                 confidence_source="uncalibrated_prior: fixed heuristic for a "
+                                                    "client-side-only privileged-route candidate"))
         for url in auth_model.get("auth_lifecycle_endpoints", []) or []:
             if not url:
                 continue
@@ -643,7 +659,9 @@ def build_capability_graph(target: str, recon_dir: str | None = None, leads: lis
                                  origin_source="browser/auth-model.json",
                                  confidence_source="auth-lifecycle endpoint cross-referenced from api-calls.json"))
                 g.add_edge(Edge(asset_id, node_id, "reveals", confidence=0.5,
-                                 origin_lead_id=None, origin_source="browser/auth-model.json"))
+                                 origin_lead_id=None, origin_source="browser/auth-model.json",
+                                 confidence_source="uncalibrated_prior: fixed heuristic for an "
+                                                    "auth-lifecycle endpoint cross-referenced from api-calls.json"))
 
     for artifact_name, list_field in (("routes.json", "routes"), ("never-called.json", "never_called")):
         payload = director._read_browser_json(recon_dir, artifact_name)
@@ -659,7 +677,9 @@ def build_capability_graph(target: str, recon_dir: str | None = None, leads: lis
                              origin_source=f"browser/{artifact_name}",
                              confidence_source="Phase 1 browser recon artifact"))
             g.add_edge(Edge(asset_id, node_id, "reveals", confidence=0.45,
-                             origin_lead_id=None, origin_source=f"browser/{artifact_name}"))
+                             origin_lead_id=None, origin_source=f"browser/{artifact_name}",
+                             confidence_source="uncalibrated_prior: fixed heuristic for a "
+                                                "Phase 1 browser recon artifact"))
 
     # 3. rule-driven edges (item 1), with the CONTRADICTORY EVIDENCE check.
     observed = _observed_statuses(recon_dir)
@@ -824,6 +844,7 @@ def top_paths(target: str, graph: Graph, max_depth: int = MAX_PATH_DEPTH,
             "to": graph.nodes[e.to_id].label if e.to_id in graph.nodes else e.to_id,
             "edge_type": e.edge_type,
             "confidence": e.confidence,
+            "confidence_source": e.confidence_source,
             "origin_source": e.origin_source,
             "rule_id": e.rule_id,
             "contradiction": e.contradiction,
@@ -989,6 +1010,8 @@ def add_cross_host_edges(graph: Graph, host_recon_dirs: dict[str, str]) -> int:
             graph.add_edge(Edge(
                 asset_id, node_id, "reveals", confidence=0.55,
                 origin_lead_id=None, origin_source=f"cross-host-fingerprint-match:{hosts_desc}",
+                confidence_source=f"uncalibrated_prior: fixed heuristic for value_fingerprint {fp} "
+                                   f"matched across {len(link['hosts'])} host(s)",
             ))
             added += 1
 
@@ -1008,6 +1031,8 @@ def add_cross_host_edges(graph: Graph, host_recon_dirs: dict[str, str]) -> int:
                 graph.add_edge(Edge(
                     node_id, target_node.id, "grants", confidence,
                     origin_lead_id=None, origin_source=leg_note, contradiction=contradiction,
+                    confidence_source="uncalibrated_prior: CROSS_HOST_GRANT_BASE_CONFIDENCE fixed constant "
+                                       "(same order as chain_rules.yaml's chain-shaped rules)",
                 ))
                 added += 1
     return added

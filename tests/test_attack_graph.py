@@ -351,6 +351,12 @@ class TestBuildCapabilityGraph:
         assert contradicted, "expected the observed 403 to contradict a grants edge"
         for e in contradicted:
             assert e.confidence < 0.75  # below the rule's base confidence
+        # Every rule-driven edge's confidence is a fixed chain_rules.yaml
+        # judgment call (0.6/0.75), never derived from report_outcomes.jsonl
+        # -- confidence_source must say so explicitly so a consumer can't
+        # mistake it for a measured/calibrated probability.
+        for e in grants_edges:
+            assert e.confidence_source.startswith("uncalibrated_prior")
 
     def test_no_contradiction_when_status_is_success(self, tmp_path):
         rd = tmp_path / "recon" / "t.example"
@@ -420,7 +426,25 @@ def _node(id_, type_, label, vuln_class=None):
 
 
 def _edge(from_id, to_id, edge_type, confidence):
-    return ag.Edge(from_id, to_id, edge_type, confidence, origin_lead_id=None, origin_source="test")
+    return ag.Edge(from_id, to_id, edge_type, confidence, origin_lead_id=None, origin_source="test",
+                   confidence_source="test")
+
+
+class TestEdgeConfidenceSourceProvenance:
+    """confidence_source carries the same PROVENANCE guarantee origin_source
+    already has (Edge.__post_init__): every confidence NUMBER must say
+    where it came from -- measured/calibrated vs. a fixed heuristic/prior
+    -- not just where the EDGE came from."""
+
+    def test_edge_without_confidence_source_raises(self):
+        with pytest.raises(ValueError, match="confidence_source"):
+            ag.Edge("a", "b", "reveals", 0.5, origin_lead_id=None, origin_source="test",
+                    confidence_source="")
+
+    def test_edge_with_confidence_source_is_fine(self):
+        e = ag.Edge("a", "b", "reveals", 0.5, origin_lead_id=None, origin_source="test",
+                     confidence_source="test")
+        assert e.confidence_source == "test"
 
 
 class TestFindPaths:
@@ -572,8 +596,9 @@ class TestPathScore:
         candidates = ag.top_paths("t.example", g)
         legs = candidates[0]["path_legs"]
         assert len(legs) == 2
-        assert {"from", "to", "edge_type", "confidence", "origin_source", "rule_id", "contradiction"} \
-            <= set(legs[0].keys())
+        assert {"from", "to", "edge_type", "confidence", "confidence_source", "origin_source",
+                "rule_id", "contradiction"} <= set(legs[0].keys())
+        assert all(leg["confidence_source"] for leg in legs)
         weakest = min(legs, key=lambda leg: leg["confidence"])
         assert weakest["confidence"] == 0.3
         assert "expected_minutes" in candidates[0]
