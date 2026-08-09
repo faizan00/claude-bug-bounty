@@ -11,6 +11,8 @@ import multiprocessing as mp
 import pytest
 
 import lead_board as lb  # tools/ is on sys.path via tests/conftest.py
+from memory.finding_state import FindingStateDB
+from memory.schemas import CURRENT_SCHEMA_VERSION
 
 
 @pytest.fixture
@@ -461,3 +463,77 @@ class TestAtomicSave:
             leads.append({"id": "y", "skill": "s", "evidence": "e2"})
             lb.save_ledger(target, leads)
         assert len(lb.load_ledger(target)) == 2
+
+
+class TestReportedStatusGate:
+    """touch --status reported has no code-level link to finding_state.py --
+    a lead could be marked 'reported' with zero validation ever run on the
+    target. Not a hard block (lead_board's skill+evidence keying can't prove
+    THIS specific lead was the one confirmed, only that *something* on the
+    target was), but must at least warn loudly rather than stay silent."""
+
+    def _entry(self, target, state, vuln_class="idor", endpoint="/api/x"):
+        return {
+            "ts": "2026-03-24T21:00:00Z",
+            "target": target,
+            "vuln_class": vuln_class,
+            "endpoint": endpoint,
+            "state": state,
+            "schema_version": CURRENT_SCHEMA_VERSION,
+        }
+
+    def test_warns_when_no_finding_state_at_all(self, isolated, tmp_path, capsys):
+        gid = "lb-warn1"
+        lb.save_ledger("t.example", [{"id": gid, "skill": "s", "evidence": "e", "status": "new"}])
+        lb.touch("t.example", gid, "reported", None, memory_dir=str(tmp_path / "hunt-memory"))
+        err = capsys.readouterr().err
+        assert "WARNING" in err
+        assert "no finding_state.py CONFIRMED" in err
+
+    def test_warns_when_finding_state_never_passed_confirmed(self, isolated, tmp_path, capsys):
+        gid = "lb-warn2"
+        lb.save_ledger("t.example", [{"id": gid, "skill": "s", "evidence": "e", "status": "new"}])
+        memory_dir = tmp_path / "hunt-memory"
+        db = FindingStateDB(str(memory_dir / "finding_states.jsonl"))
+        db.save(self._entry("t.example", "SUSPECTED"))
+        db.save(self._entry("t.example", "TESTING"))
+        lb.touch("t.example", gid, "reported", None, memory_dir=str(memory_dir))
+        err = capsys.readouterr().err
+        assert "WARNING" in err
+
+    @pytest.mark.parametrize("gate_state", ["CONFIRMED", "SELF_CRITIQUED", "REPORT_READY"])
+    def test_no_warning_once_target_has_a_confirmed_finding(self, isolated, tmp_path, capsys, gate_state):
+        gid = "lb-nowarn"
+        lb.save_ledger("t.example", [{"id": gid, "skill": "s", "evidence": "e", "status": "new"}])
+        memory_dir = tmp_path / "hunt-memory"
+        db = FindingStateDB(str(memory_dir / "finding_states.jsonl"))
+        db.save(self._entry("t.example", gate_state))
+        lb.touch("t.example", gid, "reported", None, memory_dir=str(memory_dir))
+        err = capsys.readouterr().err
+        assert "WARNING" not in err
+
+    def test_no_warning_for_non_reported_statuses(self, isolated, tmp_path, capsys):
+        gid = "lb-investigating"
+        lb.save_ledger("t.example", [{"id": gid, "skill": "s", "evidence": "e", "status": "new"}])
+        lb.touch("t.example", gid, "investigating", None, memory_dir=str(tmp_path / "hunt-memory"))
+        err = capsys.readouterr().err
+        assert "WARNING" not in err
+
+    def test_confirmed_finding_on_a_different_target_does_not_suppress_warning(self, isolated, tmp_path, capsys):
+        gid = "lb-crosscheck"
+        lb.save_ledger("other.example", [{"id": gid, "skill": "s", "evidence": "e", "status": "new"}])
+        memory_dir = tmp_path / "hunt-memory"
+        db = FindingStateDB(str(memory_dir / "finding_states.jsonl"))
+        db.save(self._entry("t.example", "CONFIRMED"))  # different target
+        lb.touch("other.example", gid, "reported", None, memory_dir=str(memory_dir))
+        err = capsys.readouterr().err
+        assert "WARNING" in err
+
+    def test_warning_is_never_fatal(self, isolated, tmp_path):
+        """The check is advisory -- touch() must still update the lead's
+        status even when it warns."""
+        gid = "lb-stillworks"
+        lb.save_ledger("t.example", [{"id": gid, "skill": "s", "evidence": "e", "status": "new"}])
+        lb.touch("t.example", gid, "reported", None, memory_dir=str(tmp_path / "hunt-memory"))
+        leads = lb.load_ledger("t.example")
+        assert next(l for l in leads if l["id"] == gid)["status"] == "reported"
