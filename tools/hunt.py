@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import itertools
 import ipaddress
 import json
@@ -201,6 +202,56 @@ def run_cmd(cmd, cwd=None, timeout=600):
         return False, str(e)
 
 
+def run_watched(argv, cwd=None, env=None, timeout=3600, grace=10):
+    """Run a foreground child (e.g. a bash pipeline script) under a timeout,
+    in its own process group, with a two-stage kill on expiry.
+
+    Why this exists: a bare `subprocess.Popen(argv); proc.wait(timeout=T)` +
+    `proc.kill()` on timeout has two real failure modes seen in this
+    codebase. (1) `proc.kill()` (SIGKILL) cannot be trapped, so a bash
+    script's own `trap ... EXIT` cleanup (e.g. recon_engine.sh's
+    _emergency_merge_subs, which exists specifically to save partial
+    subdomain results on a watchdog kill) never runs -- the one scenario it
+    was written for is exactly the one it can't fire on. (2) `proc.kill()`
+    only signals the direct child PID; any tool the script has already
+    forked (nmap, curl, subfinder, ...) is not in that PID's signal path and
+    can keep running -- and keep sending traffic to the target -- after the
+    watchdog supposedly stopped the hunt.
+
+    Fix: launch in a new session (own process group), and on timeout send
+    SIGTERM to the whole group first so both bash and its already-forked
+    children get a chance to exit cleanly (bash's EXIT trap runs once its
+    foreground child dies from the same SIGTERM). Give it `grace` seconds,
+    then SIGKILL the group to guarantee nothing is left running.
+
+    Returns (returncode_or_None, timed_out: bool). returncode is None only
+    if the process could not be reaped at all (should not happen).
+    """
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
+    try:
+        proc.wait(timeout=timeout)
+        return proc.returncode, False
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return proc.poll(), True
+
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+        proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=grace)
+    except ProcessLookupError:
+        pass
+    return proc.poll(), True
+
+
 def check_tools():
     """Check which tools are installed."""
     tools = ["subfinder", "httpx", "nuclei", "ffuf", "nmap", "amass", "gau", "dalfox", "subjack"]
@@ -322,14 +373,12 @@ def run_recon(domain, quick=False, scope_lock=False):
     # Run with live output. shell=False — the domain value reaches argv[2]
     # directly with no shell parsing, so a target like `x"; rm -rf ~; #` is
     # treated as a single literal arg.
-    try:
-        proc = subprocess.Popen(argv, cwd=BASE_DIR, env=child_env)
-        proc.wait(timeout=3600)  # 60 min timeout (CIDR ranges can be large)
-        return proc.returncode == 0
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    # 60 min timeout (CIDR ranges can be large)
+    returncode, timed_out = run_watched(argv, cwd=BASE_DIR, env=child_env, timeout=3600)
+    if timed_out:
         log("err", f"Recon timed out for {domain}")
         return False
+    return returncode == 0
 
 
 def check_cicd_results(domain):
@@ -367,14 +416,11 @@ def run_vuln_scan(domain, quick=False, full=False):
     elif full:
         argv.append("--full")
 
-    try:
-        proc = subprocess.Popen(argv, cwd=BASE_DIR, env=child_env)
-        proc.wait(timeout=1800)
-        return proc.returncode == 0
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    returncode, timed_out = run_watched(argv, cwd=BASE_DIR, env=child_env, timeout=1800)
+    if timed_out:
         log("err", f"Vulnerability scan timed out for {domain}")
         return False
+    return returncode == 0
 
 
 def generate_reports(domain):
@@ -492,14 +538,11 @@ def run_zero_day_fuzzer(domain, deep=False):
     if deep:
         argv.append("--deep")
 
-    try:
-        proc = subprocess.Popen(argv, cwd=BASE_DIR)
-        proc.wait(timeout=900)
-        return proc.returncode == 0
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    returncode, timed_out = run_watched(argv, cwd=BASE_DIR, timeout=900)
+    if timed_out:
         log("err", f"Zero-day fuzzer timed out for {domain}")
         return False
+    return returncode == 0
 
 
 def hunt_target(domain, quick=False, recon_only=False, scan_only=False, cve_hunt=False, zero_day=False):
