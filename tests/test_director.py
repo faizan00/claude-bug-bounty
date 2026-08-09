@@ -1486,6 +1486,17 @@ class TestExplainAttackGraphLead:
         assert str(weakest["confidence"]) in text
         assert weakest["edge_type"] in text
 
+    def test_explain_weak_line_discloses_confidence_provenance(self, isolated, tmp_path):
+        """A path's confidence numbers are fixed rules/chain_rules.yaml
+        judgment calls, not measured probabilities -- explain() must say so
+        on the weakest-link line, not just log it in path_legs where a
+        reader might never look."""
+        d, graph_candidate = self._plan_with_attack_graph_candidate(isolated, tmp_path)
+        lead = graph_candidate["lead"]
+        weakest = min(lead["path_legs"], key=lambda leg: leg["confidence"])
+        text = d.explain(lead["id"])
+        assert weakest["confidence_source"] in text
+
     def test_explain_unrelated_lead_still_uses_normal_path(self, isolated, tmp_path):
         """Sanity: the new elif branch must not affect explain() for
         non-attack-graph leads."""

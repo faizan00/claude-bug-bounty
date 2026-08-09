@@ -1599,7 +1599,8 @@ class Director:
                 strongest = max(legs, key=lambda leg: leg["confidence"])
                 weak_line = (
                     f"  Weakest link: {weakest['from']} -({weakest['edge_type']})-> {weakest['to']} "
-                    f"(confidence {weakest['confidence']}, origin={weakest['origin_source']})"
+                    f"(confidence {weakest['confidence']} [{weakest.get('confidence_source', '?')}], "
+                    f"origin={weakest['origin_source']})"
                 )
                 if weakest.get("contradiction"):
                     weak_line += f" — CONTRADICTED: {weakest['contradiction']}"
