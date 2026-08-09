@@ -90,7 +90,7 @@ This repo is an agent-portable bug bounty plugin for professional hunting across
 
 <!-- GENERATED:tools:START (see docs/manifest.json — run scripts/gen_docs.py) -->
 - `tools/hunt.py` — Master hunt orchestrator — chains target selection, recon, scanning, and reporting
-- `tools/recon_engine.sh` — Subdomain + URL discovery pipeline (subfinder/amass/crt.sh/wayback/httpx/nmap/gau), optional nuclei phase
+- `tools/recon_engine.sh` — Subdomain + URL discovery pipeline (subfinder/amass/crt.sh/wayback/httpx/nmap/gau), optional nuclei phase; Phase 2.6 always runs fingerprint.py (framework/infra/API-style detection + CVE match, local-file analysis only) so director.py's tech-stack-aware scoring and hunt-memory's tech_stack profile stop silently getting zero signal on every real hunt
 - `tools/vuln_scanner.sh` — XSS/SQLi/SSTI/MFA/SAML probe pipeline with verified PoC generation
 - `tools/validate.py` — Interactive 4-gate finding validator + CVSS 4.0 scorer + report skeleton; headless via --non-interactive
 - `tools/validation_core.py` — Pure, headless 4-gate validation logic + CVSS 4.0 calculator (dict in/out, zero I/O) — the single implementation validate.py wraps

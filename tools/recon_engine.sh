@@ -91,6 +91,7 @@ case "$TARGET" in
 esac
 
 RECON_DIR="${RECON_OUT_DIR:-$BASE_DIR/recon/$TARGET}"
+MEMORY_DIR="${HUNT_MEMORY_OUT_DIR:-$BASE_DIR/hunt-memory}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 THREADS="${BB_THREADS:-50}"
 RATE_LIMIT="${BB_RATE_LIMIT:-150}"  # requests per second
@@ -501,6 +502,42 @@ if [ "${BB_BROWSER_RECON:-0}" = "1" ]; then
             log_warn "browser_recon.py exited non-zero — continuing without it (non-fatal, see $RECON_DIR/browser_recon.err)"
         fi
     fi
+fi
+
+# ============================================================
+# Phase 2.6: Technology Fingerprinting
+#
+# tools/fingerprint.py already implements framework/infra/API-style/SPA
+# detection plus CVE matching against tech_attack_matrix.json --
+# tools/director.py's build_plan() only picks any of it up if
+# recon/<target>/fingerprint.json already exists (load_fingerprint_tech_
+# attack_matrix()'s own docstring: "a target that never ran Phase 3
+# fingerprinting gets None back"), and sync_tech_stack() is the only path
+# that ever populates hunt-memory's tech_stack profile from real recon
+# signal -- but nothing in this pipeline, any agent, or any command ever
+# called it, so every real hunt silently got zero tech-stack-aware
+# scoring. Local-file analysis only (httpx_full.txt + whatever Phase 2.5
+# wrote, if it ran) -- never fetches anything itself (build_fingerprint()'s
+# own docstring), so this runs unconditionally, unlike Phase 2.5's real
+# browser cost. --live-cve-lookup stays off by default, same as every
+# other opt-in live-network flag in this pipeline.
+# ============================================================
+echo ""
+log_info "Phase 2.6: Technology Fingerprinting"
+log_step "Running fingerprint.py (framework/infra/API-style detection + CVE match)..."
+if python3 "$(dirname "$0")/fingerprint.py" --target "$TARGET" --recon-dir "$RECON_DIR" \
+        --memory-dir "$MEMORY_DIR" --quiet 2>"$RECON_DIR/fingerprint.err"; then
+    FW=$(python3 -c "
+import json
+try:
+    d = json.load(open('$RECON_DIR/fingerprint.json'))
+    print(d.get('framework') or 'unknown')
+except Exception:
+    print('unknown')
+" 2>/dev/null)
+    log_done "Fingerprint: framework=$FW -> $RECON_DIR/fingerprint.json"
+else
+    log_warn "fingerprint.py exited non-zero — continuing without it (non-fatal, see $RECON_DIR/fingerprint.err)"
 fi
 
 # ============================================================

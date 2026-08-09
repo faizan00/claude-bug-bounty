@@ -64,7 +64,7 @@
   ],
   "tools": [
     {"name": "hunt.py", "path": "tools/hunt.py", "description": "Master hunt orchestrator — chains target selection, recon, scanning, and reporting"},
-    {"name": "recon_engine.sh", "path": "tools/recon_engine.sh", "description": "Subdomain + URL discovery pipeline (subfinder/amass/crt.sh/wayback/httpx/nmap/gau), optional nuclei phase"},
+    {"name": "recon_engine.sh", "path": "tools/recon_engine.sh", "description": "Subdomain + URL discovery pipeline (subfinder/amass/crt.sh/wayback/httpx/nmap/gau), optional nuclei phase; Phase 2.6 always runs fingerprint.py (framework/infra/API-style detection + CVE match, local-file analysis only) so director.py's tech-stack-aware scoring and hunt-memory's tech_stack profile stop silently getting zero signal on every real hunt"},
     {"name": "vuln_scanner.sh", "path": "tools/vuln_scanner.sh", "description": "XSS/SQLi/SSTI/MFA/SAML probe pipeline with verified PoC generation"},
     {"name": "validate.py", "path": "tools/validate.py", "description": "Interactive 4-gate finding validator + CVSS 4.0 scorer + report skeleton; headless via --non-interactive"},
     {"name": "validation_core.py", "path": "tools/validation_core.py", "description": "Pure, headless 4-gate validation logic + CVSS 4.0 calculator (dict in/out, zero I/O) — the single implementation validate.py wraps"},
