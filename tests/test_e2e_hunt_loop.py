@@ -381,10 +381,26 @@ class TestStage5Report:
         # function tools/validate.py's --report-output flag uses.
         validation_report_path = tmp_path / "validation_report.json"
         validation_report_hash = write_report_artifact(validation, validation_report_path)
+
+        # Live-verification fix: validation_core.py's gates are entirely
+        # self-reported booleans (gate3's curl_poc is only checked for being
+        # non-blank, never executed) -- CONFIRMED now ALSO requires the same
+        # tools/self_critique.py reproducibility check that used to only run
+        # afterward (gating SELF_CRITIQUED). Run it BEFORE advancing to
+        # CONFIRMED: two genuine GET /.env round trips against the live demo
+        # app, not a mock.
+        self_critique_report = _run_real_self_critique(base_url)
+        assert self_critique_report["overall"] in ("pass", "warn"), self_critique_report
+        self_critique_report_path = tmp_path / "self_critique_report.json"
+        self_critique_report_hash = write_report_artifact(self_critique_report, self_critique_report_path)
+
         confirm_evidence = {
             "verdict": "STRONG", "reproducible": True,
             "validation_report_path": str(validation_report_path),
             "validation_report_hash": validation_report_hash,
+            "self_critique_overall": self_critique_report["overall"],
+            "self_critique_report_path": str(self_critique_report_path),
+            "self_critique_report_hash": self_critique_report_hash,
         }
 
         db = FindingStateDB(tmp_path / "hunt-memory" / "finding_states.jsonl")
@@ -401,21 +417,9 @@ class TestStage5Report:
             payout=500,
         )
 
-        # Phase 7 — the self-critique gate now sits between CONFIRMED and
-        # REPORT_READY. This runs the REAL tools/self_critique.py gate
-        # (reproducibility check #1 included) against the live demo app --
-        # two genuine GET /.env round trips, not a mock -- then persists
-        # that real report the same hash-bound way.
-        self_critique_report = _run_real_self_critique(base_url)
-        assert self_critique_report["overall"] in ("pass", "warn"), self_critique_report
-        self_critique_report_path = tmp_path / "self_critique_report.json"
-        self_critique_report_hash = write_report_artifact(self_critique_report, self_critique_report_path)
-        sc_evidence = {
-            **confirm_evidence,
-            "self_critique_overall": self_critique_report["overall"],
-            "self_critique_report_path": str(self_critique_report_path),
-            "self_critique_report_hash": self_critique_report_hash,
-        }
+        # SELF_CRITIQUED/REPORT_READY reuse the same self-critique artifact
+        # already required (and produced) to reach CONFIRMED above.
+        sc_evidence = confirm_evidence
         db.advance(TARGET, vuln_class, endpoint, "SELF_CRITIQUED", evidence=sc_evidence)
         report_ready = db.advance(TARGET, vuln_class, endpoint, "REPORT_READY", evidence=sc_evidence)
 
@@ -489,10 +493,22 @@ class TestFullSequence:
         db = FindingStateDB(isolated_memory / "hunt-memory" / "finding_states.jsonl")
         validation_report_path = isolated_memory / "hunt-memory" / "validation_report.json"
         validation_report_hash = write_report_artifact(validation, validation_report_path)
+
+        # Live-verification fix: run the real self-critique reproducibility
+        # check BEFORE CONFIRMED, not only afterward -- see TestStage5Report
+        # above for the full rationale.
+        self_critique_report = _run_real_self_critique(base_url)
+        assert self_critique_report["overall"] in ("pass", "warn"), self_critique_report
+        self_critique_report_path = isolated_memory / "hunt-memory" / "self_critique_report.json"
+        self_critique_report_hash = write_report_artifact(self_critique_report, self_critique_report_path)
+
         confirm_evidence = {
             "verdict": "STRONG", "reproducible": True,
             "validation_report_path": str(validation_report_path),
             "validation_report_hash": validation_report_hash,
+            "self_critique_overall": self_critique_report["overall"],
+            "self_critique_report_path": str(self_critique_report_path),
+            "self_critique_report_hash": self_critique_report_hash,
         }
         db.advance(TARGET, "info-disclosure", "/.env", "SUSPECTED")
         db.advance(TARGET, "info-disclosure", "/.env", "TESTING")
@@ -500,16 +516,7 @@ class TestFullSequence:
         db.advance(TARGET, "info-disclosure", "/.env", "CONFIRMED", evidence=confirm_evidence,
                     technique="exposed-config-file", tech_stack=["python", "http.server"])
 
-        self_critique_report = _run_real_self_critique(base_url)
-        assert self_critique_report["overall"] in ("pass", "warn"), self_critique_report
-        self_critique_report_path = isolated_memory / "hunt-memory" / "self_critique_report.json"
-        self_critique_report_hash = write_report_artifact(self_critique_report, self_critique_report_path)
-        sc_evidence = {
-            **confirm_evidence,
-            "self_critique_overall": self_critique_report["overall"],
-            "self_critique_report_path": str(self_critique_report_path),
-            "self_critique_report_hash": self_critique_report_hash,
-        }
+        sc_evidence = confirm_evidence
         db.advance(TARGET, "info-disclosure", "/.env", "SELF_CRITIQUED", evidence=sc_evidence)
         db.advance(TARGET, "info-disclosure", "/.env", "REPORT_READY", evidence=sc_evidence)
 

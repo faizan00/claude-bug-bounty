@@ -57,6 +57,32 @@ finding through:
   recorded all fail closed with a clear reason instead of silently
   trusting a label.
 
+  A follow-up hardening pass closed the gap those two checks still left
+  open: tools/validation_core.py's four gates are themselves entirely
+  self-reported booleans, and gate3's curl_poc is only checked for being a
+  non-blank string — it is never executed against the live endpoint. A
+  caller could set every gate to true, hash that JSON, and legally reach
+  CONFIRMED with zero independent verification that the bug is real.
+  CONFIRMED now ALSO requires the same self_critique_report_path/hash
+  artifact SELF_CRITIQUED already required, specifically with its
+  reproducibility check ("details.reproducibility.status") having PASSED —
+  i.e. tools/self_critique.py's real, live, twice-replayed HTTP
+  reproduction (through a scope/rate-limit-gated Fetcher, already tested in
+  tests/test_self_critique.py and exercised against a real server in
+  tests/test_e2e_hunt_loop.py) must run and independently confirm the bug
+  BEFORE a finding is labeled CONFIRMED, not only afterward while gating
+  the later SELF_CRITIQUED/REPORT_READY stages. The same artifact a caller
+  builds for this satisfies SELF_CRITIQUED's existing requirement too, so
+  in practice one self_critique.py run (persisted once) covers both gates.
+  A known, disclosed trade-off inherited unchanged from
+  tools/self_critique.py's own existing design: a finding whose
+  validation_plan has no machine-executable {method,url} step (e.g. a bug
+  only reproducible via browser JS interaction or multi-step business
+  logic) cannot satisfy this check and so cannot reach CONFIRMED through
+  this automated path — self_critique.py already treats an unverifiable
+  claim as a block rather than a silent pass, and this fix does not change
+  that policy, only when it applies.
+
 Self-learning (FindingStateDB.advance()'s auto_learn, default on): landing
 on REJECTED or CONFIRMED automatically writes to failed_patterns.jsonl /
 patterns.jsonl (the same two files vuln_intelligence.py's
@@ -254,6 +280,42 @@ def can_transition(current_state: str, next_state: str, evidence: dict | None = 
         artifact = verify_report_artifact(report_path, report_hash, {"overall_pass": True})
         if not artifact["ok"]:
             return {"allowed": False, "reason": f"CONFIRMED validation-report check failed: {artifact['reason']}"}
+
+        # A validation_core.py artifact is still just gate booleans a caller
+        # supplied itself — gate3's curl_poc is a string that is never
+        # executed against the live endpoint. Independent, LIVE proof is
+        # required too: the same tools/self_critique.py reproducibility
+        # check (real HTTP replay, twice, through a scope-gated Fetcher)
+        # that already existed but previously only ran AFTER CONFIRMED
+        # (gating SELF_CRITIQUED) must now have run and specifically
+        # PASSED — not warn/block; reproducibility itself is pass/block
+        # only, see tools/self_critique.py's check_reproducibility() —
+        # before CONFIRMED itself. Reuses the exact same evidence field
+        # names and artifact mechanism SELF_CRITIQUED already required, so
+        # one self-critique run satisfies both checks.
+        sc_path = evidence.get("self_critique_report_path")
+        sc_hash = evidence.get("self_critique_report_hash")
+        if not sc_path or not sc_hash:
+            return {
+                "allowed": False,
+                "reason": (
+                    "CONFIRMED requires a persisted self-critique report proving live "
+                    "reproducibility, in addition to the validation report — evidence must "
+                    "carry self_critique_report_path + self_critique_report_hash referencing "
+                    "a real tools/self_critique.py self_critique() artifact whose "
+                    "reproducibility check passed (see tools/self_critique.py --output); a "
+                    "curl_poc string and self-reported gate booleans alone are not proof of "
+                    "exploitability"
+                ),
+            }
+        sc_artifact = verify_report_artifact(
+            sc_path, sc_hash, {"details.reproducibility.status": "pass"}
+        )
+        if not sc_artifact["ok"]:
+            return {
+                "allowed": False,
+                "reason": f"CONFIRMED live-reproducibility check failed: {sc_artifact['reason']}",
+            }
 
     # Phase 7 — nothing reaches SELF_CRITIQUED without tools/self_critique.py's
     # gate having actually run and cleared it (pass or warn; block means at

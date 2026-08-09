@@ -170,6 +170,35 @@ python3 -m tools.validate --non-interactive --json --input /tmp/finding.json \
 # validation_report_hash=... -- capture both.
 ```
 
+A follow-up hardening fix closed a real gap the artifact-binding fix above still left open: every field in `/tmp/finding.json` is self-reported by you — `gate3.curl_poc` is only checked for being a non-blank string, never actually executed. `memory/finding_state.py` now ALSO requires CONFIRMED to carry a `tools/self_critique.py` report whose reproducibility check specifically passed — the same real, live, twice-replayed HTTP reproduction that used to only run afterward (gating `SELF_CRITIQUED`). Run it BEFORE the CONFIRMED command, not after:
+
+```bash
+cat > /tmp/candidate.json <<'JSON'
+{
+  "source": "validator",
+  "type": "<vuln class, e.g. IDOR>",
+  "evidence": [{"type": "Observed-HTTP-Response", "detail": "<what you saw>", "artifact": "<url>"}],
+  "rationale": "<one line>",
+  "validation_plan": {
+    "steps": [{"method": "<GET/POST/...>", "url": "<the exact URL your curl PoC hits>"}],
+    "expected": "<the exact HTTP status your PoC returns, e.g. '200'>",
+    "stop_condition": "non-matching status on a retry"
+  },
+  "provenance": {"origin_lead_id": null, "origin_source": "validator"},
+  "metadata": {"target": "<target>", "endpoint": "<endpoint>"}
+}
+JSON
+python3 -m tools.self_critique --candidate /tmp/candidate.json --allowed-domain <target> \
+  --output hunt-memory/reports/<target>-<class>-self_critique.json
+# stdout ends with two lines: self_critique_report_path=... and
+# self_critique_report_hash=... -- capture both. If the reported
+# `details.reproducibility.status` isn't "pass" (e.g. the bug isn't
+# reproducible via a single {method,url} replay -- a browser-JS-only bug,
+# a multi-step business-logic chain), CONFIRMED is correctly blocked: an
+# unverifiable claim is not evidence, escalate to a human instead of
+# forcing it through.
+```
+
 `vuln_type` matters, not just documentation: `validate.py` auto-detects auth-related classes (idor/ato/auth/session/login/privilege/account/bypass/takeover/permission/"access control"/"broken auth"/bac/"broken access"/"insecure direct") from the string itself and, ONLY for those, additionally requires three identity-check booleans inside `gate1` — `cross_account_tested`, `fresh_session_tested`, `anon_vs_auth_delta` (this is what Q3's "Session A reached session B's data, both real and distinct" check above already establishes; just add the three fields to `gate1` when `vuln_type` is one of those classes). Omitting them on an auth-related finding fails the command with `missing required field: cross_account_tested` — don't guess the shape, that error message names exactly what's missing.
 
 Map your 7-Question answers onto this shape rather than re-answering from scratch: Q1 → `gate1.repro_3_3` + `gate3.curl_poc`, Q3 → `gate2.asset_in_scope`, Q4 → `gate1.no_special_state`, Q5 → `gate1.not_documented_behavior` (+ the duplicate-check preflight above covers `gate4`), Q6 → `gate3.concrete_impact`. Q2 (accepted bug class) and Q7 (never-submit list) are program-policy questions `validate.py`'s 4 gates deliberately don't encode — they stay your own PASS/KILL judgment; only answer the CONFIRMED command below if BOTH the machine gates above passed AND your own Q2/Q7 judgment was PASS. Pass `--technique`/`--tech-stack`/`--payout` too: this is what auto-saves a `patterns.jsonl` entry (Phase 7 self-learning) so the confirmed technique feeds `tech_vuln_affinity()`/`priority_score()` on the next target with no manual `/remember` step:
@@ -179,9 +208,13 @@ python3 -m memory.finding_state advance --target <target> --vuln-class <class> -
   --state CONFIRMED --verdict STRONG \
   --validation-report-path hunt-memory/reports/<target>-<class>-validation.json \
   --validation-report-hash <validation_report_hash> \
+  --self-critique-report-path hunt-memory/reports/<target>-<class>-self_critique.json \
+  --self-critique-report-hash <self_critique_report_hash> \
   --technique <technique> --tech-stack "<stack>" \
   --payout <est_or_actual> --memory-dir hunt-memory
 ```
+
+`report-writer`'s later `SELF_CRITIQUED`/`REPORT_READY` steps can reuse this exact same `self_critique_report_path`/`hash` pair — one real run covers both gates.
 
 On KILL, advance it to `REJECTED` the same way — `--technique`/`--tech-stack`/`--reason` here auto-saves a `failed_patterns.jsonl` entry instead:
 ```bash
