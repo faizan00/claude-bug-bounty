@@ -125,6 +125,7 @@ This repo is an agent-portable bug bounty plugin for professional hunting across
 - `tools/hai_browser_recon.js` — DevTools console snippet that intercepts Hai's (HackerOne AI) GraphQL requests to map its API surface
 - `tools/hai_payload_builder.py` — Generates LLM/agentic-AI attack payloads (prompt injection, exfil channels, ASCII smuggling) by category
 - `tools/hai_probe.py` — Probes HackerOne's Hai AI assistant via api.hackerone.com for IDOR/prompt-injection/fingerprinting
+- `tools/idor_diff.py` — Generic cross-session IDOR/BOLA diff tester for arbitrary targets — reuses h1_idor_scanner.py's never-auto-flag-on-non-null diff discipline, generalized to any JSON/text API; a real match feeds a memory/object_model.py Observation (--owner asserts genuine out-of-band ownership knowledge), the first live producer detect_relationship_violations() has ever had
 - `tools/memory_gc.py` — CLI for memory/rotation.py — inspect/rotate/purge hunt-memory JSONL files
 - `tools/mindmap.py` — Generates a pre-hunt reconnaissance checklist/mind-map Markdown file for a target
 - `tools/multipart_mutator.py` — Builds and optionally sends mutated multipart/form-data upload requests (file-upload bypass fuzzing)
