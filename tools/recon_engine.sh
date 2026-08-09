@@ -672,6 +672,44 @@ else
 fi
 
 # ============================================================
+# Phase 5.5: Incremental Re-Recon
+#
+# Every phase before this one is strictly linear -- a hostname first
+# referenced by Phase 4's URL collection (gau/wayback/katana) or Phase
+# 2.5's real captured browser API calls never gets probed by Phase 2,
+# fingerprinted by Phase 2.6, or fed to any downstream tool, because
+# nothing in this pipeline ever re-checks what got discovered along the
+# way. tools/incremental_recon.py is the "DISCOVER NEW INFORMATION ->
+# RECON AGAIN" step this always needed: it finds hosts newly referenced
+# in urls/all.txt or browser/api-calls.json that aren't already in
+# subdomains/all.txt, probes each real observed scheme+host+port exactly
+# once, and merges the live ones back into subdomains/all.txt +
+# live/urls.txt -- so a host discovered THIS run is a first-class citizen
+# of vuln_scanner.sh/lead_board.py/director.py on the SAME run, not only
+# on some future manual re-recon nobody reliably remembers to do.
+#
+# Same fail-closed scope gate as Phase 2.5 (no SCOPE_DOMAINS = skip,
+# never fall through to probing something unvetted) and the exact same
+# ScopeChecker/Fetcher every other active-probing phase already uses --
+# not a new safety model, just extended to hosts revealed later in this
+# same run.
+# ============================================================
+echo ""
+log_info "Phase 5.5: Incremental Re-Recon"
+if [ -z "$SCOPE_DOMAINS" ]; then
+    log_warn "No scope allowlist resolved (see Phase 1.5) — incremental_recon.py requires --domain to send any request, skipping"
+else
+    log_step "Running incremental_recon.py (new hosts from urls/all.txt + browser/api-calls.json)..."
+    IR_ARGS=(--domain "$SCOPE_DOMAINS" --i-understand)
+    [ -n "$SCOPE_EXCLUDE" ] && IR_ARGS+=(--exclude-domain "$SCOPE_EXCLUDE")
+    if python3 "$(dirname "$0")/incremental_recon.py" "$TARGET" --recon-dir "$RECON_DIR" "${IR_ARGS[@]}" 2>"$RECON_DIR/incremental_recon.err"; then
+        log_done "Incremental re-recon complete"
+    else
+        log_warn "incremental_recon.py exited non-zero — continuing without it (non-fatal, see $RECON_DIR/incremental_recon.err)"
+    fi
+fi
+
+# ============================================================
 # Phase 6: Directory Fuzzing
 # ============================================================
 echo ""

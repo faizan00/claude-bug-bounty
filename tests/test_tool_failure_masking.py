@@ -57,13 +57,18 @@ def crashing_stub_bin_dir(tmp_path):
 
 
 @pytest.fixture()
-def crash_env(crashing_stub_bin_dir):
+def crash_env(crashing_stub_bin_dir, tmp_path):
     env = dict(os.environ)
     env["PATH"] = str(crashing_stub_bin_dir) + os.pathsep + env.get("PATH", "")
     # Belt-and-suspenders: route any escaped HTTP call into a closed local
     # port rather than the real network.
     env["HTTP_PROXY"] = "http://127.0.0.1:1"
     env["HTTPS_PROXY"] = "http://127.0.0.1:1"
+    # Isolate hunt-memory writes from the real repo -- Phase 2.6
+    # (fingerprint.py) runs unconditionally on every recon_engine.sh
+    # invocation and syncs tech_stack into hunt-memory/targets/ (found and
+    # fixed here alongside the same gap in test_recon_engine_scope_e2e.py).
+    env["HUNT_MEMORY_OUT_DIR"] = str(tmp_path / "hunt-memory")
     return env
 
 
