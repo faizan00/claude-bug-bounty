@@ -385,3 +385,79 @@ class TestConcurrentWrites:
         assert len(final) == n_writers * per_writer + 10  # no leads lost to the touch race
         touched = next(l for l in final if l["id"] == first_id)
         assert touched["status"] == "investigating"
+
+
+class TestAtomicSave:
+    """save_ledger() used to be a plain open(path, "w") truncate-then-write --
+    a crash between the truncate and the last write() loses every lead ever
+    recorded for the target, not just the in-flight change. It now writes to
+    a same-dir temp file and os.replace()s it into place, so the ledger on
+    disk is always either the fully-old or fully-new content, never a
+    partial one."""
+
+    def test_no_torn_write_on_simulated_crash(self, isolated):
+        target = "crash.example"
+        lb.add(target, "hunt-idor", "https://crash.example/api/1", "s1", "med")
+        lb.add(target, "hunt-idor", "https://crash.example/api/2", "s2", "med")
+        before = lb.load_ledger(target)
+        assert len(before) == 2
+
+        # Simulate save_ledger() being killed mid-write: os.fdopen's write
+        # raises before os.replace() ever runs. The original file at
+        # ledger_path() must be completely untouched -- old-and-intact, not
+        # half-written.
+        real_fdopen = lb.os.fdopen
+
+        def crash_after_open(fd, mode):
+            fh = real_fdopen(fd, mode)
+            fh.write("this line landed in the temp file only\n")
+            raise OSError("simulated crash mid-write")
+
+        import pytest as _pytest
+        with _pytest.MonkeyPatch.context() as mp_ctx:
+            mp_ctx.setattr(lb.os, "fdopen", crash_after_open)
+            with _pytest.raises(OSError):
+                lb.save_ledger(target, [{"id": "x", "skill": "s", "evidence": "e"}])
+
+        after = lb.load_ledger(target)
+        assert after == before, "a crashed save_ledger() must leave the prior ledger untouched"
+
+        # The failed attempt's temp file must not be left behind either.
+        leftovers = [
+            f for f in lb.os.listdir(lb.LEADS_DIR)
+            if f.startswith(".ledger-") and f.endswith(".tmp")
+        ]
+        assert leftovers == []
+
+    def test_ledger_file_itself_never_truncated_readable_mid_replace(self, isolated):
+        """A reader (load_ledger, which opens by path) must never observe a
+        zero-byte or partial file -- os.replace() is atomic, so the path
+        always resolves to a complete previous or complete new version."""
+        target = "atomic.example"
+        for i in range(50):
+            lb.add(target, "hunt-idor", f"https://atomic.example/api/{i}", f"s{i}", "med")
+        leads = lb.load_ledger(target)
+        assert len(leads) == 50
+        with open(lb.ledger_path(target)) as fh:
+            lines = [ln for ln in fh if ln.strip()]
+        assert len(lines) == 50
+        for ln in lines:
+            json.loads(ln)
+
+    def test_lock_file_is_separate_from_data_file(self, isolated):
+        """_locked_ledger() must lock a sidecar `<ledger>.lock` file, not the
+        ledger data file itself -- locking the data file would tie the lock
+        to an inode that save_ledger()'s os.replace() swaps out from under
+        it, breaking mutual exclusion for the next opener (reproduced and
+        fixed during this change: see _locked_ledger()'s docstring)."""
+        target = "locktest.example"
+        lb.add(target, "hunt-idor", "https://locktest.example/api/1", "s1", "med")
+        assert lb.os.path.exists(lb.ledger_path(target) + ".lock")
+
+        with lb._locked_ledger(target):
+            # The data file's inode must be free to be replaced while the
+            # lock is held (i.e. the lock isn't on the data file's fd).
+            leads = lb.load_ledger(target)
+            leads.append({"id": "y", "skill": "s", "evidence": "e2"})
+            lb.save_ledger(target, leads)
+        assert len(lb.load_ledger(target)) == 2

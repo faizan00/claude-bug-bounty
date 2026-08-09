@@ -34,6 +34,7 @@ import os
 import re
 import secrets
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -408,19 +409,27 @@ def ledger_path(target):
 def _locked_ledger(target):
     """Hold an exclusive lock across a full load -> mutate -> save cycle.
 
-    Mirrors memory/rotation.py's rotate_if_needed() flock pattern exactly:
-    the same O_RDONLY|O_CREAT open, the same fcntl.flock(LOCK_EX), the same
-    nested try/finally (unlock, then close). Locking only save_ledger()'s
-    write (as before) doesn't close the race: the TOCTOU window is between
-    one caller's load_ledger() read and another caller's save_ledger()
-    write landing in between. Only holding one lock across the whole
-    read-modify-write critical section -- so a second writer's load_ledger()
-    can't run until the first writer's save_ledger() has fully landed --
-    closes it. Every function that does load_ledger() -> mutate -> save_ledger()
-    must wrap that sequence in this context manager.
+    Locks a dedicated `<ledger>.lock` sidecar file, never the ledger data
+    file itself. This matters because save_ledger() now writes atomically
+    (temp file + os.replace() -- see its docstring): os.replace() swaps in
+    a brand-new inode at the ledger path. flock() locks are held on an
+    *open file description*, tied to the inode that was open at lock time,
+    not the path -- so if the lock were taken on the ledger path itself, a
+    process that opens that path (by name) for the first time anywhere
+    inside another process's already-in-flight critical section (e.g. right
+    after that process's os.replace() swapped the inode but before it
+    released its flock) would transparently get a lock on the *new* inode
+    instead of blocking on the *old* one the current holder actually has
+    locked -- two processes then run the critical section concurrently
+    despite both believing they hold the exclusive lock. Verified this
+    exactly reproduces lost leads under real concurrent load. A lock file
+    that is only ever created once and never replaced/renamed has a stable
+    inode for the lifetime of the ledger, so every caller's os.open() of it
+    always resolves to the same inode and flock() gives real mutual
+    exclusion regardless of how the data file underneath gets swapped.
     """
     os.makedirs(LEADS_DIR, exist_ok=True)
-    fd = os.open(ledger_path(target), os.O_RDONLY | os.O_CREAT, 0o644)
+    fd = os.open(ledger_path(target) + ".lock", os.O_RDONLY | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
@@ -448,10 +457,32 @@ def load_ledger(target):
 
 
 def save_ledger(target, leads):
+    """Atomic write: build the full file in a same-dir temp file, fsync it,
+    then os.replace() into place. A plain open(path, "w") truncates the
+    ledger before writing a single byte of the replacement -- a crash
+    (SIGKILL, OOM-kill, power loss) mid-write loses every lead ever
+    recorded for the target, not just the in-flight change. os.replace()
+    is atomic on POSIX: readers always see either the old complete file or
+    the new complete file, never a truncated one. _locked_ledger() already
+    serializes concurrent writers; this closes the single-writer crash case
+    that lock alone doesn't cover.
+    """
     os.makedirs(LEADS_DIR, exist_ok=True)
-    with open(ledger_path(target), "w") as fh:
-        for ld in leads:
-            fh.write(json.dumps(ld, ensure_ascii=False) + "\n")
+    path = ledger_path(target)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(path) or ".", prefix=".ledger-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as fh:
+            for ld in leads:
+                fh.write(json.dumps(ld, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
 
 
 def norm_evidence(e):
