@@ -300,11 +300,12 @@ For each READY attack, in order:
    already be in that state) — use it if new evidence (a fresh chain leg, a changed
    endpoint) makes a previously-dropped attack worth reconsidering; otherwise leave
    it empty. Every id you list must be a real `Attack.id` from the plan currently at
-   `--plan-file` — `replan()` only updates attacks it finds by matching id against
-   `plan.attacks`; an id that doesn't match anything (a typo, or one left over from
-   a plan `build-plan` already regenerated) is silently skipped, not rejected, so
-   double-check an id against the plan you're editing before writing `results.json`,
-   especially after `build-plan` has run again since you last read it.
+   `--plan-file` — `replan()` raises (nonzero exit, the CLI call above fails) if any
+   id in `results.json` doesn't match `plan.attacks`, e.g. a typo or one left over
+   from a plan `build-plan` already regenerated. If that happens, re-read
+   `hunt-plan.json` for the current ids and fix `results.json` before retrying —
+   nothing from that `replan()` call is applied, so there's no partial/silently-
+   dropped update to untangle.
 
    Then take the next `READY` attack from the refreshed `hunt-plan.json` —
    `replan()` re-sorts by the same `(ev_per_hour, priority)` order, unlocks any
