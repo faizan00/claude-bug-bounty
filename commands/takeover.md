@@ -13,6 +13,11 @@ Find subdomains pointing at services you can claim and serve content from.
 /takeover --recon recon/target.com           # equivalent
 ```
 
+## Scope
+
+Requires `BB_SCOPE_DOMAINS` (e.g. `export BB_SCOPE_DOMAINS='*.target.com,target.com'`)
+before running — the script refuses to scan with no declared scope.
+
 ## How it works
 
 `tools/takeover_scanner.sh` tries each strategy in turn:

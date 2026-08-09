@@ -109,12 +109,21 @@ else
   ok "nuclei: no CVE matches"
 fi
 
-# Parallel: log4j-scan when present (still pays on legacy enterprise stacks)
+# Parallel: log4j-scan when present (still pays on legacy enterprise stacks).
+# Uses $SCAN_TARGET (the scope-gated value), not raw $TARGET — a prior
+# version used $TARGET here, bypassing the filter above for file/list input.
+# log4j-scan's -u only takes a single URL, so skip cleanly in file/list mode
+# rather than pass it a file path (nuclei's cve/log4j templates above already
+# cover lists).
 if _have log4j-scan; then
-  log "log4j-scan probe..."
-  log4j-scan -u "$TARGET" --run-all-tests > "$OUT_DIR/log4j.txt" 2>&1 || true
-  if grep -qiE 'vulnerable|cve-2021-44228' "$OUT_DIR/log4j.txt"; then
-    hit "log4j-scan: vulnerability indicator — review $OUT_DIR/log4j.txt"
+  if [ -f "$SCAN_TARGET" ]; then
+    warn "log4j-scan requires a single URL — skipping for file/list input (nuclei sweep above already covers cve/log4j templates for lists)"
+  else
+    log "log4j-scan probe..."
+    log4j-scan -u "$SCAN_TARGET" --run-all-tests > "$OUT_DIR/log4j.txt" 2>&1 || true
+    if grep -qiE 'vulnerable|cve-2021-44228' "$OUT_DIR/log4j.txt"; then
+      hit "log4j-scan: vulnerability indicator — review $OUT_DIR/log4j.txt"
+    fi
   fi
 fi
 

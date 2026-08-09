@@ -551,6 +551,12 @@ def main():
     parser.add_argument("--attachment-url", help="Signed S3 URL from a private report attachment")
     parser.add_argument("--skip", nargs="*", default=[], help="Test numbers to skip e.g. --skip 3 7 12")
     parser.add_argument("--only", nargs="*", default=[], help="Run only specific tests e.g. --only 1 2 9")
+    parser.add_argument(
+        "--i-understand", action="store_true",
+        help="Actually fire these cross-account requests against the live HackerOne "
+             "platform with real tokens. Without this flag, prints a dry-run summary "
+             "of what would run and exits without any network call.",
+    )
     args = parser.parse_args()
 
     skip = set(args.skip or [])
@@ -572,6 +578,13 @@ def main():
     if not args.report_id and not args.user_id and not args.program:
         print("ERROR: Provide at least one of --report-id, --user-id, or --program")
         sys.exit(1)
+
+    if not args.i_understand:
+        print("[DRY-RUN] This would fire real cross-account requests against "
+              "https://hackerone.com using live tokens for Account A and Account B.")
+        print("Pass --i-understand to actually run it (only against a program you "
+              "have written authorization to test this way).")
+        sys.exit(0)
 
     if args.report_id:
         if should_run("1"): test_report_idor(args.token_a, args.token_b, args.report_id)

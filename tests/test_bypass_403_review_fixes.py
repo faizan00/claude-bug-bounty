@@ -39,6 +39,18 @@ def test_normalize_body_helper_still_defined():
     assert "_normalize_body()" in scanner
 
 
+# A domain (not an IP literal) under the RFC 2606 reserved .invalid TLD --
+# never resolvable to a real system. tools/scope_checker.py has a documented,
+# separate limitation that IP addresses are never considered in-scope
+# (see its module docstring), so an IP literal here would make the scope
+# gate a follow-up hardening pass added to bypass_403.sh reject every one of
+# these tests for a reason unrelated to what each actually verifies.
+# HTTP_PROXY/HTTPS_PROXY still route any request to a closed local port as
+# a second safety layer, same as before.
+UNREACHABLE_URL = "http://bypass-probe-test.invalid:1/probe"
+UNREACHABLE_SCOPE_ENV = {"BB_SCOPE_DOMAINS": "bypass-probe-test.invalid"}
+
+
 def test_bypass_probe_does_not_crash_on_unreachable_target():
     """The actual regression test the old grep-only test could never catch:
     execute the real script (not just read its source) against a target
@@ -49,8 +61,9 @@ def test_bypass_probe_does_not_crash_on_unreachable_target():
     env = dict(os.environ)
     env["HTTP_PROXY"] = "http://127.0.0.1:1"
     env["HTTPS_PROXY"] = "http://127.0.0.1:1"
+    env.update(UNREACHABLE_SCOPE_ENV)
     proc = subprocess.run(
-        ["bash", str(BYPASS_PATH), "http://127.0.0.1:1/probe"],
+        ["bash", str(BYPASS_PATH), UNREACHABLE_URL],
         capture_output=True, text=True, timeout=60, env=env,
     )
     assert "unbound variable" not in proc.stderr, proc.stderr
@@ -65,8 +78,9 @@ def test_bypass_probe_never_confirms_a_bypass_from_a_failed_connection():
     env = dict(os.environ)
     env["HTTP_PROXY"] = "http://127.0.0.1:1"
     env["HTTPS_PROXY"] = "http://127.0.0.1:1"
+    env.update(UNREACHABLE_SCOPE_ENV)
     proc = subprocess.run(
-        ["bash", str(BYPASS_PATH), "http://127.0.0.1:1/probe"],
+        ["bash", str(BYPASS_PATH), UNREACHABLE_URL],
         capture_output=True, text=True, timeout=60, env=env,
     )
     assert "[CONFIRMED]" not in proc.stdout, proc.stdout[-2000:]

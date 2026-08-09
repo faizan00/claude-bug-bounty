@@ -14,6 +14,11 @@ Targeted nuclei scan of the `cve/` template directory plus optional log4j-scan.
 /scan-cves --year 2024 recon/target.com/live/urls.txt
 ```
 
+## Scope
+
+Requires `BB_SCOPE_DOMAINS` (e.g. `export BB_SCOPE_DOMAINS='*.target.com,target.com'`)
+before running — the script refuses to scan with no declared scope.
+
 ## Why a separate command
 
 `/recon` already runs a broad nuclei phase across every severity — this command

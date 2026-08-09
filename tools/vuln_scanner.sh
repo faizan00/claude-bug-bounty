@@ -60,6 +60,9 @@ RECON_DIR="$(cd "$RECON_DIR" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# shellcheck source=tools/external_arsenal.sh
+. "$SCRIPT_DIR/external_arsenal.sh"
+
 # Auth-aware hunting: load BBHUNT_AUTH_HEADERS into BB_AUTH_ARGS.
 # shellcheck source=tools/_auth_helper.sh
 . "$SCRIPT_DIR/_auth_helper.sh"
@@ -87,6 +90,13 @@ else
 fi
 
 FINDINGS_DIR="${FINDINGS_OUT_DIR:-$DEFAULT_FINDINGS_DIR}"
+
+# Scope gate — this is the active-exploitation stage (SQLi, RCE-upload PoC,
+# SAML sig-strip, MFA flood). It trusted $RECON_DIR to have been pre-filtered
+# by recon_engine.sh's Phase 1.5, but IP/CIDR/list-mode recon runs skip that
+# auto-filter by design, and nothing enforced that this script only ever runs
+# after it. Gate the recon target itself before any probe fires.
+_scope_gate_asset "$TARGET" || exit 1
 
 export PATH="$HOME/go/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 export PRIORITY_DIR="$RECON_DIR/priority"

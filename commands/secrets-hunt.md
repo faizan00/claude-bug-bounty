@@ -15,6 +15,15 @@ Find leaked API keys, tokens, and credentials — verified when possible.
 /secrets-hunt --github-org acme-corp           # needs GITHUB_TOKEN env
 ```
 
+## Scope
+
+`--js-bundle` (re-fetches JS from the target's own domain) and `--git` when
+given a remote URL both require `BB_SCOPE_DOMAINS` (e.g.
+`export BB_SCOPE_DOMAINS='*.target.com,target.com'`) — refuses to run
+otherwise. `--filesystem`, `--git` with a local path, `--github-org`, and
+`--recon-sources` have no target-domain concept to gate (local files or a
+GitHub org/repo, not the program's own asset) and are unaffected.
+
 ## Scanners (best installed wins; the script runs whichever it finds)
 
 | Scanner | Strength |

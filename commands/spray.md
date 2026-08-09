@@ -47,6 +47,7 @@ Live credential spray against an authentication endpoint. **The most dangerous t
 
 ## Hard guards (cannot be bypassed)
 
+0. **Declared scope** — requires `BB_SCOPE_DOMAINS` (e.g. `export BB_SCOPE_DOMAINS='*.target.com,target.com'`) before anything else; refuses to run with no declared scope.
 1. **Typed-hostname confirmation** — Pre-flight prints the target hostname and requires you to type it back. Prevents spraying the wrong target.
 2. **Lockout warning** — Calculates per-user failed-attempt count from your `--passes` size and warns if it exceeds typical lockout thresholds.
 3. **Audit log** — Every attempt is appended to `recon/<host>/spray/attempts-<timestamp>.jsonl`. Format: `{ts, round, user, pwd_sha256_prefix, status_code, looks_like_success, duration_ms}`. **Passwords are never logged in plaintext** — only their SHA-256 prefix.

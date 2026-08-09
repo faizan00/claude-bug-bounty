@@ -16,6 +16,12 @@ Run the full 7-phase GraphQL audit against a discovered `/graphql`,
 /graphql-audit https://target.com/graphql --proxy http://127.0.0.1:8080
 ```
 
+## Scope
+
+Requires `BB_SCOPE_DOMAINS` (e.g. `export BB_SCOPE_DOMAINS='*.target.com,target.com'`)
+before running — the script refuses to probe with no declared scope. Run
+`/scope <asset>` first if you haven't already.
+
 ## How it works
 
 `tools/graphql_audit.sh` runs each phase in turn, falling back to built-in

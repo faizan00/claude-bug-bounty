@@ -122,7 +122,7 @@ SH_TOOLS = [
     {"name": "banner.sh", "invalid_nonzero": False},  # sourced-function library, no arg parsing at all
     {"name": "cicd_scanner.sh", "invalid_nonzero": False},  # unknown flag becomes TARGET; scan "succeeds" (exit 0) even when the underlying tool fails
     {"name": "cloud_recon.sh"},
-    {"name": "cve_scan.sh", "invalid_nonzero": False},  # unknown flag becomes TARGET; nuclei sweep "completes" (exit 0) against the bogus value
+    {"name": "cve_scan.sh"},  # unknown flag becomes TARGET; now correctly rejected (exit 1) by the fail-closed scope gate before nuclei ever runs
     {"name": "external_arsenal.sh", "invalid_nonzero": False},  # unknown flags fall through to default status print
     {"name": "graphql_audit.sh"},
     {"name": "h1_run.sh", "help_exit": 1},  # never reads argv at all; always exits 1 on empty hardcoded tokens
@@ -233,24 +233,43 @@ class TestNoImportTimeSideEffects:
 
 NETWORK_SENDING_TOOLS = {
     "breach_checker.py", "cicd_scanner.sh",
-    "graphql_audit.sh", "h1_idor_scanner.py", "h1_mutation_idor.py",
+    "h1_idor_scanner.py", "h1_mutation_idor.py",
     "h1_oauth_tester.py", "h1_race.py", "h1_run.sh", "hai_probe.py",
     "multipart_mutator.py",  # only with --send, but the code path exists
-    "osint_employees.sh", "scope_aggregator.sh", "secrets_hunter.sh",
-    "spray_orchestrator.sh", "target_selector.py",
+    "osint_employees.sh", "scope_aggregator.sh",
+    "target_selector.py",
     "waf_response_analyzer.py",  # only with --calibrate, but the code path exists
-    "wordlist_engine.sh", "zero_day_fuzzer.py",
+    "zero_day_fuzzer.py",
 }
-# Post-Phase-7 hardening pass added a real scope_checker.py gate (via
+# h1_idor_scanner.py / h1_mutation_idor.py are deliberately NOT gated via
+# scope_checker.py: both hardcode their target to https://hackerone.com
+# itself (testing HackerOne's own platform via a specific program handle),
+# so there's no variable domain for a BB_SCOPE_DOMAINS allowlist to check
+# against — the "scope" question here is program authorization, not domain
+# membership. Both instead require an explicit --i-understand flag before
+# firing (h1_mutation_idor.py already had this; h1_idor_scanner.py was
+# fixed to match in the same pass that closed this gap list down further —
+# see test_h1_idor_scanner_dry_run.py).
+#
+# A follow-up hardening pass added a real scope_checker.py gate (via
 # external_arsenal.sh's _scope_gate_asset/_scope_gate_filter_file helpers) to
-# these three — they've graduated out of the gap list above. This is the
+# these tools — they've graduated out of the gap list above. This is the
 # deliberate edit TestScopeCheckerGateGap's docstring anticipates.
 # scope_aggregator.sh is NOT in this set: its network calls are to
 # GitHub/bbscope to fetch a program's scope, not to the target's own
 # infrastructure, so a scope_checker.py gate doesn't apply there — its
 # fix (tests/test_scope_aggregator_exact_match.py) was a different bug
 # (unanchored program-handle substring matching), not a missing scope gate.
-SCOPE_GATED_TOOLS = {"cloud_recon.sh", "cve_scan.sh", "takeover_scanner.sh"}
+# secrets_hunter.sh is partially gated: --js-bundle and URL-form --git are
+# gated, but --github-org and local-path --git aren't (no domain to check —
+# same class of gap as scope_aggregator.sh/cicd_scanner.sh) and
+# --recon-sources does no network I/O at all. It's listed here as gated
+# because the file does invoke the gate on its network-sending modes.
+SCOPE_GATED_TOOLS = {
+    "cloud_recon.sh", "cve_scan.sh", "takeover_scanner.sh",
+    "graphql_audit.sh", "secrets_hunter.sh", "spray_orchestrator.sh",
+    "wordlist_engine.sh",
+}
 
 
 class TestScopeCheckerGateGap:

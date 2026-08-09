@@ -121,30 +121,34 @@ _have() { command -v "$1" >/dev/null 2>&1; }
 # ---------------------------------------------------------------------------
 # Shared scope gate for standalone recon-adjacent tools that fire directly
 # against a single target host (cve_scan.sh, takeover_scanner.sh,
-# cloud_recon.sh's --cf-bypass path). Reuses the canonical tools/scope_checker.py
-# instead of reimplementing scope logic — mirrors recon_engine.sh's Phase 1.5
-# pattern (same BB_SCOPE_DOMAINS/BB_SCOPE_EXCLUDE env vars, same fail-CLOSED
-# behavior on a scope_checker.py error).
+# cloud_recon.sh's --cf-bypass path, and others). Reuses the canonical
+# tools/scope_checker.py instead of reimplementing scope logic — mirrors
+# recon_engine.sh's Phase 1.5 pattern (same BB_SCOPE_DOMAINS/BB_SCOPE_EXCLUDE
+# env vars, same fail-CLOSED behavior on a scope_checker.py error).
 #
-# BB_SCOPE_DOMAINS unset => warn and allow. These tools are commonly invoked
-# standalone with a single already-decided target (or fed a list a human
-# already vetted), unlike recon_engine.sh which has a whole discovered host
-# list to filter — so there's no safe default allowlist to assume here the
-# way recon_engine.sh can default to "$TARGET,*.$TARGET". Set BB_SCOPE_DOMAINS
-# to turn the warning into a real, enforced gate.
+# BB_SCOPE_DOMAINS unset => FAIL CLOSED (deny), not warn-and-allow. A prior
+# version of this helper warned and proceeded when BB_SCOPE_DOMAINS was
+# unset, which meant every tool using it (including spray_orchestrator.sh)
+# was unenforced out of the box unless an operator remembered to export the
+# env var first. There is no safe default to derive here — unlike
+# recon_engine.sh, which discovers a whole host list and can default to
+# "$TARGET,*.$TARGET" because $TARGET is the human's own authorized root —
+# these tools take a single already-decided asset as their argument, so the
+# asset being tested IS the thing that needs an independent scope answer.
+# Declare scope explicitly: BB_SCOPE_DOMAINS='*.target.com,target.com'.
 # ---------------------------------------------------------------------------
 _ext_arsenal_dir() { cd "$(dirname "${BASH_SOURCE[0]}")" && pwd; }
 
 # Usage: _scope_gate_asset "<hostname-or-url>"
-# Returns 1 (and prints an error) if BB_SCOPE_DOMAINS is set and the asset is
-# out of scope, or if scope_checker.py itself fails to run. Caller should
+# Returns 1 (and prints an error) if BB_SCOPE_DOMAINS is unset, the asset is
+# out of scope, or scope_checker.py itself fails to run. Caller should
 # `_scope_gate_asset "$TARGET" || exit 1`.
 _scope_gate_asset() {
   local asset="$1"
   local domains="${BB_SCOPE_DOMAINS:-}"
   if [ -z "$domains" ]; then
-    echo -e "\033[1;33m[!]\033[0m No BB_SCOPE_DOMAINS set — scope filter skipped for '$asset'. Set BB_SCOPE_DOMAINS to enforce (e.g. BB_SCOPE_DOMAINS='*.target.com,target.com')." >&2
-    return 0
+    echo -e "\033[0;31m[-]\033[0m BB_SCOPE_DOMAINS not set — refusing to probe '$asset' with no declared scope. Set BB_SCOPE_DOMAINS='*.target.com,target.com' to authorize." >&2
+    return 1
   fi
   local args=(--domain "$domains")
   [ -n "${BB_SCOPE_EXCLUDE:-}" ] && args+=(--exclude-domain "$BB_SCOPE_EXCLUDE")
@@ -156,17 +160,15 @@ _scope_gate_asset() {
 }
 
 # Usage: _scope_gate_filter_file "<input-file>" "<output-file>"
-# Writes only in-scope lines from input to output. If BB_SCOPE_DOMAINS is
-# unset, copies input to output unfiltered (with a warning). Fails CLOSED
-# (returns 1, does not write output) if BB_SCOPE_DOMAINS is set and
+# Writes only in-scope lines from input to output. Fails CLOSED (returns 1,
+# does not write output) if BB_SCOPE_DOMAINS is unset, or if it's set and
 # scope_checker.py errors — never falls through to scanning an unfiltered list.
 _scope_gate_filter_file() {
   local infile="$1" outfile="$2"
   local domains="${BB_SCOPE_DOMAINS:-}"
   if [ -z "$domains" ]; then
-    echo -e "\033[1;33m[!]\033[0m No BB_SCOPE_DOMAINS set — scope filter skipped, using '$infile' as-is. Set BB_SCOPE_DOMAINS to enforce." >&2
-    cp "$infile" "$outfile"
-    return 0
+    echo -e "\033[0;31m[-]\033[0m BB_SCOPE_DOMAINS not set — refusing to scan '$infile' with no declared scope. Set BB_SCOPE_DOMAINS='*.target.com,target.com' to authorize." >&2
+    return 1
   fi
   local args=(--input-file "$infile" --output "$outfile" --domain "$domains")
   [ -n "${BB_SCOPE_EXCLUDE:-}" ] && args+=(--exclude-domain "$BB_SCOPE_EXCLUDE")

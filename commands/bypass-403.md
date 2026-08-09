@@ -14,6 +14,12 @@ and method tampering — the standard battery from disclosed reports.
 /bypass-403 -l recon/target.com/live/status_403.txt
 ```
 
+## Scope
+
+Requires `BB_SCOPE_DOMAINS` (e.g. `export BB_SCOPE_DOMAINS='*.target.com,target.com'`)
+before running — the script refuses to probe with no declared scope. Run
+`/scope <asset>` first if you haven't already.
+
 ## What it tries
 
 | Class | Examples |

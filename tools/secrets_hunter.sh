@@ -99,6 +99,12 @@ case "$MODE" in
     _have gitleaks    && _run_gitleaks    "$TARGET" detect
     ;;
   git)
+    # TARGET is either a local path (no network, nothing to gate) or a
+    # remote repo URL that trufflehog/gitleaks will clone over the network —
+    # gate only the latter.
+    case "$TARGET" in
+      http://*|https://*|git@*) _scope_gate_asset "$TARGET" || exit 1 ;;
+    esac
     _have trufflehog  && _run_trufflehog  "$TARGET" git
     _have noseyparker && _run_noseyparker "$TARGET"
     _have gitleaks    && _run_gitleaks    "$TARGET" detect
@@ -109,6 +115,9 @@ case "$MODE" in
     # secrets-grep step, so we re-fetch top JS bundles here for verification.
     JS_LIST="$TARGET/urls/js_files.txt"
     [ -s "$JS_LIST" ] || { err "no js_files.txt under $TARGET"; exit 1; }
+    SCOPE_FILTERED_JS_LIST="$OUT_DIR/scope_filtered_js_files.txt"
+    _scope_gate_filter_file "$JS_LIST" "$SCOPE_FILTERED_JS_LIST" || exit 1
+    JS_LIST="$SCOPE_FILTERED_JS_LIST"
     JS_DIR="$OUT_DIR/js_bundles"
     mkdir -p "$JS_DIR"
     log "Downloading top 100 JS bundles for offline scanning..."

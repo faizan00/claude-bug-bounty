@@ -68,7 +68,11 @@ log_err()  { echo -e "${RED}[-]${NC} $1"; }
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-_have() { command -v "$1" >/dev/null 2>&1; }
+# shellcheck source=external_arsenal.sh
+. "$SCRIPT_DIR/external_arsenal.sh"
+
+# Scope gate before cewler crawls the target.
+_scope_gate_asset "$TARGET" || exit 1
 
 # Dependency check
 MISSING=()
