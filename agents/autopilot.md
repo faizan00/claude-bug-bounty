@@ -42,6 +42,13 @@ Before starting an auth-aware run:
   actual executable version of "diff behavior between identities," and a
   match with `--owner` also feeds `memory/object_model.py` a real
   relationship-establishing fact for Step 5's object-model leads.
+- For invite/role-assignment, ownership-transfer, tenant-isolation, or
+  billing/refund/coupon workflow steps, use `tools/business_logic_probe.py`
+  (see `skills/web2-vuln-classes/SKILL.md` §5) the same way — `--establish`
+  once with a session that genuinely holds the required relationship,
+  then `--probe` once with the session being tested. Same two-flag
+  mutation gate as everywhere else in this codebase (`--i-understand` +
+  `--allow-mutate`); fires the real request exactly once, never retried.
 
 The MFA workflow-skip and SAML signature-stripping probes deliberately stay
 **unauthenticated** even when a session is loaded — that's the bug they test

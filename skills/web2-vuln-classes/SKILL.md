@@ -284,6 +284,29 @@ http://localhost:8080     # Admin panel
 
 ## 5. BUSINESS LOGIC
 > Transferred from web3's "incomplete code path" pattern.
+> **Authorization-on-a-workflow-step bugs** (invite/role-assignment,
+> ownership transfer, tenant isolation, billing/refund/coupon mutations) —
+> don't just eyeball this from a single request. `tools/business_logic_probe.py`
+> is the executable version, two steps:
+> ```bash
+> # 1. Assert what you genuinely know: a real admin session holds CAN_INVITE on org 42.
+> python3 tools/business_logic_probe.py target.com --pattern invite_flow --establish \
+>   --holder-session-file .private/admin.json --org-ref 42 --i-understand
+> # 2. Probe: does the server actually let a non-privileged session invite anyway?
+> python3 tools/business_logic_probe.py target.com --pattern invite_flow --probe \
+>   --acting-session-file .private/attacker.json --org-ref 42 --target-ref newuser@x.com \
+>   --method POST --url https://target.com/api/orgs/42/invite --data '{"email":"newuser@x.com"}' \
+>   --domain target.com --i-understand --allow-mutate
+> ```
+> `--pattern` also covers `ownership_transfer`, `tenant_isolation` (read-only,
+> GET), `billing`, `refund`, `coupon`, `role_escalation`. This fires the real
+> mutating request EXACTLY ONCE — never brute-forced — and checks the result
+> against `memory/object_model.py`'s actual detector synchronously, so a real
+> violation surfaces immediately, not after a separate `director.py` call.
+> `--allow-mutate` is a second, independent confirmation beyond `--i-understand`
+> for any pattern here except `tenant_isolation` — this is a real
+> state-changing request against a live target (a real invite/refund/
+> transfer), not a read.
 
 ### Pattern 1: Fast Path Skips State Update
 ```python
