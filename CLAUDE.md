@@ -83,7 +83,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 ### Tools (Python/shell — in `tools/`)
 
 - `tools/hunt.py` — master orchestrator
-- `tools/recon_engine.sh` — subdomain + URL discovery (now with optional `nuclei` phase); `BB_BROWSER_RECON=1` opts into Phase 2.5, which runs `browser_recon.py` (source maps, framework routes, client-side auth model, hidden endpoints) against Phase 2's live hosts — off by default since it drives a real headless browser
+- `tools/recon_engine.sh` — subdomain + URL discovery (now with optional `nuclei` phase); `BB_BROWSER_RECON=1` opts into Phase 2.5, which runs `browser_recon.py` (source maps, framework routes, client-side auth model, hidden endpoints) against Phase 2's live hosts — off by default since it drives a real headless browser. `browser_recon.py --api-capture` now also feeds `memory/api_call_observer.py`, so running it once per test account (`--bearer`/`--cookie`) accumulates cross-account API calls in `browser/api-calls.json` and records real Object Model observations for `director.py`'s authorization-violation detector — previously built and tested but never wired to any producer.
 - `tools/vuln_scanner.sh` — XSS/SQLi/SSTI/MFA/SAML probe pipeline
 - `tools/validate.py` — 4-gate finding validator
 - `tools/learn.py` — CVE + disclosure intel; `fetch_and_cache_cve()` (Phase 5) populates `tools/tech_attack_matrix_live_cache.json` with real fetched CVEs, called only via `fingerprint.py`'s opt-in `--live-cve-lookup` flag (new network call, default OFF)
