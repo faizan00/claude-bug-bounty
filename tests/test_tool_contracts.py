@@ -232,15 +232,25 @@ class TestNoImportTimeSideEffects:
 # regression-visible fact instead of leaving it undocumented.
 
 NETWORK_SENDING_TOOLS = {
-    "breach_checker.py", "cicd_scanner.sh", "cloud_recon.sh", "cve_scan.sh",
+    "breach_checker.py", "cicd_scanner.sh",
     "graphql_audit.sh", "h1_idor_scanner.py", "h1_mutation_idor.py",
     "h1_oauth_tester.py", "h1_race.py", "h1_run.sh", "hai_probe.py",
     "multipart_mutator.py",  # only with --send, but the code path exists
     "osint_employees.sh", "scope_aggregator.sh", "secrets_hunter.sh",
-    "spray_orchestrator.sh", "takeover_scanner.sh", "target_selector.py",
+    "spray_orchestrator.sh", "target_selector.py",
     "waf_response_analyzer.py",  # only with --calibrate, but the code path exists
     "wordlist_engine.sh", "zero_day_fuzzer.py",
 }
+# Post-Phase-7 hardening pass added a real scope_checker.py gate (via
+# external_arsenal.sh's _scope_gate_asset/_scope_gate_filter_file helpers) to
+# these three — they've graduated out of the gap list above. This is the
+# deliberate edit TestScopeCheckerGateGap's docstring anticipates.
+# scope_aggregator.sh is NOT in this set: its network calls are to
+# GitHub/bbscope to fetch a program's scope, not to the target's own
+# infrastructure, so a scope_checker.py gate doesn't apply there — its
+# fix (tests/test_scope_aggregator_exact_match.py) was a different bug
+# (unanchored program-handle substring matching), not a missing scope gate.
+SCOPE_GATED_TOOLS = {"cloud_recon.sh", "cve_scan.sh", "takeover_scanner.sh"}
 
 
 class TestScopeCheckerGateGap:
@@ -271,3 +281,29 @@ class TestScopeCheckerGateGap:
 
     def test_network_sending_set_is_subset_of_all_tools(self):
         assert NETWORK_SENDING_TOOLS <= set(ALL_TOOL_NAMES)
+
+
+class TestScopeCheckerGateAdded:
+    """The inverse of TestScopeCheckerGateGap: these three tools were fixed
+    in the post-Phase-7 hardening pass to call the canonical
+    tools/scope_checker.py (via external_arsenal.sh's _scope_gate_asset /
+    _scope_gate_filter_file helpers) before firing any request at a target.
+    Locks the fix in as a regression-visible fact the same way the gap was
+    locked in above — if this starts failing, the gate was accidentally
+    removed."""
+
+    @pytest.mark.parametrize("name", sorted(SCOPE_GATED_TOOLS))
+    def test_tool_invokes_scope_checker(self, name):
+        path = os.path.join(TOOLS_DIR, name)
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            content = fh.read()
+        assert "scope_checker.py" in content or "_scope_gate_" in content, (
+            f"{name} no longer appears to invoke scope_checker.py — "
+            f"the post-Phase-7 hardening fix may have been reverted."
+        )
+
+    def test_scope_gated_set_is_subset_of_all_tools(self):
+        assert SCOPE_GATED_TOOLS <= set(ALL_TOOL_NAMES)
+
+    def test_scope_gated_and_gap_sets_are_disjoint(self):
+        assert SCOPE_GATED_TOOLS.isdisjoint(NETWORK_SENDING_TOOLS)

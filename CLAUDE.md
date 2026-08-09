@@ -4,7 +4,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 
 ## What's Here
 
-### Skills (10 domains — load with `/bug-bounty`, `/web2-recon`, `/token-scan`, etc.)
+### Skills (13 domains — load with `/bug-bounty`, `/web2-recon`, `/token-scan`, etc.)
 
 | Skill | Domain |
 |---|---|
@@ -22,7 +22,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 | `skills/cicd-security/` | CI/CD pipeline hunting — GitHub Actions injection, secret exfil, self-hosted runner poisoning, OIDC abuse, supply chain attacks |
 | `skills/graphql-audit/` | GraphQL hunting — introspection, field suggestions (clairvoyance), batching DoS, IDOR via aliasing, injection, auth bypass, depth bombs |
 
-### Commands (21 slash commands)
+### Commands (28 slash commands)
 
 > **Note:** All commands are prefixed to avoid conflicts with Claude Code's built-in commands.
 > `/resume` is a reserved Claude Code command — use `/pickup` to continue a previous hunt.
@@ -58,7 +58,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 | `/spray` | `/spray <url> --mode http-form\|oauth\|o365\|okta --users <f> --passes <f>` — password spray with hard guards (typed-host confirm, lockout warn, audit log) |
 | `/graphql-audit` | `/graphql-audit <url>` — full GraphQL audit: introspection, batching DoS, IDOR, injection, alias bomb, graphw00f fingerprint |
 
-### Agents (13 specialized agents)
+### Agents (14 specialized agents)
 
 - `recon-agent` — subdomain enum + live host discovery
 - `js-intelligence` — mines JS bundles/source maps for hidden endpoints, feature flags, debug routes, leaked config, auth flows
@@ -70,6 +70,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 - `web3-auditor` — smart contract bug class analysis
 - `chain-builder` — builds A→B→C exploit chains, memory-first (chains.jsonl + lead-board graph before the static table), saves every chain it confirms
 - `autopilot` — autonomous hunt loop (scope→recon→rank→hunt→validate→report), decision-engine-driven priority scoring, experiment-tracked stop/pivot decisions
+- `research-director` — wraps `tools/director.py`'s dependency-aware, falsifier-generating, time-boxed planner; drives `/autopilot`'s Decision (Step 5) and Experiment Selection (Step 6) via `build_plan()`/`replan()` instead of ad hoc re-scoring
 - `recon-ranker` — scored, confidence-rated attack surface ranking from recon output + hypotheses + the intelligence briefing + lead-board chains, plus Expected Value per Hour per candidate
 - `token-auditor` — fast meme coin/token rug pull and security analysis
 - `credential-hunter` — orchestrates wordlist-gen + osint-employees + breach-check; HARD STOPS at spray for human go/no-go
@@ -82,7 +83,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 ### Tools (Python/shell — in `tools/`)
 
 - `tools/hunt.py` — master orchestrator
-- `tools/recon_engine.sh` — subdomain + URL discovery (now with optional `nuclei` phase)
+- `tools/recon_engine.sh` — subdomain + URL discovery (now with optional `nuclei` phase); `BB_BROWSER_RECON=1` opts into Phase 2.5, which runs `browser_recon.py` (source maps, framework routes, client-side auth model, hidden endpoints) against Phase 2's live hosts — off by default since it drives a real headless browser
 - `tools/vuln_scanner.sh` — XSS/SQLi/SSTI/MFA/SAML probe pipeline
 - `tools/validate.py` — 4-gate finding validator
 - `tools/learn.py` — CVE + disclosure intel; `fetch_and_cache_cve()` (Phase 5) populates `tools/tech_attack_matrix_live_cache.json` with real fetched CVEs, called only via `fingerprint.py`'s opt-in `--live-cve-lookup` flag (new network call, default OFF)

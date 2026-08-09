@@ -40,6 +40,19 @@ done
 
 [ -z "$TARGET" ] && { err "target host or -l <file> required"; exit 2; }
 
+# Scope gate — reuses the canonical tools/scope_checker.py (via
+# external_arsenal.sh's shared helpers) rather than firing nuclei against
+# whatever was passed with no check at all. See _scope_gate_* for the
+# BB_SCOPE_DOMAINS/BB_SCOPE_EXCLUDE convention shared with recon_engine.sh.
+SCAN_TARGET="$TARGET"
+if [ -f "$TARGET" ]; then
+  SCOPE_FILTERED_FILE="$(mktemp)"
+  _scope_gate_filter_file "$TARGET" "$SCOPE_FILTERED_FILE" || exit 1
+  SCAN_TARGET="$SCOPE_FILTERED_FILE"
+else
+  _scope_gate_asset "$TARGET" || exit 1
+fi
+
 OUT_DIR="${CVE_OUT_DIR:-$(pwd)/findings/cve/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT_DIR"
 
@@ -62,8 +75,8 @@ log "Updating nuclei templates (skip with NUCLEI_NO_UPDATE=1)..."
 TEMPLATE_FILTER=( -tags cve )
 [ -n "$YEAR" ] && TEMPLATE_FILTER+=( -tags "$YEAR" )
 
-INPUT_ARG=( -u "$TARGET" )
-[ -f "$TARGET" ] && INPUT_ARG=( -l "$TARGET" )
+INPUT_ARG=( -u "$SCAN_TARGET" )
+[ -f "$SCAN_TARGET" ] && INPUT_ARG=( -l "$SCAN_TARGET" )
 
 log "nuclei CVE sweep on $TARGET ${YEAR:+(year=$YEAR)}..."
 nuclei "${INPUT_ARG[@]}" \

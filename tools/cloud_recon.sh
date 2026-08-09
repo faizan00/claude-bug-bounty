@@ -39,6 +39,16 @@ done
 
 [ -z "$KEYWORD" ] && [ -z "$CF_TARGET" ] && { err "--keyword or --cf-bypass required"; exit 2; }
 
+# Scope gate for --cf-bypass only: that flag makes real requests (or dnsReaper/
+# CloudFail probes) against a specific target host, so it's gated the same
+# way as recon_engine.sh/cve_scan.sh/takeover_scanner.sh. --keyword sweeps
+# (S3Scanner/cloud_enum) query third-party cloud-provider namespaces by
+# company name, not the target's own infrastructure, so a hostname scope
+# check doesn't apply to that path.
+if [ -n "$CF_TARGET" ]; then
+  _scope_gate_asset "$CF_TARGET" || exit 1
+fi
+
 OUT_DIR="${CLOUD_OUT_DIR:-$(pwd)/findings/cloud/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT_DIR"
 
