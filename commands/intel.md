@@ -13,6 +13,23 @@ Fetch actionable intelligence for a target.
 3. Cross-references with hunt memory — flags untested CVEs and new endpoints
 4. Outputs prioritized intel with hunt recommendations
 
+## Tool
+
+`tools/intel_engine.py` — its own docstring says "Called by /intel command,"
+so this is the actual invocation, not `learn.py` directly (it wraps
+`learn.py` + HackerOne MCP + hunt-memory context, matching everything above):
+
+```bash
+python3 tools/intel_engine.py --target target.com --tech "nextjs,graphql"
+```
+
+`--tech` should come from `recon/target.com/fingerprint.json`'s `framework`/
+`spa_framework`/`api_style` fields if `recon_engine.sh` already ran (Phase 2.6
+writes this automatically) or `hunt-memory/targets/target.com.json`'s
+`tech_stack` — don't guess a stack that was never actually fingerprinted.
+Add `--program <handle>` for a HackerOne program handle and `--memory-dir`
+to point at a non-default hunt-memory location.
+
 ## Usage
 
 ```

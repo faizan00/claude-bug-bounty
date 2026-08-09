@@ -24,6 +24,23 @@ otherwise. `--filesystem`, `--git` with a local path, `--github-org`, and
 `--recon-sources` have no target-domain concept to gate (local files or a
 GitHub org/repo, not the program's own asset) and are unaffected.
 
+## Tool
+
+`tools/secrets_hunter.sh` — the four `/secrets-hunt` usage forms above map
+directly onto its own CLI:
+
+```bash
+bash tools/secrets_hunter.sh --filesystem /path/to/project
+bash tools/secrets_hunter.sh --git https://github.com/target/repo
+bash tools/secrets_hunter.sh --js-bundle recon/target.com
+bash tools/secrets_hunter.sh --github-org acme-corp   # needs GITHUB_TOKEN env
+```
+
+There's also a fifth, no-network mode not listed above: `--recon-sources <recon-dir>`
+runs `tools/secrets_scanner.py`'s pattern + Shannon-entropy + JS-signal scan over
+Phase 1's already-recovered unminified source + CI/CD scanner output — use this
+when you want the JS-bundle-adjacent signal without any new outbound request.
+
 ## Scanners (best installed wins; the script runs whichever it finds)
 
 | Scanner | Strength |

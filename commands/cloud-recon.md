@@ -22,6 +22,17 @@ otherwise. `--keyword` has no scope requirement: it searches third-party
 cloud-storage namespaces (S3/Azure/GCP bucket names), not the target's own
 infrastructure.
 
+## Tool
+
+`tools/cloud_recon.sh` — the two `/cloud-recon` usage forms above map
+directly onto its own CLI:
+
+```bash
+bash tools/cloud_recon.sh --keyword acme
+bash tools/cloud_recon.sh --keyword acme --s3-only
+bash tools/cloud_recon.sh --cf-bypass api.target.com
+```
+
 ## What it runs
 
 | Tool | Mode | What it finds |
