@@ -36,7 +36,12 @@ Before starting an auth-aware run:
   Continue under this identity?"
 - If the program forbids automated authenticated testing, **stop**.
 - For IDOR / privilege-escalation hunts, ask whether a second low-priv
-  session is available so we can diff behavior between identities.
+  session is available so we can diff behavior between identities — if
+  yes, run `tools/idor_diff.py` (see `skills/web2-vuln-classes/SKILL.md`
+  §1) rather than eyeballing repeated single-session tool calls; it's the
+  actual executable version of "diff behavior between identities," and a
+  match with `--owner` also feeds `memory/object_model.py` a real
+  relationship-establishing fact for Step 5's object-model leads.
 
 The MFA workflow-skip and SAML signature-stripping probes deliberately stay
 **unauthenticated** even when a session is loaded — that's the bug they test

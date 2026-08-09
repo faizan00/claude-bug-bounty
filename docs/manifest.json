@@ -99,6 +99,7 @@
     {"name": "hai_browser_recon.js", "path": "tools/hai_browser_recon.js", "description": "DevTools console snippet that intercepts Hai's (HackerOne AI) GraphQL requests to map its API surface"},
     {"name": "hai_payload_builder.py", "path": "tools/hai_payload_builder.py", "description": "Generates LLM/agentic-AI attack payloads (prompt injection, exfil channels, ASCII smuggling) by category"},
     {"name": "hai_probe.py", "path": "tools/hai_probe.py", "description": "Probes HackerOne's Hai AI assistant via api.hackerone.com for IDOR/prompt-injection/fingerprinting"},
+    {"name": "idor_diff.py", "path": "tools/idor_diff.py", "description": "Generic cross-session IDOR/BOLA diff tester for arbitrary targets — reuses h1_idor_scanner.py's never-auto-flag-on-non-null diff discipline, generalized to any JSON/text API; a real match feeds a memory/object_model.py Observation (--owner asserts genuine out-of-band ownership knowledge), the first live producer detect_relationship_violations() has ever had"},
     {"name": "memory_gc.py", "path": "tools/memory_gc.py", "description": "CLI for memory/rotation.py — inspect/rotate/purge hunt-memory JSONL files"},
     {"name": "mindmap.py", "path": "tools/mindmap.py", "description": "Generates a pre-hunt reconnaissance checklist/mind-map Markdown file for a target"},
     {"name": "multipart_mutator.py", "path": "tools/multipart_mutator.py", "description": "Builds and optionally sends mutated multipart/form-data upload requests (file-upload bypass fuzzing)"},

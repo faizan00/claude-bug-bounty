@@ -25,8 +25,26 @@ Root cause, pattern, bypass table, chaining opportunity, real paid examples.
 
 ## 1. IDOR — INSECURE DIRECT OBJECT REFERENCE  🔐
 > #1 most paid web2 class — 30% of all submissions that get paid.
-> **Needs two sessions** (A=attacker, B=victim) — load both via `--auth-file`
-> and diff audit-log `session_id` hashes to confirm cross-tenant access.
+> **Needs two sessions** (A=owner, B=attacker). Don't diff by hand —
+> `tools/idor_diff.py` runs the actual comparison and never auto-flags on
+> a merely non-null response, only a genuine match:
+> ```bash
+> python3 tools/idor_diff.py target.com --recon-dir recon/target.com \
+>   --session-a-file .private/account_a.json --session-b-file .private/account_b.json \
+>   --owner a --auto --domain '*.target.com' --i-understand
+> ```
+> `--auto` pulls object-scoped candidate URLs (numeric/UUID id in a path
+> segment or query param) straight from recon output; add explicit `--url`
+> flags for anything recon missed. `--owner a` matters beyond the report
+> itself: it's asserting genuine out-of-band knowledge ("I created this
+> under Account A") to `memory/object_model.py` as a real relationship-
+> establishing fact — the first live producer its `detect_relationship_
+> violations()` detector has ever had, so it starts actually firing on
+> later `/autopilot` runs instead of finding nothing to compare against.
+> A match is still only a CANDIDATE (same disclosed limitation
+> `tools/h1_idor_scanner.py`'s diff logic this reuses always had: it can't
+> tell "B illegitimately saw A's data" from "this is legitimately public"
+> — that judgment is still yours before it becomes a report).
 
 ### Root Cause
 ```python
