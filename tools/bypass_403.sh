@@ -48,10 +48,6 @@ done
 OUT_DIR="${BYPASS_OUT_DIR:-$(pwd)/findings/bypass/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT_DIR"
 
-orig_norm="$OUT_DIR/orig_norm"
-bypass_norm="$OUT_DIR/bypass_norm"
-[ "$bypass_norm" = "$orig_norm" ] && log "normalized response matches baseline"
-baseline_code=$orig_code
 # shellcheck source=banner.sh
 . "$SCRIPT_DIR/banner.sh"
 print_banner "403 / 401 Bypass Probe" "${URL:-$LIST}" \

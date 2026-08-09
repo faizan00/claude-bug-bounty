@@ -108,18 +108,31 @@ def flag(test_name: str, token_b_response: dict, severity: str = "HIGH"):
 
 
 def check(test_name: str, resp_a: dict, resp_b: dict, severity: str = "HIGH"):
-    """Compare A's response to B's. Flag if B got real data."""
+    """Compare A's response to B's. Flag ONLY if B's response actually
+    reproduces A's data byte-for-byte — a non-null field in B's response is
+    NOT proof of cross-account access on its own (it could be B's own
+    legitimately-owned data, or a field that's public/shared for every
+    account), so it must never auto-flag by itself.
+
+    Note this still can't distinguish "B illegitimately saw A's private
+    data" from "the field is genuinely public and identical for everyone"
+    (e.g. program.policy) — a human still has to judge sensitivity before
+    reporting. That is a real, disclosed limitation, not something this
+    function can safely infer from the response alone (see project rule:
+    never fabricate confidence/exploitability from insufficient evidence)."""
     same = is_same_data(resp_a, resp_b)
     b_data = resp_b.get("data", {})
     has_error = bool(resp_b.get("errors")) or "_http_error" in resp_b
 
-    # B got non-null data and no errors = IDOR
-    if b_data and not has_error:
-        for v in b_data.values():
-            if v is not None:
-                flag(test_name, resp_b, severity)
-                return
-    status = "BLOCKED" if has_error else "NULL (ok)"
+    if same and not has_error:
+        flag(test_name, resp_b, severity)
+        return
+    if has_error:
+        status = "BLOCKED"
+    elif b_data and any(v is not None for v in b_data.values()):
+        status = "DIFFERS FROM A — inconclusive, not auto-flagged"
+    else:
+        status = "NULL (ok)"
     print(f"  [{status}] {test_name}")
 
 

@@ -93,6 +93,7 @@ opencode
 | `osint-employees` | "osint-employees <target>" — employee names + emails (theHarvester + username-anarchy, opt-in LinkedIn); requires --with-credential-attack |
 | `breach-check` | "breach-check <wordlist>" — HIBP k-anonymity rank wordlist by real-world breach count |
 | `spray` | "spray <url> --mode http-form|oauth|o365|okta --users <f> --passes <f>" — password spray with hard guards |
+| `graphql-audit` | "graphql-audit <endpoint-url>" — full 7-phase GraphQL audit: introspection, graphw00f fingerprint, clairvoyance field discovery, batching DoS, alias bomb, gqlmap injection, graphql-cop checklist |
 <!-- GENERATED:commands:END -->
 
 ## Usage

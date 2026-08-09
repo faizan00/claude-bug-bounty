@@ -43,7 +43,8 @@
     {"name": "wordlist-gen", "path": "commands/wordlist-gen.md", "description": "/wordlist-gen <target> — company-specific password wordlist (cewler + hashcat); requires --with-credential-attack"},
     {"name": "osint-employees", "path": "commands/osint-employees.md", "description": "/osint-employees <target> — employee names + emails (theHarvester + username-anarchy, opt-in LinkedIn); requires --with-credential-attack"},
     {"name": "breach-check", "path": "commands/breach-check.md", "description": "/breach-check <wordlist> — HIBP k-anonymity rank wordlist by real-world breach count"},
-    {"name": "spray", "path": "commands/spray.md", "description": "/spray <url> --mode http-form|oauth|o365|okta --users <f> --passes <f> — password spray with hard guards"}
+    {"name": "spray", "path": "commands/spray.md", "description": "/spray <url> --mode http-form|oauth|o365|okta --users <f> --passes <f> — password spray with hard guards"},
+    {"name": "graphql-audit", "path": "commands/graphql-audit.md", "description": "/graphql-audit <endpoint-url> — full 7-phase GraphQL audit: introspection, graphw00f fingerprint, clairvoyance field discovery, batching DoS, alias bomb, gqlmap injection, graphql-cop checklist"}
   ],
   "agents": [
     {"name": "recon-agent", "path": "agents/recon-agent.md", "description": "Subdomain enum + live host discovery"},

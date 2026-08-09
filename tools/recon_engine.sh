@@ -379,8 +379,15 @@ if [ -n "$SCOPE_DOMAINS" ] && [ -s "$RECON_DIR/subdomains/all.txt" ]; then
             log_warn "Every discovered host was filtered out of scope — check BB_SCOPE_DOMAINS/BB_SCOPE_EXCLUDE. Phase 2+ will find nothing live, by design."
         fi
     else
-        log_err "scope_checker.py failed to run — proceeding WITHOUT automated scope filtering."
-        log_err "Verify $RECON_DIR/subdomains/all.txt against program scope by hand before trusting Phase 2+ output."
+        # Fail CLOSED, not open: a scope_checker.py crash (e.g. a single
+        # non-UTF-8 byte in a crt.sh/wayback-derived hostname) used to log an
+        # error and fall through to Phase 2+ with the UNFILTERED host list —
+        # the opposite of what "Phase 1.5: Scope Enforcement" promises. Abort
+        # instead; the operator can re-run once the input is cleaned up, or
+        # explicitly opt out with BB_SCOPE_DOMAINS=off.
+        log_err "scope_checker.py failed to run — aborting rather than probing an unfiltered host list."
+        log_err "Fix the input (see error above), or set BB_SCOPE_DOMAINS=off to explicitly skip filtering."
+        exit 1
     fi
 else
     log_warn "No scope allowlist resolved for target type '$TARGET_TYPE' — automated pre-probe filter skipped (list/ip/cidr targets are assumed already scope-vetted; set BB_SCOPE_DOMAINS to filter them anyway)."
@@ -427,23 +434,74 @@ else
 fi
 
 # ============================================================
+# Phase 2.5: Browser Intelligence (opt-in — BB_BROWSER_RECON=1)
+#
+# tools/browser_recon.py already implements source-map recovery, framework
+# route extraction, client-side auth-model analysis, and hidden-endpoint
+# discovery, writing exactly the recon/<target>/browser/{routes,auth-model,
+# api-calls,never-called}.json files tools/director.py's browser_intel_leads()
+# already reads — but nothing in this pipeline ever called it, so those
+# consumers always got an empty result on every real hunt.
+#
+# Opt-in rather than on-by-default: --api-capture/--auth-model drive a real
+# headless browser, which is meaningfully more resource-intensive than the
+# rest of this pipeline and would change every existing hunt's runtime and
+# network footprint if silently turned on. Set BB_BROWSER_RECON=1 to enable.
+# ============================================================
+if [ "${BB_BROWSER_RECON:-0}" = "1" ]; then
+    echo ""
+    log_info "Phase 2.5: Browser Intelligence (opt-in)"
+    if [ -z "$SCOPE_DOMAINS" ]; then
+        log_warn "No scope allowlist resolved (see Phase 1.5) — browser_recon.py requires --domain to send any request, skipping"
+    elif [ ! -s "$RECON_DIR/live/urls.txt" ]; then
+        log_warn "No live hosts from Phase 2 — skipping browser intelligence"
+    elif ! python3 -c "import playwright" 2>/dev/null; then
+        log_warn "Playwright not installed — skipping browser intelligence (pip install playwright && playwright install chromium)"
+    else
+        log_step "Running browser_recon.py (source maps, routes, auth model, hidden endpoints)..."
+        BROWSER_ARGS=(
+            --domain "$SCOPE_DOMAINS"
+            --source-maps --hidden-endpoints --route-extraction --auth-model --api-capture
+            --max-pages "${BB_BROWSER_MAX_PAGES:-10}"
+        )
+        [ -n "$SCOPE_EXCLUDE" ] && BROWSER_ARGS+=(--exclude-domain "$SCOPE_EXCLUDE")
+        if python3 "$(dirname "$0")/browser_recon.py" "$TARGET" --recon-dir "$RECON_DIR" "${BROWSER_ARGS[@]}" >/dev/null 2>"$RECON_DIR/browser_recon.err"; then
+            log_done "Browser intelligence written to $RECON_DIR/browser/"
+        else
+            log_warn "browser_recon.py exited non-zero — continuing without it (non-fatal, see $RECON_DIR/browser_recon.err)"
+        fi
+    fi
+fi
+
+# ============================================================
 # Phase 3: Port Scanning
 # ============================================================
 echo ""
 log_info "Phase 3: Port Scanning"
 
 if command -v nmap &>/dev/null; then
-    log_step "Running nmap (top 1000 ports) on $TARGET..."
-    nmap -sV --top-ports 1000 -T4 --open "$TARGET" \
-        -oN "$RECON_DIR/ports/nmap_results.txt" \
-        -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
-    log_done "Nmap scan complete"
+    # Port-scan the SAME scope-filtered host list Phase 2's httpx already
+    # used — never the raw $TARGET. Scanning $TARGET directly used to
+    # bypass Phase 1.5 entirely: a program scoping only *.target.com (apex
+    # explicitly excluded, a common real scoping rule) still got its bare
+    # apex port-scanned on every run, and list/cidr-mode targets got a
+    # nonsensical scan of a literal filename/CIDR string instead of the
+    # actual discovered hosts.
+    if [ -s "$RECON_DIR/subdomains/all.txt" ]; then
+        log_step "Running nmap (top 1000 ports) on $(wc -l < "$RECON_DIR/subdomains/all.txt" | tr -d ' ') scope-filtered host(s)..."
+        nmap -sV --top-ports 1000 -T4 --open -iL "$RECON_DIR/subdomains/all.txt" \
+            -oN "$RECON_DIR/ports/nmap_results.txt" \
+            -oG "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null || true
+        log_done "Nmap scan complete"
 
-    # Extract open ports (macOS compatible - no grep -P)
-    grep "open" "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null \
-        | sed -nE 's/.*[^0-9]([0-9]+)\/open.*/\1\/open/p' \
-        | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
-    log_done "Open ports: $(wc -l < "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || echo 0)"
+        # Extract open ports (macOS compatible - no grep -P)
+        grep "open" "$RECON_DIR/ports/nmap_greppable.txt" 2>/dev/null \
+            | sed -nE 's/.*[^0-9]([0-9]+)\/open.*/\1\/open/p' \
+            | sort -u > "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || true
+        log_done "Open ports: $(wc -l < "$RECON_DIR/ports/open_ports.txt" 2>/dev/null || echo 0)"
+    else
+        log_warn "No scope-filtered hosts to port-scan (subdomains/all.txt empty) — skipping nmap"
+    fi
 else
     log_warn "nmap not installed — skipping"
 fi

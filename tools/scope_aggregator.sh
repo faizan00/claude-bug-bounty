@@ -115,7 +115,15 @@ for entry in data or []:
         continue
     handle  = (entry.get("handle") or entry.get("company_handle") or entry.get("name") or "").lower()
     url     = (entry.get("url") or "").lower()
-    if program and program not in handle and program not in url:
+    # Exact match only. An unanchored substring match here ("acme" matching
+    # a handle of "acme-labs", or "target" matching an unrelated
+    # "my-target-corp") can silently merge a DIFFERENT program's scope into
+    # the output file -- which recon_engine.sh's list-mode then treats as
+    # pre-vetted and actively probes with zero further scope check. The URL
+    # form (https://hackerone.com/<handle>) is matched by its final path
+    # segment, not by substring-anywhere, for the same reason.
+    url_handle = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+    if program and program != handle and program != url_handle:
         continue
     targets = entry.get("targets") or {}
     if isinstance(targets, list):

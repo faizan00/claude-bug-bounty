@@ -224,7 +224,12 @@ class TestSpecificDriftRegression:
         assert len(manifest["skills"]) == 13
 
     def test_command_count_is_current(self, manifest):
-        assert len(manifest["commands"]) == 27
+        # 28, not 27: post-Phase-7 hardening added commands/graphql-audit.md,
+        # which CLAUDE.md had documented as a working /graphql-audit command
+        # (with usage syntax and everything) for a while despite the file
+        # never existing -- only skills/graphql-audit/SKILL.md did. Wired for
+        # real rather than left as a dead command reference.
+        assert len(manifest["commands"]) == 28
 
     @pytest.mark.parametrize("module_name", [
         "vuln_intelligence.py", "experiment_memory.py", "finding_state.py",

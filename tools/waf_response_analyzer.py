@@ -543,6 +543,26 @@ class ResponseClassifier:
         bb_len = int(bb.get("median_length") or 0)
         bb_vendor = bb.get("vendor")
 
+        # 0. No real HTTP response at all (connection refused, DNS failure,
+        #    TLS handshake failure, timeout -- curl/urllib report this as
+        #    status 0). This is not evidence of a bypass: nothing was ever
+        #    reached, so an all-signals-absent score of 0 would otherwise
+        #    fall through to "bypassed" below purely because a failed probe
+        #    has no WAF block body to match against. Never fabricate a
+        #    bypass verdict from the absence of a response.
+        if fp.status_code == 0:
+            return {
+                "verdict": "needs_review",
+                "score": 0,
+                "reason": "no HTTP response received (connection/timeout/TLS failure) — "
+                          "inconclusive, not evidence of a bypass or a block",
+                "status_code": fp.status_code,
+                "body_length": fp.body_length,
+                "block_baseline_length": bb_len,
+                "length_ratio": 0.0,
+                "waf_vendor": bb_vendor,
+            }
+
         signals: list[dict[str, Any]] = []
         score = 0
 

@@ -117,6 +117,65 @@ ARSENAL_TOOLS=(
 # `_have <tool>` — true when the binary is on PATH. Source this file from other
 # scripts to use it; safe under `set -e` because it returns 1 (no exit).
 _have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Shared scope gate for standalone recon-adjacent tools that fire directly
+# against a single target host (cve_scan.sh, takeover_scanner.sh,
+# cloud_recon.sh's --cf-bypass path). Reuses the canonical tools/scope_checker.py
+# instead of reimplementing scope logic — mirrors recon_engine.sh's Phase 1.5
+# pattern (same BB_SCOPE_DOMAINS/BB_SCOPE_EXCLUDE env vars, same fail-CLOSED
+# behavior on a scope_checker.py error).
+#
+# BB_SCOPE_DOMAINS unset => warn and allow. These tools are commonly invoked
+# standalone with a single already-decided target (or fed a list a human
+# already vetted), unlike recon_engine.sh which has a whole discovered host
+# list to filter — so there's no safe default allowlist to assume here the
+# way recon_engine.sh can default to "$TARGET,*.$TARGET". Set BB_SCOPE_DOMAINS
+# to turn the warning into a real, enforced gate.
+# ---------------------------------------------------------------------------
+_ext_arsenal_dir() { cd "$(dirname "${BASH_SOURCE[0]}")" && pwd; }
+
+# Usage: _scope_gate_asset "<hostname-or-url>"
+# Returns 1 (and prints an error) if BB_SCOPE_DOMAINS is set and the asset is
+# out of scope, or if scope_checker.py itself fails to run. Caller should
+# `_scope_gate_asset "$TARGET" || exit 1`.
+_scope_gate_asset() {
+  local asset="$1"
+  local domains="${BB_SCOPE_DOMAINS:-}"
+  if [ -z "$domains" ]; then
+    echo -e "\033[1;33m[!]\033[0m No BB_SCOPE_DOMAINS set — scope filter skipped for '$asset'. Set BB_SCOPE_DOMAINS to enforce (e.g. BB_SCOPE_DOMAINS='*.target.com,target.com')." >&2
+    return 0
+  fi
+  local args=(--domain "$domains")
+  [ -n "${BB_SCOPE_EXCLUDE:-}" ] && args+=(--exclude-domain "$BB_SCOPE_EXCLUDE")
+  if ! python3 "$(_ext_arsenal_dir)/scope_checker.py" "$asset" "${args[@]}" >/dev/null 2>&1; then
+    echo -e "\033[0;31m[-]\033[0m '$asset' is OUT OF SCOPE per BB_SCOPE_DOMAINS='$domains' (or scope_checker.py failed) — aborting rather than probing an unverified target." >&2
+    return 1
+  fi
+  return 0
+}
+
+# Usage: _scope_gate_filter_file "<input-file>" "<output-file>"
+# Writes only in-scope lines from input to output. If BB_SCOPE_DOMAINS is
+# unset, copies input to output unfiltered (with a warning). Fails CLOSED
+# (returns 1, does not write output) if BB_SCOPE_DOMAINS is set and
+# scope_checker.py errors — never falls through to scanning an unfiltered list.
+_scope_gate_filter_file() {
+  local infile="$1" outfile="$2"
+  local domains="${BB_SCOPE_DOMAINS:-}"
+  if [ -z "$domains" ]; then
+    echo -e "\033[1;33m[!]\033[0m No BB_SCOPE_DOMAINS set — scope filter skipped, using '$infile' as-is. Set BB_SCOPE_DOMAINS to enforce." >&2
+    cp "$infile" "$outfile"
+    return 0
+  fi
+  local args=(--input-file "$infile" --output "$outfile" --domain "$domains")
+  [ -n "${BB_SCOPE_EXCLUDE:-}" ] && args+=(--exclude-domain "$BB_SCOPE_EXCLUDE")
+  if ! python3 "$(_ext_arsenal_dir)/scope_checker.py" "${args[@]}" >/dev/null 2>&1; then
+    echo -e "\033[0;31m[-]\033[0m scope_checker.py failed filtering '$infile' — aborting rather than scanning an unfiltered list." >&2
+    return 1
+  fi
+  return 0
+}
 export -f _have 2>/dev/null || true
 
 _print_status() {

@@ -34,6 +34,14 @@ done
 
 [ -z "$INPUT" ] || [ ! -s "$INPUT" ] && { err "subdomains file required and non-empty"; exit 2; }
 
+# Scope gate — reuses the canonical tools/scope_checker.py (via
+# external_arsenal.sh's shared helpers). Every strategy below (dnsReaper,
+# subjack, or the curl-based fingerprint fallback) makes a real request to
+# every line in this file, so filter it before any of them run.
+SCOPE_FILTERED_INPUT="$(mktemp)"
+_scope_gate_filter_file "$INPUT" "$SCOPE_FILTERED_INPUT" || exit 1
+INPUT="$SCOPE_FILTERED_INPUT"
+
 OUT_DIR="${TAKEOVER_OUT_DIR:-$(pwd)/findings/takeover/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$OUT_DIR"
 
