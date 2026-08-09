@@ -226,6 +226,90 @@ class TestRefundPattern:
         assert result["violations"][0]["type"] == "refund_violation"
 
 
+class TestSessionCheckpoint:
+    """Part 3 (memory/object_model.py's make_checkpoint()/save_session())
+    has had zero producers since Phase 6 -- establish()/probe() must be
+    the first thing that ever writes one, automatically (not opt-in),
+    since an optional checkpoint nobody remembers to request is exactly
+    how this mechanism stayed dormant in the first place."""
+
+    def test_establish_writes_a_real_checkpoint(self, sessions, isolated_leads, tmp_path):
+        admin, _ = sessions
+        target = "cp.local"
+        memory_dir = tmp_path / "hunt-memory"
+        blp.establish(target, "invite_flow", admin, "42", str(memory_dir))
+
+        path = blp.checkpoint_path(str(memory_dir), target, "invite_flow")
+        assert path.exists()
+        cp = json.loads(path.read_text())
+        assert cp["version"] == 1
+        assert cp["workflow_state"]["last_action"] == "establish"
+        assert cp["workflow_state"]["pattern"] == "invite_flow"
+        assert cp["fingerprinted_session_reference"] == admin.session_id()
+        # entity:Organization:42 is what admin's own establish() call
+        # touched (the org side of the CAN_INVITE grant).
+        assert "entity:Organization:42" in cp["reachable_objects"]
+
+    def test_probe_updates_the_checkpoint_with_the_real_outcome(
+        self, demo_server, sessions, isolated_leads, tmp_path
+    ):
+        admin, attacker = sessions
+        target = "cp2.local"
+        memory_dir = tmp_path / "hunt-memory"
+        blp.establish(target, "invite_flow", admin, "42", str(memory_dir))
+
+        checker = ScopeChecker(["localhost"])
+        runner = blp.ProbeRunner(target, checker, attacker, memory_dir=str(memory_dir), allow_mutate=True)
+        runner.probe("invite_flow", "POST", f"{demo_server}/api/orgs/42/invite",
+                      "42", "newuser@x.com", data='{"email":"newuser@x.com"}')
+
+        cp = json.loads(blp.checkpoint_path(str(memory_dir), target, "invite_flow").read_text())
+        assert cp["workflow_state"]["last_action"] == "probe"
+        assert cp["workflow_state"]["last_status"] == 200
+        assert cp["workflow_state"]["violation_detected"] is True
+        assert cp["fingerprinted_session_reference"] == attacker.session_id()
+        assert "object:User:newuser@x.com" in cp["reachable_objects"]
+
+    def test_no_raw_credentials_ever_reach_the_checkpoint_file(self, sessions, isolated_leads, tmp_path):
+        admin, _ = sessions
+        memory_dir = tmp_path / "hunt-memory"
+        blp.establish("cp3.local", "invite_flow", admin, "42", str(memory_dir))
+        raw = blp.checkpoint_path(str(memory_dir), "cp3.local", "invite_flow").read_text()
+        assert "token-admin" not in raw
+
+    def test_reachable_refs_ignores_a_different_actor(self):
+        actor = "entity:User:aaa"
+        other = "entity:User:bbb"
+        observations = [
+            {"subject_id": other, "object_id": "object:Doc:1", "outcome_status": 200, "metadata": {}},
+            {"subject_id": actor, "object_id": "object:Doc:2", "outcome_status": 200, "metadata": {}},
+        ]
+        objects, caps = blp._reachable_refs(observations, actor)
+        assert objects == ["object:Doc:2"]
+        assert caps == []
+
+    def test_reachable_refs_excludes_failed_requests(self):
+        actor = "entity:User:aaa"
+        observations = [
+            {"subject_id": actor, "object_id": "object:Doc:1", "outcome_status": 403, "metadata": {}},
+            {"subject_id": actor, "object_id": "object:Doc:2", "outcome_status": 200, "metadata": {}},
+        ]
+        objects, _ = blp._reachable_refs(observations, actor)
+        assert objects == ["object:Doc:2"]
+
+    def test_reachable_refs_matches_metadata_performed_by_too(self):
+        """membership_granted's subject_id is the ORG, not the actor -- the
+        actor only appears in metadata.performed_by (see PATTERN_SPECS).
+        _reachable_refs() must still find it there."""
+        actor = "entity:User:aaa"
+        observations = [
+            {"subject_id": "entity:Organization:42", "object_id": "object:User:invited",
+             "outcome_status": 200, "metadata": {"performed_by": actor}},
+        ]
+        objects, _ = blp._reachable_refs(observations, actor)
+        assert objects == ["object:User:invited"]
+
+
 class TestSafety:
     def test_establish_dry_run_records_nothing(self, sessions, tmp_path):
         admin, _ = sessions

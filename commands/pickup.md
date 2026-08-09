@@ -33,9 +33,30 @@ Pick up where you left off on a target.
    re-run `build-plan`, which would discard this state and re-derive a fresh queue.
    If `hunt-plan.json` doesn't exist (no `/autopilot` session ran, or recon was the
    only thing done last time), fall through to step 4 below.
-4. Otherwise, lists untested endpoints from last recon
-5. Suggests techniques based on tech stack + pattern DB, and flags any technique already in `hunt-memory/failed_patterns.jsonl` for this target as a don't-retry
-6. Asks: continue hunting or re-run recon?
+4. **If `hunt-memory/object_model/checkpoints/<target>__*.json` files exist, show
+   each one's `workflow_state`** — these are `tools/business_logic_probe.py`'s Part 3
+   checkpoints, written automatically after every real `--establish`/`--probe` call
+   (never opt-in). One file per pattern under test:
+   ```bash
+   python3 -c "
+   import glob, json
+   for f in sorted(glob.glob('hunt-memory/object_model/checkpoints/<target>__*.json')):
+       cp = json.load(open(f))
+       ws = cp['workflow_state']
+       print(f\"[{ws.get('pattern')}] last_action={ws.get('last_action')} \"
+             f\"org_ref={ws.get('org_ref')} violation_detected={ws.get('violation_detected')}\")
+   "
+   ```
+   A checkpoint showing `last_action=establish` with no matching `--probe` run yet
+   means the relationship precondition is on record but the actual test was never
+   fired — resume by running `--probe` for that pattern, not `--establish` again
+   (re-establishing is harmless but redundant; the precondition already holds).
+   `violation_detected=True` on a `probe` checkpoint means a candidate is already
+   sitting in the lead board from before the interruption — check there first
+   rather than re-probing.
+5. Otherwise, lists untested endpoints from last recon
+6. Suggests techniques based on tech stack + pattern DB, and flags any technique already in `hunt-memory/failed_patterns.jsonl` for this target as a don't-retry
+7. Asks: continue hunting or re-run recon?
 
 ## Usage
 
@@ -59,6 +80,10 @@ Resumable Plan (recon/target.com/hunt-plan.json):
   [IN_PROGRESS] atk-a1b2c3  idor  /api/v2/users/{id}/export   <- killed mid-test, resume here first
   [READY]       atk-d4e5f6  ssrf  /api/v2/webhooks/register
   [READY]       atk-a7b8c9  idor  /api/v2/users/{id}/share
+
+Business-Logic Checkpoints (hunt-memory/object_model/checkpoints/):
+  [invite_flow] last_action=establish org_ref=42   <- precondition on record, --probe not run yet
+  [refund]      last_action=probe org_ref=17 violation_detected=True   <- check lead board first
 
 Untested Surface (no hunt-plan.json — shown only when the above is empty):
   3 endpoints from last recon:

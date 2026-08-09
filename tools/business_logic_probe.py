@@ -90,6 +90,7 @@ from memory.identity import entity_id, object_id  # noqa: E402
 from memory.object_model import (  # noqa: E402
     ObservationStore, make_observation, load_logic_patterns,
     detect_logic_pattern_violations, LogicPatternLoadError,
+    make_checkpoint, save_session,
 )
 
 import requests  # noqa: E402
@@ -224,7 +225,63 @@ def establish(target: str, pattern_id: str, holder_session: AuthSession, org_ref
         metadata={"target": target, "tool": "business_logic_probe", "pattern_id": pattern_id},
     )
     ObservationStore(Path(memory_dir) / "object_model" / f"{target}.jsonl").record(obs)
+    _write_checkpoint(target, pattern_id, memory_dir, holder_session,
+                       {"pattern": pattern_id, "org_ref": org_ref, "last_action": "establish",
+                        "last_event": spec.establish_event})
     return obs
+
+
+def checkpoint_path(memory_dir: str, target: str, pattern_id: str) -> Path:
+    """One checkpoint per (target, pattern) -- matches this tool's own
+    invocation granularity (a hunter tests one pattern against one target
+    at a time). Separate from memory/object_model/<target>.jsonl (the
+    permanent evidence log this checkpoint is DERIVED from, never a
+    replacement for it)."""
+    return Path(memory_dir) / "object_model" / "checkpoints" / f"{target}__{pattern_id}.json"
+
+
+def _reachable_refs(observations: list[dict], actor_ref: str) -> tuple[list[str], list[str]]:
+    """What `actor_ref` has actually, successfully (2xx) touched so far,
+    per the real observation history -- not the full relationship graph
+    (that's compute_relationships()'s job), just a cheap, honest "where
+    has this session gotten to" snapshot for --pickup to show without
+    replaying the whole log itself. Matches on subject_id OR
+    metadata.performed_by, since some events (membership_granted) record
+    the acting user only in metadata (see PATTERN_SPECS)."""
+    objects, capabilities = set(), set()
+    for obs in observations:
+        if obs.get("subject_id") != actor_ref and (obs.get("metadata") or {}).get("performed_by") != actor_ref:
+            continue
+        status = obs.get("outcome_status")
+        if status is not None and not (200 <= status < 300):
+            continue
+        obj = obs.get("object_id") or ""
+        if obj.startswith("capability:"):
+            capabilities.add(obj)
+        elif obj:
+            objects.add(obj)
+    return sorted(objects), sorted(capabilities)
+
+
+def _write_checkpoint(target: str, pattern_id: str, memory_dir: str, session: AuthSession,
+                       workflow_state: dict) -> str:
+    """Save a Part 3 stateful-session checkpoint after every real
+    --establish/--probe action -- unconditional, not opt-in, for the same
+    reason ObservationStore recording is unconditional: an optional
+    checkpoint nobody remembers to request is exactly how this mechanism
+    stayed a dormant no-op since Phase 6. Cheap (one JSON write, no
+    network I/O), so there's no cost to making it automatic."""
+    actor_ref = entity_id("User", session.session_id())
+    store = ObservationStore(Path(memory_dir) / "object_model" / f"{target}.jsonl")
+    objects, capabilities = _reachable_refs(store.all(), actor_ref)
+    cp = make_checkpoint(
+        workflow_state=workflow_state,
+        reachable_objects=objects,
+        reachable_capabilities=capabilities,
+        auth_session=session,
+        metadata={"target": target, "tool": "business_logic_probe"},
+    )
+    return save_session(cp, checkpoint_path(memory_dir, target, pattern_id))
 
 
 class ProbeRunner:
@@ -293,6 +350,12 @@ class ProbeRunner:
         for c in new_candidates:
             lead_board.add(self.target, spec_skill(pattern_id), url,
                             signal=f"business_logic_probe:{pattern_id}", priority="high")
+
+        _write_checkpoint(self.target, pattern_id, self.memory_dir, self.acting_session, {
+            "pattern": pattern_id, "org_ref": org_ref, "last_action": "probe",
+            "last_url": url, "last_status": result["status"],
+            "violation_detected": bool(new_candidates),
+        })
 
         return {"status": result["status"], "body": result["body"], "observation": obs,
                 "violations": new_candidates}
