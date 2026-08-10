@@ -47,6 +47,20 @@ class _OrdersHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(body.encode())
+        elif self.path.startswith("/api/expiring/"):
+            # Simulates account B's session having expired/been revoked:
+            # account A still gets real data, account B gets 401 no matter
+            # what -- never a shared error page (which IS meaningfully
+            # equal to nothing), always A=200/B=401 specifically.
+            if "token-account-a" in auth:
+                body = json.dumps({"order_id": self.path.rsplit("/", 1)[-1], "owner": "alice"})
+                self.send_response(200)
+            else:
+                body = json.dumps({"error": "session expired"})
+                self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body.encode())
         elif self.path == "/api/public/catalog":
             # Legitimately shared data -- identical to everyone on purpose,
             # not a per-object ownership case (this URL isn't object-scoped
@@ -244,3 +258,103 @@ class TestSafety:
         assert result["error"] is not None
         assert "out-of-scope" in result["error"] or "scope" in result["error"].lower()
         assert not runner.findings
+
+
+class TestSessionExpiryDetection:
+    """Phase 4 (failure/recovery): a session that expires/gets revoked
+    partway through a multi-URL --auto run must never silently become
+    "no IDOR found" with no signal at all -- missing evidence (a broken
+    session) is not the same claim as negative evidence (a well-protected
+    endpoint), and this codebase's discipline forbids treating either one
+    as if it were the other."""
+
+    def test_majority_non_2xx_for_one_session_warns(self):
+        results = (
+            [{"url": f"/a/{i}", "status_a": 200, "status_b": 200} for i in range(2)]
+            + [{"url": f"/a/{i}", "status_a": 200, "status_b": 401} for i in range(2, 6)]
+        )
+        warnings = idd.detect_possible_session_expiry(results)
+        assert len(warnings) == 1
+        assert "Session B" in warnings[0]
+        assert "4/6" in warnings[0]
+
+    def test_minority_non_2xx_never_warns(self):
+        # A couple of individually-protected resources is expected and
+        # normal -- must not be confused with a broken session.
+        results = (
+            [{"url": f"/a/{i}", "status_a": 200, "status_b": 200} for i in range(8)]
+            + [{"url": f"/a/{i}", "status_a": 200, "status_b": 403} for i in range(8, 10)]
+        )
+        assert idd.detect_possible_session_expiry(results) == []
+
+    def test_empty_results_never_warns(self):
+        assert idd.detect_possible_session_expiry([]) == []
+
+    def test_below_min_sample_never_warns_even_at_100_percent_failure(self):
+        # A single --url test hitting one genuinely protected resource
+        # must not produce a session-expiry warning -- there's no
+        # aggregate PATTERN in a sample of 1-2, just one status code the
+        # hunter already sees directly.
+        results = [{"url": "/a/1", "status_a": 200, "status_b": 401}]
+        assert idd.detect_possible_session_expiry(results) == []
+        results2 = [{"url": f"/a/{i}", "status_a": 200, "status_b": 401} for i in range(2)]
+        assert idd.detect_possible_session_expiry(results2) == []
+
+    def test_error_only_results_never_warn_key_error(self):
+        # test_url() sets result["error"] and returns early WITHOUT
+        # status_a/status_b on a ScopeViolation/RequestCapExceeded/network
+        # error -- must not KeyError or misclassify these as a session
+        # problem (they're a completely different failure class).
+        results = [{"url": "/a/1", "matched": False, "reason": None, "error": "out-of-scope"}]
+        assert idd.detect_possible_session_expiry(results) == []
+
+    def test_both_sessions_degrading_produces_two_warnings(self):
+        results = [{"url": f"/a/{i}", "status_a": 401, "status_b": 403} for i in range(4)]
+        warnings = idd.detect_possible_session_expiry(results)
+        assert len(warnings) == 2
+        assert any("Session A" in w for w in warnings)
+        assert any("Session B" in w for w in warnings)
+
+    def test_real_run_against_a_degrading_endpoint_surfaces_the_warning(
+        self, demo_server, two_sessions, isolated_leads, tmp_path
+    ):
+        # End-to-end against the real local server: account B's session is
+        # rejected (401) for every /api/expiring/* URL, exactly the
+        # "session expired mid-run" scenario -- must neither fabricate an
+        # IDOR match (both must be 2xx) NOR stay silent about the pattern.
+        session_a, session_b = two_sessions
+        runner = _runner("demo.local", session_a, session_b, tmp_path / "hunt-memory")
+        urls = [f"{demo_server}/api/expiring/{i}" for i in range(4)]
+        results = runner.run(urls)
+        assert not runner.findings  # never a fabricated match
+        warnings = idd.detect_possible_session_expiry(results)
+        assert len(warnings) == 1
+        assert "Session B" in warnings[0]
+        assert "4/4" in warnings[0]
+
+    def test_json_output_shape_carries_warnings_without_losing_results(
+        self, demo_server, two_sessions, isolated_leads, tmp_path, capsys
+    ):
+        session_a, session_b = two_sessions
+        rc = idd.main([
+            "demo.local", "--url", f"{demo_server}/api/expiring/1",
+            "--session-a-file", str(_write_session(tmp_path, "sa.json", "token-account-a")),
+            "--session-b-file", str(_write_session(tmp_path, "sb.json", "token-account-b")),
+            "--domain", "localhost", "--i-understand", "--json",
+            "--memory-dir", str(tmp_path / "hunt-memory"),
+        ])
+        assert rc == 0
+        # main() always prints an informational banner (target/session
+        # summary) before the JSON blob, even in --json mode -- pre-existing
+        # behavior unrelated to this fix; extract just the JSON tail.
+        raw = capsys.readouterr().out
+        out = json.loads(raw[raw.index("{"):])
+        assert "results" in out and "warnings" in out
+        assert len(out["results"]) == 1
+        assert out["warnings"] == []  # a single 401 out of 1 -- not a MAJORITY, correctly no warning
+
+
+def _write_session(tmp_path, name, token):
+    p = tmp_path / name
+    p.write_text(json.dumps({"bearer": token}))
+    return p

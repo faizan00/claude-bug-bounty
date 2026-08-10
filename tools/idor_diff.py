@@ -288,6 +288,53 @@ class IdorDiffRunner:
         return [self.test_url(u) for u in urls]
 
 
+# A session (cookie/bearer token) that expires or gets revoked PARTWAY
+# through a multi-URL --auto run doesn't crash anything -- is_meaningfully_
+# equal()'s "both must be 2xx" gate already prevents it from ever
+# fabricating a false-positive IDOR match (a shared 401/403 error page is
+# never "meaningfully equal"). But nothing previously told the hunter that
+# a large chunk of the run silently degraded into testing an expired
+# session instead of the target -- Phase 4 (failure/recovery)'s "never
+# treat missing evidence as positive evidence" cuts both ways: missing
+# evidence (a broken session) must not silently become NEGATIVE evidence
+# either ("no IDOR found" when actually "nothing was really tested").
+# Majority (not "any"), since occasional legitimate 403s on individual
+# resources are expected and not a session problem.
+_SESSION_EXPIRY_WARNING_THRESHOLD = 0.5
+# Below this many observations for one session, "majority failed" isn't a
+# real aggregate PATTERN yet -- a single --url test hitting one genuinely
+# protected resource would otherwise warn on n=1 every time, which is just
+# noise the hunter already sees directly in that one status code.
+_SESSION_EXPIRY_MIN_SAMPLE = 3
+
+
+def detect_possible_session_expiry(results: list[dict]) -> list[str]:
+    """Aggregate signal across a whole run: a session returning non-2xx for
+    a MAJORITY of its own requests (out of a real sample, not one or two
+    URLs) likely expired/was revoked partway through, not that every
+    individual URL is genuinely protected. Purely a warning surfaced to
+    the hunter -- never suppresses, alters, or reinterprets any individual
+    result, and never claims certainty (an over-broad --auto URL list
+    could ALSO produce this exact pattern; this doesn't try to tell the
+    two apart, same "not proof on its own" discipline print_result()
+    already applies to a real match)."""
+    warnings = []
+    for label, key in (("A", "status_a"), ("B", "status_b")):
+        statuses = [r[key] for r in results if key in r]
+        if len(statuses) < _SESSION_EXPIRY_MIN_SAMPLE:
+            continue
+        non_2xx = sum(1 for s in statuses if not (200 <= s < 300))
+        if non_2xx / len(statuses) >= _SESSION_EXPIRY_WARNING_THRESHOLD:
+            warnings.append(
+                f"Session {label}: {non_2xx}/{len(statuses)} requests returned a non-2xx "
+                f"status -- possible session expiry/revocation partway through this run "
+                f"(or an over-broad URL list). Results before the failures started may "
+                f"still be valid; treat later ones with caution and consider re-running "
+                f"with a fresh session."
+            )
+    return warnings
+
+
 def print_result(r: dict) -> None:
     if r["error"]:
         print(f"  [ERROR] {r['url']} — {r['error']}")
@@ -379,12 +426,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Testing {len(urls)} URL(s)...\n")
 
     results = runner.run(urls)
+    session_warnings = detect_possible_session_expiry(results)
 
     if args.json:
-        print(json.dumps(results, indent=2))
+        print(json.dumps({"results": results, "warnings": session_warnings}, indent=2))
     else:
         for r in results:
             print_result(r)
+        for w in session_warnings:
+            print(f"\n  [WARN] {w}")
         print(f"\n{'='*60}")
         print(f"  {len(runner.findings)} candidate IDOR finding(s) out of {len(urls)} URL(s) tested")
         print(f"{'='*60}")
