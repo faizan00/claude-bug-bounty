@@ -666,7 +666,7 @@ Examples:
     log("info", f"Tools: {len(installed)}/{len(installed)+len(missing)} installed")
     if missing:
         log("warn", f"Missing tools: {', '.join(missing)}")
-        log("warn", "Run: bash tools/install_tools.sh")
+        log("warn", "Run: bash install_tools.sh")
 
     # Target selection only
     if args.select_targets:
