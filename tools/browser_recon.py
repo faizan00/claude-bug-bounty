@@ -113,6 +113,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urljoin, urlparse
 
@@ -137,6 +138,18 @@ except ImportError:  # pragma: no cover - exercised by CLI smoke checks
 DEFAULT_TIMEOUT = 15.0
 DEFAULT_MAX_REQUESTS = 200
 DEFAULT_RECON_RPS = 5.0
+# max_requests alone bounds REQUEST COUNT, not wall-clock time: at the
+# default test_rps=1.0 (memory/audit_log.py's RateLimiter), 200 requests
+# each hitting the full 15s DEFAULT_TIMEOUT could legitimately run for
+# 3000s (50 minutes) before max_requests ever triggers -- no code anywhere
+# stopped a single Fetcher instance from running indefinitely on wall-clock
+# time alone. Default is double rules/hunting.md Rule 5's 5-minute single-
+# technique window (memory/experiment_memory.py's should_stop() default
+# minute_limit=5): a Fetcher instance often spans one whole CLI invocation
+# (idor_diff.py --auto testing many candidate URLs, for example), a
+# legitimately broader scope than one manual technique attempt, but this
+# must still be a real, hard, code-enforced cap, not just a suggestion.
+DEFAULT_MAX_WALL_CLOCK_SECONDS = 600.0
 
 
 # ─── errors ─────────────────────────────────────────────────────────────────
@@ -160,6 +173,14 @@ class RequestBlocked(BrowserReconError):
 
 class RequestCapExceeded(BrowserReconError):
     """Raised when a run hits its global --max-requests cap."""
+
+
+class WallClockBudgetExceeded(BrowserReconError):
+    """Raised when a run hits its global --max-wall-clock-seconds budget.
+    Complements RequestCapExceeded: max_requests bounds request COUNT,
+    this bounds elapsed TIME -- a slow/hanging target can burn the full
+    per-request timeout on every single request without ever tripping the
+    count-based cap."""
 
 
 class BrowserUnavailable(BrowserReconError):
@@ -205,9 +226,9 @@ def require_playwright():
 class Fetcher:
     """Every outbound HTTP request in this module goes through here.
 
-    Order per request: global request cap -> scope check -> circuit breaker
-    -> safe-method policy -> rate limiter wait -> the request -> guard
-    feedback -> audit log entry (if configured).
+    Order per request: global request cap -> wall-clock budget -> scope
+    check -> circuit breaker -> safe-method policy -> rate limiter wait ->
+    the request -> guard feedback -> audit log entry (if configured).
     """
 
     def __init__(
@@ -218,6 +239,7 @@ class Fetcher:
         recon_rps: float = DEFAULT_RECON_RPS,
         timeout: float = DEFAULT_TIMEOUT,
         max_requests: int = DEFAULT_MAX_REQUESTS,
+        max_wall_clock_seconds: float = DEFAULT_MAX_WALL_CLOCK_SECONDS,
         audit_log: AuditLog | None = None,
         guard: AutopilotGuard | None = None,
         limiter: RateLimiter | None = None,
@@ -227,24 +249,34 @@ class Fetcher:
         self.no_mutate = no_mutate
         self.timeout = timeout
         self.max_requests = max_requests
+        self.max_wall_clock_seconds = max_wall_clock_seconds
         self.audit_log = audit_log
         self.guard = guard if guard is not None else AutopilotGuard(safe_methods_only=no_mutate)
         self.limiter = limiter if limiter is not None else RateLimiter(recon_rps=recon_rps)
         self.session = session if session is not None else requests.Session()
         self.request_count = 0
+        self._start_time = time.monotonic()
 
     def get(self, url: str) -> requests.Response:
         return self.request("GET", url)
 
     def _preflight(self, method: str, url: str) -> str:
-        """Scope + request cap + circuit-breaker + safe-method checks, shared
-        by request() and check(). Does not touch the rate limiter or the
-        request counter — callers do that after a successful preflight, so
-        check() (no actual I/O) and request() (real I/O) both pace/count
-        correctly relative to each other on the same Fetcher instance."""
+        """Scope + request cap + wall-clock budget + circuit-breaker +
+        safe-method checks, shared by request() and check(). Does not
+        touch the rate limiter or the request counter — callers do that
+        after a successful preflight, so check() (no actual I/O) and
+        request() (real I/O) both pace/count correctly relative to each
+        other on the same Fetcher instance."""
         if self.request_count >= self.max_requests:
             raise RequestCapExceeded(
                 f"global request cap ({self.max_requests}) reached — refusing to fetch {url}"
+            )
+
+        elapsed = time.monotonic() - self._start_time
+        if elapsed >= self.max_wall_clock_seconds:
+            raise WallClockBudgetExceeded(
+                f"wall-clock budget ({self.max_wall_clock_seconds}s) exceeded "
+                f"({elapsed:.1f}s elapsed) — refusing to fetch {url}"
             )
 
         if not self.scope_checker.is_in_scope(url):
@@ -1397,6 +1429,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recon-rps", type=float, default=DEFAULT_RECON_RPS)
     parser.add_argument("--max-requests", type=int, default=DEFAULT_MAX_REQUESTS)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--max-wall-clock-seconds", type=float, default=DEFAULT_MAX_WALL_CLOCK_SECONDS,
+                         help="Hard cap on total elapsed time for this run's Fetcher "
+                              f"(default: {DEFAULT_MAX_WALL_CLOCK_SECONDS:.0f}s) — bounds a slow/"
+                              "hanging target from running indefinitely even under --max-requests")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON")
     add_auth_cli_args(parser)
     args = parser.parse_args(argv)
@@ -1436,6 +1472,7 @@ def main(argv: list[str] | None = None) -> int:
             recon_rps=args.recon_rps,
             timeout=args.timeout,
             max_requests=args.max_requests,
+            max_wall_clock_seconds=args.max_wall_clock_seconds,
         )
 
     if args.source_maps:
