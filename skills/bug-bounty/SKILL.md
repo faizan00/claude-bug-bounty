@@ -319,6 +319,13 @@ Good prompt shapes:
 
 # PHASE 1: RECON
 
+> **Run `/recon target.com` first** (`tools/recon_engine.sh`) — it already automates
+> subdomain enum + live-host probing + nmap + URL collection + JS analysis + ffuf
+> directory fuzzing + param discovery + config-exposure checks + CI/CD scan, scope-gated
+> end to end, and outputs to `recon/<target>/`. The raw commands below are reference
+> material for going manual on one specific step or filling a gap the script doesn't
+> cover — not a replacement pipeline to run by hand.
+
 ## Standard Recon Pipeline
 ```bash
 # Step 1: Subdomains
@@ -1591,19 +1598,19 @@ When payout is being downgraded, use these counters:
 
 ---
 
-# INSTALLATION (Claude Code Skill)
+# INSTALLATION
 
-To use this as a Claude Code skill, copy this file to your skills directory:
+This repo ships 13 skills (this file is one of them, at `skills/bug-bounty/SKILL.md`), 28
+commands, and 14 agents — not a single-file skill, so a plain `git clone` + symlink into a
+skill directory doesn't fit its layout. Use the repo's own installer instead:
 
 ```bash
-# Option A: Clone the repo and link the skill
-git clone https://github.com/shuvonsec/claude-bug-bounty.git ~/.claude/skills/bug-bounty
-ln -s ~/.claude/skills/bug-bounty/SKILL.md ~/.claude/skills/bug-bounty/SKILL.md
-
-# Option B: Direct copy
-mkdir -p ~/.claude/skills/bug-bounty
-curl -s https://raw.githubusercontent.com/shuvonsec/claude-bug-bounty/main/SKILL.md \
-  -o ~/.claude/skills/bug-bounty/SKILL.md
+git clone <this-repo-url>
+cd claude-bug-bounty
+chmod +x install.sh && ./install.sh
 ```
 
-Then in Claude Code, this skill loads automatically when you ask about bug bounty, recon, or vulnerability hunting.
+`install.sh` supports multiple harnesses (`--agent claude|opencode|pi|codex|agents|standalone|all`,
+`--global`/`--project`) — see `./install.sh --help` or `CLAUDE.md`'s "Install Skills" section.
+Once installed, this skill loads automatically when you ask about bug bounty, recon, or
+vulnerability hunting.

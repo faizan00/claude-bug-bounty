@@ -7,6 +7,13 @@ description: Web2 recon pipeline — subdomain enumeration (subfinder, Chaos API
 
 Full asset discovery from nothing to a prioritized URL list ready for hunting.
 
+> **`/recon target.com` (`tools/recon_engine.sh`) already automates this entire pipeline**
+> — subdomain enum, live-host probing, nmap, URL collection, JS analysis, ffuf directory
+> fuzzing, param discovery, config-exposure checks, and CI/CD scan, all scope-gated and
+> writing to `recon/<target>/`. Run that first. Everything below is reference material —
+> for going manual on one step, understanding what the script is doing, or covering a
+> gap it doesn't — not a by-hand replacement for it.
+
 ---
 
 ## SETUP (one-time)
