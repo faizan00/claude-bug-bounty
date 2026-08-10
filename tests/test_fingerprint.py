@@ -390,6 +390,31 @@ class TestSyncTechStack:
         assert "manual-tag" in profile["tech_stack"]
         assert "nextjs" in profile["tech_stack"]
 
+    def test_crash_mid_write_never_corrupts_the_prior_profile(self, tmp_path, monkeypatch):
+        # Phase 5 (state recovery): this is a read-modify-write of the
+        # target's WHOLE profile (tech_stack history, tested_endpoints,
+        # hunt_sessions) -- a crash mid-write must never lose it all just
+        # because this one sync was interrupted.
+        mem_dir = tmp_path / "hunt-memory"
+        (mem_dir / "targets").mkdir(parents=True)
+        profile_path = mem_dir / "targets" / "t.example.json"
+        profile_path.write_text(json.dumps({
+            "target": "t.example", "first_hunted": "2026-01-01T00:00:00Z",
+            "last_hunted": "2026-01-01T00:00:00Z", "schema_version": 1,
+            "tech_stack": ["manual-tag"], "hunt_sessions": 3,
+        }))
+        original_bytes = profile_path.read_bytes()
+
+        import memory.atomic_write as aw
+        monkeypatch.setattr(aw.os, "replace", lambda *a, **kw: (_ for _ in ()).throw(OSError("simulated crash")))
+        with pytest.raises(OSError, match="simulated crash"):
+            fp.sync_tech_stack("t.example", str(mem_dir), {"framework": "django"})
+
+        assert profile_path.read_bytes() == original_bytes
+        restored = json.loads(profile_path.read_text())
+        assert restored["hunt_sessions"] == 3
+        assert restored["tech_stack"] == ["manual-tag"]
+
 
 # ─── tech_attack_matrix.json weights reach priority_score() ───────────────
 
@@ -525,6 +550,28 @@ class TestSaveTechAttackMatrixCache:
         path = tmp_path / "nested" / "dir" / "cache.json"
         fp.save_tech_attack_matrix_cache({}, str(path))
         assert path.exists()
+
+    def test_crash_mid_write_never_corrupts_prior_cached_cves(self, tmp_path, monkeypatch):
+        # Phase 5: tools/learn.py always passes the FULL accumulated cache
+        # (existing entries + one new tag) -- a crash mid-write must not
+        # lose every previously-cached CVE lookup just because this one
+        # save was interrupted (each entry only exists after a real,
+        # opt-in network fetch -- losing it forces a real re-fetch, not
+        # free to regenerate).
+        path = tmp_path / "cache.json"
+        original = {"nextjs": {"version_ranges": [{"range": "==14.0.1", "vulns": [
+            {"class": "misconfig", "weight": 90, "cve": "CVE-2024-1234", "citation": "x"}]}]}}
+        fp.save_tech_attack_matrix_cache(original, str(path))
+        original_bytes = path.read_bytes()
+
+        import memory.atomic_write as aw
+        monkeypatch.setattr(aw.os, "replace", lambda *a, **kw: (_ for _ in ()).throw(OSError("simulated crash")))
+        updated = dict(original, django={"version_ranges": []})
+        with pytest.raises(OSError, match="simulated crash"):
+            fp.save_tech_attack_matrix_cache(updated, str(path))
+
+        assert path.read_bytes() == original_bytes
+        assert fp.load_tech_attack_matrix(str(path)) == original
 
 
 class TestLiveCveLookupCli:

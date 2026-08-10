@@ -120,6 +120,7 @@ if _REPO not in sys.path:
 from tools.recon_adapter import ReconAdapter  # noqa: E402
 from tools.waf_response_analyzer import WAFSignatureDB  # noqa: E402
 from memory.schemas import CURRENT_SCHEMA_VERSION, validate_target_profile  # noqa: E402
+from memory.atomic_write import atomic_write_text  # noqa: E402
 
 DEFAULT_MATRIX_PATH = str(Path(__file__).resolve().parent / "tech_attack_matrix.json")
 # Phase 5, Part D: where tools/learn.py's opt-in live NVD/GitHub-Advisory
@@ -517,12 +518,13 @@ def load_tech_attack_matrix(path: str = DEFAULT_MATRIX_PATH) -> dict:
 
 
 def save_tech_attack_matrix_cache(matrix: dict, path: str = DEFAULT_LIVE_CVE_CACHE_PATH) -> None:
-    """Pure JSON write — no network. Symmetric with load_tech_attack_matrix()
-    for DEFAULT_LIVE_CVE_CACHE_PATH; tools/learn.py calls this after an
-    opt-in live fetch, never this module."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(matrix, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    """Symmetric with load_tech_attack_matrix() for DEFAULT_LIVE_CVE_CACHE_PATH;
+    tools/learn.py calls this after an opt-in live fetch (never this
+    module), always with the FULL accumulated cache (existing entries
+    read back + the one new tag just fetched) — a crash mid-write would
+    lose every previously-cached CVE lookup, not just the new one, so
+    this is an atomic write (memory/atomic_write.py), not a plain one."""
+    atomic_write_text(Path(path), json.dumps(matrix, indent=2, sort_keys=True) + "\n")
 
 
 def merge_tech_attack_matrix(static: dict, live: dict) -> dict:
@@ -680,8 +682,11 @@ def sync_tech_stack(target: str, memory_dir: str, fingerprint: dict) -> dict:
     profile["schema_version"] = CURRENT_SCHEMA_VERSION
 
     validated = validate_target_profile(profile)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(validated, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    # Atomic write (memory/atomic_write.py): this is a read-modify-write of
+    # the target's WHOLE profile (tech_stack history, tested_endpoints,
+    # findings, hunt_sessions count) -- a crash mid-write would lose all
+    # of it, not just this run's tech_stack addition.
+    atomic_write_text(path, json.dumps(validated, indent=2, sort_keys=True) + "\n")
     return validated
 
 

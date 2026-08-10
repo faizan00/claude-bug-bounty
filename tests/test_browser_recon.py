@@ -1028,6 +1028,33 @@ class TestCaptureRuntimeApiEndToEnd:
         assert data["pages_visited"] == 1
         assert isinstance(data["calls"], list)
 
+    def test_crash_mid_write_never_corrupts_a_prior_accounts_captured_calls(
+        self, tmp_path, local_server, monkeypatch
+    ):
+        # Phase 5 (state recovery): merged_calls accumulates across every
+        # account's --api-capture run (PR #21's whole point -- run once
+        # per account for cross-account IDOR correlation) -- a crash
+        # mid-write on account B's run must never lose account A's
+        # already-captured calls.
+        br.capture_runtime_api(
+            "t.example", str(tmp_path), self._fetcher(),
+            entry_urls=[local_server + "/"], max_pages=1, max_links_per_page=0,
+        )
+        out_path = tmp_path / "browser" / "api-calls.json"
+        original_bytes = out_path.read_bytes()
+
+        import memory.atomic_write as aw
+        monkeypatch.setattr(aw.os, "replace", lambda *a, **kw: (_ for _ in ()).throw(OSError("simulated crash")))
+        with pytest.raises(OSError, match="simulated crash"):
+            br.capture_runtime_api(
+                "t.example", str(tmp_path), self._fetcher(),
+                entry_urls=[local_server + "/"], max_pages=1, max_links_per_page=0,
+            )
+
+        assert out_path.read_bytes() == original_bytes
+        restored = json.loads(out_path.read_text())
+        assert isinstance(restored["calls"], list) and restored["calls"]
+
     def test_hidden_endpoints_consumes_api_calls_json(self, tmp_path, local_server):
         """discover_hidden_endpoints() (#5) reads browser/api-calls.json once
         #1 has run -- confirms the dict shape #1 writes and the shape #5

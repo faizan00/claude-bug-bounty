@@ -113,3 +113,30 @@ class TestSaveLoadRoundTrip:
         cp = om.make_checkpoint({}, [], [], auth_session=None)
         path = om.save_session(cp, tmp_path / "a" / "b" / "c.json")
         assert (tmp_path / "a" / "b" / "c.json").exists()
+
+    def test_crash_mid_write_never_corrupts_the_prior_checkpoint(self, tmp_path, monkeypatch):
+        # Phase 5 (state recovery): this checkpoint accumulates real
+        # --establish/--probe workflow_state across a multi-step
+        # business-logic test (business_logic_probe.py writes one after
+        # EVERY call) -- a crash mid-write must never corrupt/empty the
+        # prior checkpoint /pickup reads back to show where a killed
+        # multi-step test left off.
+        path = tmp_path / "t.example__invite_flow.json"
+        cp1 = om.make_checkpoint(
+            workflow_state={"step": "invite_sent"}, reachable_objects=[],
+            reachable_capabilities=[], auth_session=None,
+        )
+        om.save_session(cp1, path)
+        original_bytes = path.read_bytes()
+
+        import memory.atomic_write as aw
+        monkeypatch.setattr(aw.os, "replace", lambda *a, **kw: (_ for _ in ()).throw(OSError("simulated crash")))
+        cp2 = om.make_checkpoint(
+            workflow_state={"step": "invite_accepted"}, reachable_objects=[],
+            reachable_capabilities=[], auth_session=None,
+        )
+        with pytest.raises(OSError, match="simulated crash"):
+            om.save_session(cp2, path)
+
+        assert path.read_bytes() == original_bytes
+        assert om.load_session(path) == cp1  # still the last GOOD checkpoint, not corrupted

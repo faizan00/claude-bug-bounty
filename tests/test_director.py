@@ -1729,6 +1729,28 @@ class TestPlanPersistence:
         with pytest.raises(FileNotFoundError):
             director.load_plan(str(tmp_path / "does-not-exist.json"))
 
+    def test_crash_mid_write_never_corrupts_the_prior_saved_plan(self, isolated, tmp_path, monkeypatch):
+        # Phase 5 (state recovery): save_plan() is THE authoritative
+        # /pickup resume point once it exists. Simulates a crash during
+        # replan()'s in-place overwrite (os.replace() never completes) --
+        # the PREVIOUSLY saved plan must survive intact, not end up
+        # truncated/empty the way a plain path.write_text() would leave it.
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=3, recon_dir=rd)
+        plan_file = str(tmp_path / "hunt-plan.json")
+        director.save_plan(plan, plan_file)
+        original_bytes = Path(plan_file).read_bytes()
+
+        import memory.atomic_write as aw
+        monkeypatch.setattr(aw.os, "replace", lambda *a, **kw: (_ for _ in ()).throw(OSError("simulated crash")))
+        with pytest.raises(OSError, match="simulated crash"):
+            director.save_plan(plan, plan_file)
+
+        assert Path(plan_file).read_bytes() == original_bytes  # untouched, not corrupted/emptied
+        reloaded = director.load_plan(plan_file)  # still loads cleanly
+        assert reloaded == plan
+
     def test_save_plan_creates_parent_directories(self, isolated, tmp_path):
         rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
         d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))

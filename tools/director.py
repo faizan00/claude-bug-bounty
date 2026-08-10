@@ -71,6 +71,7 @@ from memory.vuln_intelligence import (  # noqa: E402
 from memory.experiment_memory import should_stop  # noqa: E402
 from memory import object_model  # noqa: E402  (Phase 6 — object_model.py never imports this module, no circularity)
 from memory.candidate import candidate_to_lead_view  # noqa: E402
+from memory.atomic_write import atomic_write_text  # noqa: E402
 
 # ─── State machine ──────────────────────────────────────────────────────────
 
@@ -1342,11 +1343,14 @@ def save_plan(plan: Plan, path: str) -> str:
     stays the human-readable artifact for a hunter to read; this is the
     separate machine-readable one replan() actually needs when build-plan
     and replan run as two different CLI invocations instead of sharing one
-    in-process Plan object. Plain json.dumps(plan.to_dict()) — the same
-    to_dict() build-plan already prints to stdout, just persisted."""
+    in-process Plan object — the SAME to_dict() build-plan already prints
+    to stdout, just persisted. Atomic write (memory/atomic_write.py, same
+    discipline tools/lead_board.py's save_ledger() established): this is
+    THE authoritative /pickup resume point once it exists — a crash
+    mid-write from a plain path.write_text() would corrupt or empty it,
+    not just lose the in-flight replan() update."""
     out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(plan.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_text(out_path, json.dumps(plan.to_dict(), indent=2, sort_keys=True) + "\n")
     return str(out_path)
 
 

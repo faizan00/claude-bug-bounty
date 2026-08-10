@@ -155,6 +155,7 @@ This repo is an agent-portable bug bounty plugin for professional hunting across
 - `memory/experiment_memory.py` — Granular per-payload-attempt log beneath patterns/failed_patterns — payload_category_affinity(), should_stop() (5-min-rule), suggest_pivot()
 - `memory/audit_log.py` — Append-only outbound-request audit log, rate limiter, and circuit breaker for autopilot sessions
 - `memory/rotation.py` — Size-based JSONL rotation (10MB cap, keep 3 backups), auto-fired on every append
+- `memory/atomic_write.py` — Crash-safe whole-file JSON/text replacement (temp file + fsync + os.replace()) — shared by every read-modify-write JSON state file (hunt-plan.json, object_model checkpoints, per-target profile, CVE cache, api-calls.json)
 - `memory/schemas.py` — Schema validation for all hunt-memory JSONL entry types (schema_version for migrations)
 - `memory/finding_state.py` — Finding lifecycle state machine — SUSPECTED→TESTING→VALIDATED→CONFIRMED→SELF_CRITIQUED→REPORT_READY (+REJECTED), append-only transition log; Phase 7 gates REPORT_READY behind tools/self_critique.py's SELF_CRITIQUED state (evidence["self_critique_overall"] must be pass/warn)
 - `memory/finding_score.py` — Ranks raw scanner-output lines using vuln_intelligence.priority_score() as the single scoring formula — wired into brain.py's _finding_score()/_collect_candidate_findings() (Brain's standalone-CLI triage path)

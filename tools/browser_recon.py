@@ -129,6 +129,7 @@ from tools.auth_session import AuthSession, add_cli_args as add_auth_cli_args, s
 from memory.audit_log import AutopilotGuard, RateLimiter, AuditLog  # noqa: E402
 from memory.api_call_observer import observe_from_api_calls  # noqa: E402
 from memory.object_model import ObservationStore  # noqa: E402
+from memory.atomic_write import atomic_write_text  # noqa: E402
 
 try:
     from playwright.sync_api import sync_playwright
@@ -923,7 +924,11 @@ def capture_runtime_api(
         "requests_captured": len(recorder.calls),
         "calls": merged_calls,
     }
-    api_calls_file.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    # Atomic write: merged_calls accumulates across every account's
+    # --api-capture run (the whole point of PR #21's merge fix) -- a crash
+    # mid-write would lose every PRIOR account's captured calls, not just
+    # this run's new ones.
+    atomic_write_text(api_calls_file, json.dumps(result, indent=2, sort_keys=True) + "\n")
     return result
 
 
