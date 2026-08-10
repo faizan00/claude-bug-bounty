@@ -611,6 +611,19 @@ MIN_SAMPLES_FOR_DEDUP_PROBABILITY = 5
 # — never presented as equivalent to a real estimate.
 DEFAULT_DEDUP_PROBABILITY = 0.5
 
+# Same rule agents/recon-ranker.md already documents and hand-applies for
+# its own LLM-driven scoring ("Endpoint shape (normalize_endpoint) has a
+# losing track record (losses > wins, sample >= 3) | -15 | endpoint-stats")
+# — priority_score() below now applies the IDENTICAL rule in code, so the
+# deterministic director.py pipeline (which recon-ranker's prose can't
+# reach) gets the same signal, not a second heuristic with different
+# numbers. Sample >= 3 (not the 5-sample bar used elsewhere): endpoint
+# shape is a narrower, higher-precision bucket than tech_stack+vuln_class,
+# so fewer real hits already say something — this threshold is
+# recon-ranker.md's own choice, kept as-is rather than reinvented.
+MIN_SAMPLES_FOR_ENDPOINT_SHAPE_PENALTY = 3
+ENDPOINT_SHAPE_LOSING_PENALTY = 15
+
 
 def dedup_probability(
     vuln_class: str,
@@ -704,12 +717,14 @@ def priority_score(
     report_outcomes: list[dict] | None = None,
     tech_attack_matrix: dict | None = None,
     dedup_probability_result: dict | None = None,
+    endpoint: str | None = None,
+    journal_entries: list[dict] | None = None,
 ) -> dict:
     """The autopilot decision-engine formula:
 
         Priority = impact_potential + historical_success_probability
                  + technology_match + attack_chain_probability
-                 - failure_penalty - dedup_penalty
+                 - failure_penalty - dedup_penalty - endpoint_shape_penalty
 
     Every positive component is scaled 0-100, so the base score is their
     average; failure_penalty (100 when this exact target+technique already
@@ -745,6 +760,20 @@ def priority_score(
     point value, and never enough alone to zero a score the way a hard
     failure_penalty (a proven dead end, a categorically stronger signal)
     does.
+
+    endpoint / journal_entries (optional, both default None): when
+    ``endpoint`` is given, calls endpoint_shape_stats() (the SAME
+    normalize_endpoint()-based cross-target shape matcher
+    duplicate_or_noise_check() and dedup_leads() already use) and applies
+    ENDPOINT_SHAPE_LOSING_PENALTY once sample_size clears
+    MIN_SAMPLES_FOR_ENDPOINT_SHAPE_PENALTY and losses outnumber wins for
+    this exact shape — the flat -15 agents/recon-ranker.md already
+    documents and hand-applies, now also applied in code so director.py's
+    deterministic build_plan() gets it too. journal_entries is a caller-
+    supplied list (mem["journal"] in director.py) since this function has
+    no memory_dir of its own to read one from. Omitting endpoint
+    reproduces the exact score this function had before the parameter
+    existed.
     """
     patterns = patterns or []
     failed_patterns = failed_patterns or []
@@ -801,12 +830,21 @@ def priority_score(
             and dedup_probability_result.get("sample_size", 0) >= MIN_SAMPLES_FOR_DEDUP_PROBABILITY):
         dedup_penalty = round(base * MAX_IMPACT_RECALIBRATION_WEIGHT * dedup_probability_result["probability"])
 
-    score = max(0, min(100, round(base - failure_penalty - dedup_penalty)))
+    endpoint_shape = None
+    endpoint_shape_penalty = 0
+    if endpoint:
+        endpoint_shape = endpoint_shape_stats(endpoint, patterns, failed_patterns, journal_entries)
+        if (endpoint_shape["wins"] + endpoint_shape["losses"] >= MIN_SAMPLES_FOR_ENDPOINT_SHAPE_PENALTY
+                and endpoint_shape["losses"] > endpoint_shape["wins"]):
+            endpoint_shape_penalty = ENDPOINT_SHAPE_LOSING_PENALTY
+
+    score = max(0, min(100, round(base - failure_penalty - dedup_penalty - endpoint_shape_penalty)))
 
     return {
         "vuln_class": vuln_class,
         "score": score,
         "hard_kill": failure_penalty >= 100,
+        "endpoint_shape": endpoint_shape,
         "components": {
             "impact_potential": impact,
             "historical_success_probability": historical_success,
@@ -814,6 +852,7 @@ def priority_score(
             "attack_chain_probability": attack_chain_probability,
             "failure_penalty": failure_penalty,
             "dedup_penalty": dedup_penalty,
+            "endpoint_shape_penalty": endpoint_shape_penalty,
         },
         "failed_pattern_reason": failed_entry.get("reason") if failed_entry else None,
         "matching_chains": [c["chain_name"] for c in matching_chains],
@@ -848,6 +887,8 @@ def expected_value_per_hour(
     estimated_minutes: float | None = None,
     tech_attack_matrix: dict | None = None,
     dedup_probability_result: dict | None = None,
+    endpoint: str | None = None,
+    journal_entries: list[dict] | None = None,
 ) -> dict:
     """Expected-value-per-hour: which candidate pays off *fastest*, not just highest.
 
@@ -866,6 +907,9 @@ def expected_value_per_hour(
     (1 - probability) when sample-backed — a lead with a high historical
     duplicate rate pays off less often even if the raw score is high.
     Default None, or a cold-start result, reproduces prior behavior exactly.
+
+    endpoint / journal_entries: passed straight through to priority_score()
+    — see its docstring. Default None reproduces prior behavior exactly.
     """
     report_outcomes = report_outcomes or []
     score_result = priority_score(
@@ -874,6 +918,8 @@ def expected_value_per_hour(
         report_outcomes=report_outcomes,
         tech_attack_matrix=tech_attack_matrix,
         dedup_probability_result=dedup_probability_result,
+        endpoint=endpoint,
+        journal_entries=journal_entries,
     )
 
     outcomes_for_class = [o for o in report_outcomes if o.get("vuln_class") == vuln_class]
@@ -1316,6 +1362,7 @@ def _cmd_priority(args: argparse.Namespace) -> int:
     failed = FailedPatternDB(paths["failed_patterns"]).read_all()
     chains = ChainDB(paths["chains"]).read_all()
     outcomes = ReportOutcomeDB(paths["report_outcomes"]).read_all()
+    journal = _read_jsonl_best_effort(paths["journal"])
     tech_stack = [t.strip() for t in args.tech.split(",") if t.strip()]
     result = priority_score(
         vuln_class=args.vuln_class,
@@ -1328,6 +1375,8 @@ def _cmd_priority(args: argparse.Namespace) -> int:
         chain_detected=args.chain_detected,
         impact_override=args.impact_override,
         report_outcomes=outcomes,
+        endpoint=args.endpoint,
+        journal_entries=journal,
     )
     print(json.dumps(result, indent=2))
     return 0
@@ -1341,6 +1390,7 @@ def _cmd_decision(args: argparse.Namespace) -> int:
     failed = FailedPatternDB(paths["failed_patterns"]).read_all()
     chains = ChainDB(paths["chains"]).read_all()
     outcomes = ReportOutcomeDB(paths["report_outcomes"]).read_all()
+    journal = _read_jsonl_best_effort(paths["journal"])
     tech_stack = [t.strip() for t in args.tech.split(",") if t.strip()]
 
     result = expected_value_per_hour(
@@ -1355,6 +1405,8 @@ def _cmd_decision(args: argparse.Namespace) -> int:
         impact_override=args.impact_override,
         report_outcomes=outcomes,
         estimated_minutes=args.minutes,
+        endpoint=args.endpoint,
+        journal_entries=journal,
     )
     affinity_list = tech_vuln_affinity(tech_stack, patterns, failed)
     affinity = next((a for a in affinity_list if a["vuln_class"] == args.vuln_class), None)
@@ -1403,6 +1455,7 @@ def _cmd_ev(args: argparse.Namespace) -> int:
     failed = FailedPatternDB(paths["failed_patterns"]).read_all()
     chains = ChainDB(paths["chains"]).read_all()
     outcomes = ReportOutcomeDB(paths["report_outcomes"]).read_all()
+    journal = _read_jsonl_best_effort(paths["journal"])
     tech_stack = [t.strip() for t in args.tech.split(",") if t.strip()]
     result = expected_value_per_hour(
         vuln_class=args.vuln_class,
@@ -1416,6 +1469,8 @@ def _cmd_ev(args: argparse.Namespace) -> int:
         impact_override=args.impact_override,
         report_outcomes=outcomes,
         estimated_minutes=args.minutes,
+        endpoint=args.endpoint,
+        journal_entries=journal,
     )
     print(json.dumps(result, indent=2))
     return 0
@@ -1551,6 +1606,7 @@ def main() -> int:
     p.add_argument("--technique", default=None, help="Checked against failed_patterns.jsonl for a hard kill")
     p.add_argument("--chain-detected", action="store_true", help="This candidate is part of a lead-board chain")
     p.add_argument("--impact-override", type=float, default=None)
+    p.add_argument("--endpoint", default=None, help="Applies endpoint_shape_stats()'s losing-shape penalty when sample-backed")
     p.add_argument("--memory-dir", default="hunt-memory")
     p.set_defaults(func=_cmd_priority)
 
@@ -1603,6 +1659,7 @@ def main() -> int:
     p.add_argument("--chain-detected", action="store_true")
     p.add_argument("--impact-override", type=float, default=None)
     p.add_argument("--minutes", type=float, default=None, help="Override the static per-vuln-class time estimate")
+    p.add_argument("--endpoint", default=None, help="Applies endpoint_shape_stats()'s losing-shape penalty when sample-backed")
     p.add_argument("--memory-dir", default="hunt-memory")
     p.set_defaults(func=_cmd_ev)
 

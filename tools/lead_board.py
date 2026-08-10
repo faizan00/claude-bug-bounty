@@ -47,7 +47,12 @@ from memory.finding_state import FindingStateDB  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # ROUTING TABLE — the brain. (pattern, source, skill, priority, label, why)
-# source: "url" | "tech" | "nuclei" | "host" | "ai"
+# source: "url" | "tech" | "nuclei" | "host" | "ai" | "param"
+# "param" matches a bare hidden-parameter NAME (tools/director.py's
+# param_discovery_leads() is the caller — see there, not gather_recon()
+# below, since param_discovery.sh's findings/params/<ts>/ output isn't
+# recon_dir-relative, same reason takeover/cloud/graphql findings aren't
+# read by gather_recon() either).
 # One observation may match several rules (a URL can be both IDOR and XSS).
 # ---------------------------------------------------------------------------
 P_HIGH, P_MED, P_LOW = "high", "med", "low"
@@ -100,6 +105,32 @@ ROUTES = [
      "url", "hunt-cors", P_LOW, "JSONP/CORS", "JSONP data theft / permissive ACAO"),
     (R(r"/api/cron|/jobs?/|/queue|/task", re.I),
      "url", "hunt-business-logic", P_LOW, "job/cron surface", "logic abuse, replay, state machine gaps"),
+
+    # ---- Hidden parameter NAMES (from tools/param_discovery.sh's Arjun/x8
+    # diff -- these are CONFIRMED to change server behavior, not just
+    # observed sitting in a crawled URL, so they're at least as strong a
+    # signal as the "url" rules above matching name=value). Bare-name
+    # match (no "=value" required, unlike the "url" rules) since a hidden
+    # param's value was never actually observed -- only its NAME and the
+    # fact that including it changed the response. ----
+    (R(r"^(url|uri|dest|destination|domain|site|callback|fetch|load|proxy|feed|host|to|out|"
+       r"image_url|imageurl|continue_url|webhook|webhook_url|notify_url|ping_url|callback_url)$", re.I),
+     "param", "hunt-ssrf", P_HIGH, "hidden URL-fetch param", "diff-confirmed param name implies server-side fetch -> SSRF/IMDS"),
+    (R(r"^(next|redirect|redirect_uri|return|returnurl|return_to|continue|goto|rurl|checkout_url|success_url|back)$", re.I),
+     "param", "hunt-open-redirect", P_MED, "hidden redirect param", "diff-confirmed redirect param -> open redirect; chains to OAuth token theft"),
+    (R(r"^(id|uid|user_id|userid|account|account_id|order|order_id|invoice|doc|doc_id|file_id|"
+       r"record|profile|customer|cid|pid|role_id|group_id|org_id|tenant_id)$", re.I),
+     "param", "hunt-idor", P_HIGH, "hidden object-reference param", "diff-confirmed id-shaped param not in any crawled URL -> IDOR/BOLA candidate, untested by any scanner"),
+    (R(r"^(file|page|path|template|include|view|folder|pg|lang|locale|theme)$", re.I),
+     "param", "hunt-lfi", P_MED, "hidden path-valued param", "diff-confirmed path param -> LFI/path-traversal; chain to source disclosure"),
+    (R(r"^(upload|attachment|avatar|image|filename)$", re.I),
+     "param", "hunt-file-upload", P_MED, "hidden upload-adjacent param", "diff-confirmed upload param -> unrestricted upload / content-type bypass"),
+    (R(r"^(template|tpl|preview|render|greeting)$", re.I),
+     "param", "hunt-ssti", P_LOW, "hidden template-ish param", "diff-confirmed template param -> SSTI if server-side templating reflects it"),
+    (R(r"^(role|is_admin|isadmin|admin|debug|internal|test|impersonate|as_user|sudo|superuser)$", re.I),
+     "param", "hunt-auth-bypass", P_HIGH, "hidden privilege/debug param", "diff-confirmed param name implies a hidden authz/debug toggle -> privilege escalation"),
+    (R(r"^(promo|coupon|discount|price|amount|quantity|qty|total|balance)$", re.I),
+     "param", "hunt-business-logic", P_MED, "hidden pricing/quantity param", "diff-confirmed param affects response -> mass-assignment / price-tampering candidate"),
 
     # ---- Tech-stack signals (from httpx fingerprints / technologies) ----
     (R(r"asp\.net|iis|\.aspx|aspxauth|__viewstate", re.I),

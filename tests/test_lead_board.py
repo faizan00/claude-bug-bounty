@@ -537,3 +537,51 @@ class TestReportedStatusGate:
         lb.touch("t.example", gid, "reported", None, memory_dir=str(tmp_path / "hunt-memory"))
         leads = lb.load_ledger("t.example")
         assert next(l for l in leads if l["id"] == gid)["status"] == "reported"
+
+
+class TestParamSourceRouting:
+    """The "param" ROUTES source (bare hidden-parameter NAME match, no
+    "=value" required) -- tools/director.py's param_discovery_leads() is
+    the real caller (tools/param_discovery.sh's Arjun/x8 output has no
+    observed VALUE, only a name diff-confirmed to change server behavior),
+    but the routing table itself lives here, same as every other source."""
+
+    @pytest.mark.parametrize("name,expected_skill", [
+        ("callback", "hunt-ssrf"),
+        ("redirect_uri", "hunt-open-redirect"),
+        ("user_id", "hunt-idor"),
+        ("account_id", "hunt-idor"),
+        ("template", "hunt-lfi"),
+        ("upload", "hunt-file-upload"),
+        ("is_admin", "hunt-auth-bypass"),
+        ("coupon", "hunt-business-logic"),
+    ])
+    def test_known_param_names_route_to_expected_skill(self, name, expected_skill):
+        skills = {skill for skill, _prio, _label, _why in lb.route_observation(name, "param")}
+        assert expected_skill in skills
+
+    def test_unrelated_param_name_routes_nowhere(self):
+        assert list(lb.route_observation("totally_unrelated_xyz", "param")) == []
+
+    def test_bare_name_never_matches_the_url_source_value_rules(self):
+        # The "url" rules require "=value" (e.g. "url=https"); a bare name
+        # with no "=" must never accidentally match them under source="url".
+        assert list(lb.route_observation("callback", "url")) == []
+
+    def test_param_source_match_is_case_insensitive(self):
+        skills = {skill for skill, _prio, _label, _why in lb.route_observation("CALLBACK", "param")}
+        assert "hunt-ssrf" in skills
+
+    def test_param_source_requires_exact_name_not_substring(self):
+        # "callback_extra" must not match the "^callback$" bare-name pattern
+        # -- these rules are anchored full-name matches, not substring scans
+        # (unlike the "url" source's regexes, which intentionally scan
+        # inside a full URL string).
+        assert list(lb.route_observation("callback_extra_junk", "param")) == []
+
+    def test_template_matches_both_lfi_and_ssti(self):
+        # A single param name can legitimately route to more than one
+        # skill -- same "one observation, multiple rules" convention the
+        # module docstring already states for "url" source matches.
+        skills = {skill for skill, _prio, _label, _why in lb.route_observation("template", "param")}
+        assert {"hunt-lfi", "hunt-ssti"}.issubset(skills)

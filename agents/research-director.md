@@ -42,6 +42,20 @@ This does, in order:
 
 Read the written file, don't just trust the one-line summary printed to stdout — the summary is a sanity check, the file is the plan.
 
+## Standalone-Tool Findings Aren't Picked Up Automatically
+
+`lead_board.py`/browser-intel/attack-graph/secret-scan/object-model leads above are all either the lead board itself or recon_dir-relative — `build-plan` reads them with no extra flag. Four tools are different: they write to a **timestamped** `findings/<tool>/<timestamp>/` directory outside `recon/<target>/`, so `build-plan` has no fixed path to look at and stays silent about them unless you pass the directory explicitly. If any of these ran this session, pass its output dir or its leads are invisible to the plan:
+
+```bash
+python3 tools/director.py build-plan <target> --hours <N> --memory-dir hunt-memory --write \
+  --takeover-findings-dir findings/takeover/<timestamp> \
+  --cloud-findings-dir    findings/cloud/<timestamp> \
+  --graphql-findings-dir  findings/graphql/<timestamp> \
+  --param-findings-dir    findings/params/<timestamp>
+```
+
+Omit whichever flags don't apply — all four default to not-run, and each is a no-op ([] leads) if its directory doesn't exist yet. Look for the most recent `findings/takeover/`, `findings/cloud/`, `findings/graphql/`, `findings/params/` subdirectory (if any) before calling `build-plan` rather than assuming none ran.
+
 ## The SKIPPED Section Is Not Optional
 
 Every lead that didn't become an attack has a reason from a fixed, machine-checkable set: `BELOW_EV_FLOOR`, `MATCHES_FAILED_PATTERN`, `DUPLICATE`, `TIME_CONSTRAINT`, `DEPENDENCY_UNMET`, `INSUFFICIENT_EVIDENCE`, plus `POLICY_EXCLUDED` and `ALWAYS_REJECTED` (valid values in the taxonomy, but the automatic classifier never emits them itself — see below). If `hunt-plan.md`'s SKIPPED section is empty, that is **suspicious, not clean** — say so explicitly instead of treating it as a good sign. A real lead board almost always has *something* below the EV floor or already noted as failed.

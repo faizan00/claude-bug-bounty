@@ -585,6 +585,70 @@ def graphql_audit_leads(target: str, findings_dir: str, recon_dir: str | None = 
     return leads
 
 
+def param_discovery_leads(target: str, findings_dir: str) -> list[dict]:
+    """Convert tools/param_discovery.sh (Arjun/x8) hidden-parameter output
+    into lead-board-shaped candidates. Prior to this, findings/params/<ts>/
+    was a genuine dead end — nothing downstream (lead_board.py,
+    attack_graph.py, this file) ever read it, so every hidden param Arjun/x8
+    diff-confirmed just sat in a file (same "IMPLEMENTED != REACHABLE" shape
+    as fingerprint.py before it got wired into Phase 2.6).
+
+    Routes each discovered param NAME through lead_board.route_observation()'s
+    new "param" source (bare-name match, see ROUTES's "param" block) —
+    reuses the SAME routing brain every other signal type goes through,
+    not a second table. Arjun/x8 already diff-CONFIRMED the param changes
+    server behavior (stronger evidence than a URL merely containing
+    name=value), so this is at least as trustworthy as the "url"-source
+    routing lead_board.py's gather_recon() already does.
+
+    arjun.json (preferred — structured, written whenever arjun is
+    installed): {endpoint: {"params": [...], ...}, ...} — same shape
+    param_discovery.sh's own inline Python already trusts to build
+    arjun_summary.txt, not a new assumption.
+
+    x8.txt (fallback — only present when arjun wasn't installed):
+    default "standart" format is "<METHOD> <URL> % <PARAMETERS divided by
+    ', '>" per x8's own docs (no --output-format flag is passed by
+    param_discovery.sh, so this is genuinely the default, not a guess).
+    A line that doesn't match this shape is skipped, never guessed at.
+    """
+    leads: list[dict] = []
+    base = Path(findings_dir)
+    if not base.is_dir():
+        return leads
+
+    def _add(endpoint: str, param: str, artifact: str) -> None:
+        param = param.strip()
+        if not param:
+            return
+        for skill, prio, label, why in lead_board.route_observation(param, "param"):
+            leads.append(_new_tool_lead(
+                target, skill, prio, label, why,
+                f"{endpoint}?{param}=<discovered-by-{artifact.split('.')[0]}>",
+                "param-discovery", artifact,
+            ))
+
+    arjun = _read_json_file(base / "arjun.json")
+    if isinstance(arjun, dict):
+        for endpoint, info in arjun.items():
+            if not isinstance(info, dict):
+                continue
+            for param in info.get("params", []) or []:
+                if isinstance(param, str):
+                    _add(endpoint, param, "arjun.json")
+
+    x8_line_re = re.compile(r"^\S+\s+(\S+)\s*%\s*(.+)$")
+    for line in _read_text_lines(base / "x8.txt"):
+        m = x8_line_re.match(line)
+        if not m:
+            continue
+        endpoint, params_csv = m.group(1), m.group(2)
+        for param in params_csv.split(","):
+            _add(endpoint, param, "x8.txt")
+
+    return leads
+
+
 # ─── Secret scan -> concrete leads (Phase 5, Part C) ───────────────────────
 #
 # Unlike takeover_leads()/cloud_recon_leads()/graphql_audit_leads() above,
@@ -1146,7 +1210,8 @@ class Director:
                     rejection_lessons: list[dict] | None = None,
                     takeover_findings_dir: str | None = None,
                     cloud_findings_dir: str | None = None,
-                    graphql_findings_dir: str | None = None) -> Plan:
+                    graphql_findings_dir: str | None = None,
+                    param_findings_dir: str | None = None) -> Plan:
         if hours <= 0:
             raise ValueError("hours must be positive")
         memory_dir = memory_dir if memory_dir is not None else self.memory_dir
@@ -1185,6 +1250,8 @@ class Director:
             tool_leads += cloud_recon_leads(target, cloud_findings_dir)
         if graphql_findings_dir:
             tool_leads += graphql_audit_leads(target, graphql_findings_dir, recon_dir)
+        if param_findings_dir:
+            tool_leads += param_discovery_leads(target, param_findings_dir)
 
         all_leads = board_leads + bi_leads + graph_leads + secret_leads + object_model_leads_list + tool_leads
         # HIGH-severity fix — collapse the same real vulnerability
@@ -1289,17 +1356,20 @@ class Director:
                      tech_attack_matrix: dict | None = None,
                      rejection_lessons: list[dict] | None = None) -> dict:
         vuln_class = skill_to_vuln_class(lead["skill"])
+        endpoint = lead.get("evidence", "")
         score_result = priority_score(
             vuln_class=vuln_class, tech_stack=tech_stack, target=target,
             technique=None, patterns=mem["patterns"], failed_patterns=mem["failed_patterns"],
             chains=mem["chains"], chain_detected=(lead.get("source") == "hypothesis"),
             report_outcomes=mem["report_outcomes"], tech_attack_matrix=tech_attack_matrix,
+            endpoint=endpoint, journal_entries=mem["journal"],
         )
         ev_result = expected_value_per_hour(
             vuln_class=vuln_class, tech_stack=tech_stack, target=target,
             technique=None, patterns=mem["patterns"], failed_patterns=mem["failed_patterns"],
             chains=mem["chains"], chain_detected=(lead.get("source") == "hypothesis"),
             report_outcomes=mem["report_outcomes"], tech_attack_matrix=tech_attack_matrix,
+            endpoint=endpoint, journal_entries=mem["journal"],
         )
         dup_check = duplicate_or_noise_check(
             target=target, vuln_class=vuln_class, endpoint=lead.get("evidence", ""),
@@ -1756,6 +1826,7 @@ def _cmd_build_plan(args: argparse.Namespace) -> int:
         takeover_findings_dir=args.takeover_findings_dir,
         cloud_findings_dir=args.cloud_findings_dir,
         graphql_findings_dir=args.graphql_findings_dir,
+        param_findings_dir=args.param_findings_dir,
     )
     if args.write:
         path = director.write_plan(plan, recon_dir=args.recon_dir)
@@ -1821,6 +1892,9 @@ def main(argv: list[str] | None = None) -> int:
                           help="Phase 5: dir a cloud_recon.sh run wrote to (not recon-dir-relative)")
     p_build.add_argument("--graphql-findings-dir", default=None,
                           help="Phase 5: dir a graphql_audit.sh run wrote to (not recon-dir-relative)")
+    p_build.add_argument("--param-findings-dir", default=None,
+                          help="dir a param_discovery.sh run wrote to (not recon-dir-relative) — "
+                               "e.g. findings/params/<timestamp>")
     p_build.set_defaults(func=_cmd_build_plan)
 
     p_replan = sub.add_parser("replan", help="Update a saved plan with results-so-far, across process boundaries")
