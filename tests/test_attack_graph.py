@@ -34,12 +34,13 @@ class TestLoadChainRules:
 
     def test_default_file_loads(self):
         rules = ag.load_chain_rules()
-        assert len(rules) == 6
+        assert len(rules) == 7
         ids = {r.id for r in rules}
         assert ids == {
             "secret_plus_api", "idor_plus_account_surface", "cors_plus_sensitive",
             "upload_plus_processing", "account_takeover_via_leaked_secret",
             "account_takeover_via_cors_and_idor",
+            "client_capability_plus_missing_serverside_check",
         }
 
     def test_chain_shaped_rules_have_one_step(self):
@@ -414,6 +415,145 @@ class TestBuildCapabilityGraph:
         edge_before = next(e for e in g_before.edges if e.to_id == "lead:lb-1")
         edge_after = next(e for e in g_after.edges if e.to_id == "lead:lb-1")
         assert edge_after.confidence > edge_before.confidence
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Architecture Milestone 3 — Capability-origin rules: closing the dead end
+# where a real Capability node (browser auth-model.json role/permission
+# constants) had exactly one edge (Asset->Capability) and zero outgoing
+# edges, so it could never appear in find_paths()'s output despite already
+# being a declared valid path-start type.
+# ─────────────────────────────────────────────────────────────────────────
+
+def _capability_node(node_id, label, origin_source="browser/auth-model.json"):
+    return ag.Node(node_id, "Capability", label, origin_lead_id=None,
+                    origin_source=origin_source, confidence_source="test")
+
+
+class TestCapabilityLegSourceCandidates:
+    """Direct unit tests for _leg_source_candidates() — the new leg-lookup
+    path that sources candidates from graph.nodes instead of `leads`."""
+
+    def test_wildcard_matches_any_capability_label(self):
+        g = ag.Graph()
+        g.add_node(_capability_node("capability:ROLE_ADMIN", "ROLE_ADMIN"))
+        g.add_node(_capability_node("capability:isSuperUser", "isSuperUser"))
+        out = ag._leg_source_candidates("Capability", frozenset({ag.WILDCARD_LEG_VALUE}), {}, g)
+        assert {c["node_id"] for c in out} == {"capability:ROLE_ADMIN", "capability:isSuperUser"}
+        assert all(c["origin_lead_id"] is None for c in out)
+
+    def test_specific_label_only_matches_that_label(self):
+        g = ag.Graph()
+        g.add_node(_capability_node("capability:ROLE_ADMIN", "ROLE_ADMIN"))
+        g.add_node(_capability_node("capability:isSuperUser", "isSuperUser"))
+        out = ag._leg_source_candidates("Capability", frozenset({"ROLE_ADMIN"}), {}, g)
+        assert {c["node_id"] for c in out} == {"capability:ROLE_ADMIN"}
+
+    def test_no_capability_nodes_yields_empty_not_a_crash(self):
+        g = ag.Graph()
+        g.add_node(ag.Node("asset:t.example", "Asset", "t.example", origin_lead_id=None,
+                            origin_source="target", confidence_source="given"))
+        out = ag._leg_source_candidates("Capability", frozenset({ag.WILDCARD_LEG_VALUE}), {}, g)
+        assert out == []
+
+    def test_non_capability_leg_type_is_unaffected_lead_lookup(self):
+        # Zero behavior change for every existing rule: an Endpoint leg
+        # still sources from `by_skill`, never from graph.nodes.
+        by_skill = {"hunt-idor": [{"id": "lb-1", "skill": "hunt-idor", "evidence": "https://t.example/x"}]}
+        g = ag.Graph()
+        out = ag._leg_source_candidates("Endpoint", frozenset({"hunt-idor"}), by_skill, g)
+        assert out == [{
+            "node_id": "lead:lb-1", "dedup_id": "lb-1",
+            "dedup_evidence": "https://t.example/x", "origin_lead_id": "lb-1",
+        }]
+
+
+class TestCapabilityOriginRule:
+    """apply_chain_rules() actually reaching a real Capability node via
+    client_capability_plus_missing_serverside_check — end to end, through
+    the real rules/chain_rules.yaml file, not a synthetic rule."""
+
+    def test_real_rule_file_includes_the_capability_origin_rule(self):
+        rules = {r.id: r for r in ag.load_chain_rules()}
+        rule = rules["client_capability_plus_missing_serverside_check"]
+        assert rule.steps[0].from_type == "Capability"
+        assert rule.steps[0].from_values == (ag.WILDCARD_LEG_VALUE,)
+        assert rule.steps[0].to_type == "Endpoint"
+
+    def test_capability_node_gains_a_real_outgoing_edge(self):
+        leads = [_lead("lb-1", "hunt-auth-bypass", "https://t.example/admin/export")]
+        g = ag.build_capability_graph("t.example", recon_dir="/nonexistent", leads=leads)
+        g.add_node(_capability_node("capability:ROLE_ADMIN", "ROLE_ADMIN"))
+
+        added = ag.apply_chain_rules(g, leads)
+
+        cap_edges = [e for e in g.edges if e.from_id == "capability:ROLE_ADMIN"]
+        assert cap_edges, "expected the Capability node to gain a real outgoing edge"
+        edge = cap_edges[0]
+        assert edge.to_id == "lead:lb-1"
+        assert edge.edge_type == "grants"
+        assert edge.rule_id == "client_capability_plus_missing_serverside_check"
+        assert edge.origin_lead_id is None  # no single lead originates a Capability-sourced edge
+        assert edge.origin_source.startswith("rules/chain_rules.yaml#")
+
+    def test_no_capability_node_present_contributes_nothing(self):
+        # Graceful: a target with no browser auth-model.json data (the
+        # common case) sees zero edges from this rule, not an error.
+        leads = [_lead("lb-1", "hunt-auth-bypass", "https://t.example/admin/export")]
+        g = ag.build_capability_graph("t.example", recon_dir="/nonexistent", leads=leads)
+        rule_edges = [e for e in g.edges if e.rule_id == "client_capability_plus_missing_serverside_check"]
+        assert rule_edges == []
+
+    def test_wildcard_matches_regardless_of_target_specific_label(self):
+        # Two different targets' extracted permission-constant names --
+        # neither hardcoded in the rule -- both must match.
+        for label in ("ROLE_ADMIN", "isSuperUser", "canDeleteAnyUser"):
+            leads = [_lead("lb-1", "hunt-idor", "https://t.example/api/x")]
+            g = ag.build_capability_graph("t.example", recon_dir="/nonexistent", leads=leads)
+            g.add_node(_capability_node(f"capability:{label}", label))
+            added = ag.apply_chain_rules(g, leads)
+            cap_edges = [e for e in g.edges if e.from_id == f"capability:{label}"]
+            assert cap_edges, f"expected a match for label {label!r}"
+
+    def test_end_to_end_capability_now_reaches_find_paths_output(self):
+        """The actual dead-end this milestone closes: a Capability node
+        previously could never appear in find_paths()' output (zero
+        outgoing edges). With a real downstream Impact-terminated chain in
+        the same graph, a Capability-start path must now exist."""
+        leads = [
+            _lead("lb-1", "hunt-source-leak", "https://t.example/.env"),
+            _lead("lb-2", "hunt-idor", "https://t.example/api/v2/users?id=1"),
+            _lead("lb-3", "hunt-auth-bypass", "https://t.example/login?next=/dashboard"),
+        ]
+        g = ag.build_capability_graph("t.example", recon_dir="/nonexistent", leads=leads)
+        g.add_node(_capability_node("capability:ROLE_ADMIN", "ROLE_ADMIN"))
+        ag.apply_chain_rules(g, leads)  # fold the new Capability edge in on top of build's own pass
+
+        paths = ag.find_paths(g)
+        capability_paths = [p for p in paths if p.edges[0].from_id == "capability:ROLE_ADMIN"]
+        assert capability_paths, "expected at least one path starting from the Capability node"
+        for p in capability_paths:
+            assert p.edges[-1].to_id.startswith("impact:")
+
+    def test_existing_lead_only_rules_produce_identical_edges_with_or_without_capability_node(self):
+        """Regression: adding an unrelated Capability node to the graph must
+        not change anything about the existing Endpoint-only rule matching
+        (same edges, same count) -- the new leg-sourcing path is additive,
+        never a substitute for the lead-sourced path."""
+        leads = [
+            _lead("lb-1", "hunt-source-leak", "https://t.example/.env"),
+            _lead("lb-2", "hunt-idor", "https://t.example/api/v2/users?id=1"),
+        ]
+        g_without = ag.build_capability_graph("t.example", recon_dir="/nonexistent", leads=leads)
+        edges_without = {(e.from_id, e.to_id, e.edge_type, e.rule_id) for e in g_without.edges}
+
+        g_with = ag.build_capability_graph("t.example", recon_dir="/nonexistent", leads=leads)
+        g_with.add_node(_capability_node("capability:ROLE_ADMIN", "ROLE_ADMIN"))
+        ag.apply_chain_rules(g_with, leads)
+        edges_with = {(e.from_id, e.to_id, e.edge_type, e.rule_id)
+                      for e in g_with.edges if e.from_id != "capability:ROLE_ADMIN"}
+
+        assert edges_without == edges_with
 
 
 # ─────────────────────────────────────────────────────────────────────────

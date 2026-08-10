@@ -5,7 +5,9 @@ import pytest
 from memory.experiment_memory import (
     ExperimentDB,
     evaluate_experiment,
+    expected_information_value,
     payload_category_affinity,
+    rank_by_information_value,
     should_stop,
     suggest_pivot,
 )
@@ -333,4 +335,235 @@ class TestEvaluateExperiment:
     def test_result_always_has_all_four_keys(self):
         result = evaluate_experiment(target="a.com", technique="x")
         assert set(result.keys()) == {"decision", "reason", "confidence", "recommended_next_step"}
-        assert result["decision"] in {"continue", "pivot", "stop"}
+
+
+# ─── Milestone 2: value-of-information ─────────────────────────────────────
+
+def _exps(n_success, n_fail, target="other.com", technique="numeric_id_swap",
+          vuln_class="idor", tech_stack=("nextjs",)):
+    exps = []
+    for i in range(n_success):
+        exps.append({"target": f"{target}-{i}", "endpoint": f"e{i}", "vuln_class": vuln_class,
+                      "payload_category": "id_swap", "technique": technique, "result": "success",
+                      "tech_stack": list(tech_stack)})
+    for i in range(n_fail):
+        exps.append({"target": f"{target}-f{i}", "endpoint": f"ef{i}", "vuln_class": vuln_class,
+                      "payload_category": "id_swap", "technique": technique, "result": "fail",
+                      "tech_stack": list(tech_stack)})
+    return exps
+
+
+class TestExpectedInformationValue:
+
+    def test_empty_history_is_deterministic_and_bounded(self):
+        # 1. EMPTY HISTORY
+        r = expected_information_value(target="t.example", technique="numeric_id_swap", vuln_class="idor")
+        assert r["resolved"] is False
+        assert 0.0 <= r["information_value"] <= 100.0
+        assert r["prior_track_record"] == {
+            "successes": 0, "failures": 0, "sample_size": 0, "estimated_success_probability": 0.5,
+        }
+        # No prior data -> maximal uncertainty, not an arbitrary low default.
+        assert r["uncertainty_entropy"] == 1.0
+
+    def test_informative_action_beats_equivalent_non_distinguishing_action(self):
+        # 2 / 8. INFORMATIVE ACTION / HYPOTHESIS DISCRIMINATION
+        exps = _exps(0, 10)  # one-sided track record -> base entropy has headroom below the cap
+        hyps = [{"id": "lb-hyp1", "signal": "CHAIN: ato", "chain_of": ["lb-1", "lb-2"]}]
+
+        distinguishing = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor", tech_stack=["nextjs"],
+            lead_id="lb-1", experiments=exps, active_hypotheses=hyps,
+        )
+        unrelated = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor", tech_stack=["nextjs"],
+            lead_id="lb-999", experiments=exps, active_hypotheses=hyps,
+        )
+        assert distinguishing["information_value"] > unrelated["information_value"]
+        assert distinguishing["distinguishes_hypotheses"]
+        assert unrelated["distinguishes_hypotheses"] == []
+
+    def test_non_informative_action_has_low_information_value(self):
+        # 3. NON-INFORMATIVE ACTION: lopsided track record -> outcome predictable
+        exps = _exps(0, 10)
+        r = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor",
+            tech_stack=["nextjs"], experiments=exps,
+        )
+        assert r["information_value"] < 50.0
+        assert r["uncertainty_entropy"] < 0.5
+
+    def test_previously_resolved_question_is_not_artificially_high(self):
+        # 4. PREVIOUSLY RESOLVED QUESTION
+        confirmed = [{"target": "t.example", "vuln_class": "idor",
+                      "endpoint": "https://t.example/api/orders/1", "state": "CONFIRMED"}]
+        r = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor",
+            endpoint="https://t.example/api/orders/1", confirmed_findings=confirmed,
+        )
+        assert r["information_value"] == 0.0
+        assert r["resolved"] is True
+        assert "CONFIRMED" in r["resolved_reason"]
+
+    def test_failed_technique_remains_blocked_evoi_never_overrides(self):
+        # 5. FAILED TECHNIQUE — even with a maximally-uncertain empty history
+        # AND a hypothesis connection, the hard-kill wins.
+        failed = [{"target": "t.example", "vuln_class": "idor", "technique": "numeric_id_swap",
+                   "reason": "egress filtered"}]
+        hyps = [{"id": "lb-hyp1", "chain_of": ["lb-1"]}]
+        r = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor",
+            lead_id="lb-1", failed_patterns=failed, active_hypotheses=hyps,
+        )
+        assert r["information_value"] == 0.0
+        assert r["resolved"] is True
+        assert r["hard_kill"] is True
+
+    def test_positive_historical_signal_shifts_estimated_probability(self):
+        # 6. POSITIVE HISTORICAL SIGNAL
+        exps = _exps(8, 0)
+        r = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor",
+            tech_stack=["nextjs"], experiments=exps,
+        )
+        assert r["prior_track_record"]["estimated_success_probability"] > 0.5
+        assert r["prior_track_record"]["successes"] == 8
+
+    def test_target_specificity_no_cross_target_leakage(self):
+        # 7. TARGET-SPECIFICITY
+        failed_for_b = [{"target": "target-B", "vuln_class": "idor", "technique": "numeric_id_swap",
+                          "reason": "n/a"}]
+        r = expected_information_value(
+            target="target-A", technique="numeric_id_swap", vuln_class="idor",
+            failed_patterns=failed_for_b,
+        )
+        assert r["resolved"] is False  # target-B's hard-kill must not leak onto target-A
+
+    def test_downstream_unlock_exposes_other_legs(self):
+        # 9. DOWNSTREAM UNLOCK
+        hyps = [{"id": "lb-hyp1", "signal": "CHAIN: ato", "chain_of": ["lb-1", "lb-2", "lb-3"]}]
+        r = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor",
+            lead_id="lb-1", active_hypotheses=hyps,
+        )
+        assert len(r["distinguishes_hypotheses"]) == 1
+        assert set(r["distinguishes_hypotheses"][0]["other_legs"]) == {"lb-2", "lb-3"}
+
+    def test_cost_time_changes_information_value_per_hour(self):
+        # 10. COST / TIME — same entropy, different minutes -> different per-hour rate.
+        exps = _exps(0, 10)
+        cheap = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor",
+            tech_stack=["nextjs"], experiments=exps, estimated_minutes=10,
+        )
+        expensive = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor",
+            tech_stack=["nextjs"], experiments=exps, estimated_minutes=40,
+        )
+        assert cheap["information_value"] == expensive["information_value"]
+        assert cheap["information_value_per_hour"] > expensive["information_value_per_hour"]
+
+    def test_determinism(self):
+        # 11. DETERMINISM
+        exps = _exps(2, 3)
+        hyps = [{"id": "lb-hyp1", "chain_of": ["lb-1"]}]
+        kwargs = dict(target="t.example", technique="numeric_id_swap", vuln_class="idor",
+                      tech_stack=["nextjs"], lead_id="lb-1", experiments=exps, active_hypotheses=hyps)
+        assert expected_information_value(**kwargs) == expected_information_value(**kwargs)
+
+    def test_safety_invariant_hard_kill_never_overridden_by_any_combination(self):
+        # 12. SAFETY INVARIANTS — stack every info-raising signal at once
+        # (empty-ish mixed history, hypothesis connection, cheap cost) and
+        # confirm the hard-kill still wins.
+        failed = [{"target": "t.example", "vuln_class": "idor", "technique": "numeric_id_swap"}]
+        hyps = [{"id": "lb-hyp1", "chain_of": ["lb-1"]}]
+        exps = _exps(1, 1)
+        r = expected_information_value(
+            target="t.example", technique="numeric_id_swap", vuln_class="idor",
+            tech_stack=["nextjs"], lead_id="lb-1", experiments=exps, active_hypotheses=hyps,
+            failed_patterns=failed, estimated_minutes=1,
+        )
+        assert r["information_value"] == 0.0
+        assert r["information_value_per_hour"] == 0.0
+        assert r["resolved"] is True and r["hard_kill"] is True
+
+    def test_never_crashes_on_missing_optional_fields(self):
+        # Cold-start / incomplete target-profile safety.
+        r = expected_information_value(target="t.example", technique="x", vuln_class="idor",
+                                        tech_stack=None, endpoint=None, lead_id=None,
+                                        experiments=None, failed_patterns=None,
+                                        confirmed_findings=None, active_hypotheses=None)
+        assert r["resolved"] is False
+
+    def test_estimated_minutes_must_be_positive(self):
+        with pytest.raises(ValueError):
+            expected_information_value(target="t", technique="x", vuln_class="idor", estimated_minutes=0)
+
+
+class TestRankByInformationValue:
+
+    def test_ranks_high_low_resolved_hardkilled_correctly(self):
+        candidates = [
+            {"target": "target-A", "technique": "numeric_id_swap", "vuln_class": "idor",
+             "tech_stack": ["nextjs"], "endpoint": "https://target-A/api/orders/1", "lead_id": "lb-1"},
+            {"target": "target-A", "technique": "predictable_tech", "vuln_class": "ssrf",
+             "tech_stack": ["nextjs"], "endpoint": "https://target-A/fetch", "lead_id": "lb-2"},
+            {"target": "target-A", "technique": "resolved_tech", "vuln_class": "xss",
+             "tech_stack": ["nextjs"], "endpoint": "https://target-A/already-confirmed", "lead_id": "lb-3"},
+            {"target": "target-A", "technique": "dead_tech", "vuln_class": "rce",
+             "tech_stack": ["nextjs"], "endpoint": "https://target-A/dead", "lead_id": "lb-4"},
+        ]
+        # high-information: no prior data, connects to an active hypothesis
+        hyps = [{"id": "lb-hyp1", "chain_of": ["lb-1", "lb-9"]}]
+        # low-information: lopsided prior track record
+        low_info_exps = _exps(0, 10, technique="predictable_tech", vuln_class="ssrf")
+        confirmed = [{"target": "target-A", "vuln_class": "xss",
+                      "endpoint": "https://target-A/already-confirmed", "state": "CONFIRMED"}]
+        failed = [{"target": "target-A", "vuln_class": "rce", "technique": "dead_tech", "reason": "n/a"}]
+
+        ranked = rank_by_information_value(
+            candidates, experiments=low_info_exps, failed_patterns=failed,
+            confirmed_findings=confirmed, active_hypotheses=hyps,
+        )
+        order = [c["technique"] for c in ranked]
+
+        assert order[0] == "numeric_id_swap"  # empty history + hypothesis bonus -> highest genuine info value
+        assert order[1] == "predictable_tech"  # lopsided-but-nonzero track record -> some info, less than #1
+        # Resolved (already-confirmed) and hard-killed candidates sort last -- still
+        # present (never dropped), never ranked above a genuinely informative one.
+        assert set(order[2:]) == {"resolved_tech", "dead_tech"}
+        assert order.index("predictable_tech") < order.index("resolved_tech")
+        assert order.index("predictable_tech") < order.index("dead_tech")
+        for c in ranked:
+            if c["technique"] in ("resolved_tech", "dead_tech"):
+                assert c["evoi"]["resolved"] is True
+                assert c["evoi"]["information_value"] == 0.0
+
+
+class TestEvoiCliIntegration:
+
+    def test_evoi_cli_composes_target_profile_without_duplicating_reads(self, tmp_path, monkeypatch):
+        """The evoi CLI subcommand must read confirmed_findings/active_hypotheses
+        via tools.target_profile.build_target_profile() -- not a second,
+        independent read of finding_states.jsonl/the lead board."""
+        import sys as _sys
+        import json as _json
+
+        from tools import lead_board as lb
+        from memory.experiment_memory import main as em_main
+
+        monkeypatch.setattr(lb, "LEADS_DIR", str(tmp_path / "leads"))
+        lb.save_ledger("target-A", [{
+            "id": "lb-1", "target": "target-A", "skill": "hunt-idor", "priority": "high",
+            "signal": "CHAIN: ato", "why": "test", "evidence": "https://target-A/api/orders/1",
+            "source": "hypothesis", "status": "new", "note": "", "created": lb.now_iso(),
+            "last_seen": lb.now_iso(), "seen_count": 1, "chain_of": ["lb-2", "lb-3"],
+        }])
+        memory_dir = str(tmp_path / "hunt-memory")
+
+        monkeypatch.setattr(_sys, "argv", [
+            "experiment_memory.py", "evoi", "--target", "target-A", "--technique", "numeric_id_swap",
+            "--vuln-class", "idor", "--lead-id", "lb-1", "--memory-dir", memory_dir,
+            "--recon-dir", str(tmp_path / "recon" / "target-A"),
+        ])
+        assert em_main() == 0

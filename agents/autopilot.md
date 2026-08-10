@@ -290,7 +290,19 @@ re-sorts the queue: `state == "READY"`, ordered by `ev_per_hour` desc (tie-break
 `priority` desc). Each attack already names its `vuln_class`, `endpoint`/`evidence`,
 `falsifier`, and `maximum_time_minutes` — you don't select a vuln class or re-check
 `failed_patterns.jsonl` yourself here, `build-plan` already did that before this
-attack could reach `READY` at all.
+attack could reach `READY` at all. This EV/hour ordering stays authoritative — do not
+reorder the queue yourself.
+
+When two or more READY attacks are close in `ev_per_hour` (a real tie, not a vibe),
+`python3 -m memory.experiment_memory evoi --target <target> --technique <technique>
+--vuln-class <attack.vuln_class> --tech-stack "<stack>" --endpoint <attack.endpoint>
+--lead-id <attack.lead_id> --memory-dir hunt-memory` answers a different question than
+EV/hour does: not "what pays" but "how much would testing this one actually teach us
+right now" — a technique with a genuinely uncertain track record on tech like this
+target's outranks one whose outcome similar tests already predict confidently, and an
+attack sitting on the `chain_of` path of a currently-open hypothesis (surfaced in
+`distinguishes_hypotheses`) outranks an equivalent, unconnected one. Use it to break a
+real tie, not to override EV/hour on its own.
 
 For each READY attack, in order:
 
