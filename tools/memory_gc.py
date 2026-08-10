@@ -2,9 +2,37 @@
 """
 Memory GC — inspect and rotate hunt-memory JSONL files.
 
-Scans the hunt-memory directory for append-only logs (audit.jsonl,
-patterns.jsonl, journal.jsonl) and reports per-file size + backup usage.
-Optionally rotates oversize files or purges existing backups.
+Scans the hunt-memory directory for every append-only log this repo's
+memory/*.py *DB/*Store classes already protect with a per-write
+memory.rotation.rotate_if_needed() call (see ROTATABLE below) and reports
+per-file size + backup usage. Optionally rotates oversize files or purges
+existing backups.
+
+Before this list covered only 3 of the (now) 10 files that already have
+real on-write rotation protection — chains.jsonl/hypotheses.jsonl/
+report_outcomes.jsonl/failed_patterns.jsonl/experiments.jsonl/
+finding_states.jsonl/object_model/<target>.jsonl were all invisible here,
+so `--dir hunt-memory` (no args) undersold actual disk usage, and the
+session-end Stop-hook's blind `--rotate` call (.claude/settings.json)
+missed them too. Not a silent-unbounded-growth risk on its own (the
+per-write trigger inside each class's own .save()/.record() already
+rotates on the very next write regardless of whether this tool ever
+looked at the file) — purely a reporting/manual-rotation blind spot,
+closed here for consistency with what CLAUDE.md's `memory/rotation.py`
+bullet already claims applies repo-wide.
+
+memory/leads/<target>.jsonl (the lead board, tools/lead_board.py) is
+DELIBERATELY not covered here even though it's also a hunt-memory-
+adjacent JSONL file: it's a stateful KEYED ledger (read-modify-write via
+save_ledger()'s full-rewrite, not append-only) living outside the
+hunt-memory/ tree entirely. Byte-cap rotation is safe only for pure
+append-only logs (chop old bytes into a numbered backup, keep writing to
+a fresh file) — applying it to a ledger where every entry's CURRENT
+status/dedup-key membership must stay live-readable would silently drop
+killed/reported lead history, violating "Critical Rule 6: never lose a
+lead." A safe fix there needs its own compaction design (e.g. archiving
+terminal-status leads while keeping their dedup keys indexed elsewhere),
+not a blind reuse of this file's rotate-by-size logic.
 
 Usage:
     python -m tools.memory_gc                       # report only
@@ -32,8 +60,28 @@ from memory.rotation import (  # noqa: E402
     total_bytes,
 )
 
-# Files we consider rotatable. Anything else in the directory is left alone.
-ROTATABLE = ("audit.jsonl", "patterns.jsonl", "journal.jsonl")
+# Files/patterns we consider rotatable, matched via Path.rglob() (works
+# identically for a bare filename or a glob pattern with wildcards -- see
+# _find_targets()). Anything else in the directory is left alone.
+#
+# "object_model/*.jsonl" is the one entry that needs a wildcard:
+# memory.object_model.ObservationStore writes one <target>.jsonl file per
+# target under hunt-memory/object_model/ (see
+# tools/director.py::object_model_observations_path()), unlike every
+# other entry here, which is a single fixed filename shared across all
+# targets in one hunt-memory dir.
+ROTATABLE = (
+    "audit.jsonl",
+    "patterns.jsonl",
+    "journal.jsonl",
+    "failed_patterns.jsonl",
+    "chains.jsonl",
+    "report_outcomes.jsonl",
+    "hypotheses.jsonl",
+    "experiments.jsonl",
+    "finding_states.jsonl",
+    "object_model/*.jsonl",
+)
 
 
 def _human_size(n: int) -> str:
@@ -53,13 +101,18 @@ def _find_targets(root: Path) -> list[Path]:
     if not root.exists():
         return []
     found: set[Path] = set()
-    for name in ROTATABLE:
-        found.update(root.rglob(name))
-        # Match orphaned backups (audit.jsonl.1, audit.jsonl.2, ...) and
-        # surface their live path as a target even if the live file is gone.
-        for bp in root.rglob(name + ".*"):
+    for pattern in ROTATABLE:
+        found.update(root.rglob(pattern))
+        # Match orphaned backups (audit.jsonl.1, object_model/acme.jsonl.2,
+        # ...) and surface their live path as a target even if the live
+        # file is gone. Path.match() (not a bare name==name comparison)
+        # so this stays precise for the "object_model/*.jsonl" wildcard
+        # entry too -- a coincidental "object_model/x.jsonl.bak.1" strips
+        # to "object_model/x.jsonl.bak", which correctly does NOT match
+        # "object_model/*.jsonl" and is left alone.
+        for bp in root.rglob(pattern + ".*"):
             stem = bp.with_suffix("")  # strip the .N suffix
-            if stem.name == name:
+            if stem.match(pattern):
                 found.add(stem)
     return sorted(found)
 
