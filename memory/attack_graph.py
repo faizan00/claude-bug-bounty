@@ -455,13 +455,68 @@ def _observed_statuses(recon_dir: str | None) -> dict[str, int]:
     return out
 
 
+# A rule leg with this single value means "match any already-built node of
+# this leg's declared type, regardless of label" — the only sane way to
+# match a Capability leg, since Capability node labels are arbitrary,
+# target-specific strings extracted from a real client bundle (e.g.
+# "ROLE_ADMIN", "isAdmin", "canDeleteUser") with no fixed vocabulary the
+# way lead `skill` values are a fixed, known set of hunt-* tags. A
+# disclosed, minimal extension to the from_value/to_value schema, same
+# spirit as the file's existing "list of OR-alternatives" extension (see
+# rules/chain_rules.yaml's own header comment) — not a silent behavior
+# change, and it only ever applies to a Capability-typed leg (see
+# _leg_source_candidates() below); a skill-name leg with from_value: "*"
+# would just fail to match any lead, since no lead's skill is literally "*".
+WILDCARD_LEG_VALUE = "*"
+
+
+def _leg_source_candidates(leg_type: str, leg_values: frozenset[str], by_skill: dict[str, list[dict]],
+                            graph: Graph) -> list[dict]:
+    """One rule leg's real candidates, normalized to a common shape
+    regardless of where they come from:
+      {"node_id", "dedup_id", "dedup_evidence", "origin_lead_id"}
+
+    Every leg type except "Capability" is sourced from `leads` exactly as
+    before (matched by lead `skill` against leg_values) — zero behavior
+    change for every existing rule, all of which are Endpoint-shaped legs.
+
+    A "Capability" leg is sourced from already-built graph.nodes instead —
+    the real Capability nodes build_capability_graph() creates from Phase 1
+    browser intelligence (role/permission constants extracted from a client
+    bundle), which previously had no rule that could ever reach them: every
+    existing rule only ever looked leads up by skill, and a Capability node
+    has no lead / no skill field to match against. This is the smallest
+    extension that lets a rule actually originate from one of those nodes,
+    reusing the SAME rule engine (steps, confidence, contradiction check,
+    Impact-node creation) rather than a second, parallel mechanism."""
+    if leg_type == "Capability":
+        matches = WILDCARD_LEG_VALUE in leg_values
+        out = [
+            {"node_id": node.id, "dedup_id": node.id, "dedup_evidence": node.label, "origin_lead_id": None}
+            for node in graph.nodes.values()
+            if node.type == "Capability" and (matches or node.label in leg_values)
+        ]
+        return out[:MAX_LEG_CANDIDATES]
+
+    cands: list[dict] = []
+    for sk in leg_values:
+        for l in by_skill.get(sk, []):
+            cands.append({
+                "node_id": f"lead:{l['id']}", "dedup_id": l["id"],
+                "dedup_evidence": l["evidence"], "origin_lead_id": l["id"],
+            })
+    return cands[:MAX_LEG_CANDIDATES]
+
+
 def apply_chain_rules(graph: Graph, leads: list[dict], rules: list[ChainRule] | None = None,
                        observed_statuses: dict[str, int] | None = None) -> int:
     """Connect existing lead-derived nodes (added by build_capability_graph's
-    raw-lead pass, node id f"lead:{lead_id}") with rule-driven edges from
-    rules/chain_rules.yaml, creating terminal Impact nodes lazily where a
-    hypothesis-shaped rule fires. Applies the CONTRADICTORY EVIDENCE check
-    to every `grants` edge. Returns the number of edges added."""
+    raw-lead pass, node id f"lead:{lead_id}") — or, for a Capability-typed
+    leg, an already-built Capability node (see _leg_source_candidates()) —
+    with rule-driven edges from rules/chain_rules.yaml, creating terminal
+    Impact nodes lazily where a hypothesis-shaped rule fires. Applies the
+    CONTRADICTORY EVIDENCE check to every `grants` edge. Returns the number
+    of edges added."""
     rules = rules if rules is not None else load_chain_rules()
     observed_statuses = observed_statuses or {}
 
@@ -479,28 +534,31 @@ def apply_chain_rules(graph: Graph, leads: list[dict], rules: list[ChainRule] | 
         is_impact_terminated = legs[-1][0] == "Impact"
         skill_legs = legs[:-1] if is_impact_terminated else legs
 
-        leg_candidates = []
-        for _type, skills in skill_legs:
-            cands: list[dict] = []
-            for sk in skills:
-                cands.extend(by_skill.get(sk, []))
-            leg_candidates.append(cands[:MAX_LEG_CANDIDATES])
+        leg_candidates = [
+            _leg_source_candidates(leg_type, leg_values, by_skill, graph)
+            for leg_type, leg_values in skill_legs
+        ]
         if any(not c for c in leg_candidates):
             continue
 
         for combo in itertools.product(*leg_candidates):
-            ids = [l["id"] for l in combo]
+            ids = [c["dedup_id"] for c in combo]
             if len(set(ids)) != len(ids):
                 continue
-            if len({l["evidence"] for l in combo}) != len(combo):
+            if len({c["dedup_evidence"] for c in combo}) != len(combo):
                 continue
             if is_impact_terminated:
-                hosts = {lead_board._host_of(l["evidence"]) for l in combo}
+                # A Capability leg's dedup_evidence is a permission-constant
+                # label, not a URL — _host_of() returns None for it, and
+                # hosts.discard(None) already lets the OTHER, real-URL legs
+                # decide the same-host gate; a Capability isn't tied to one
+                # host the way an Endpoint/Credential lead is.
+                hosts = {lead_board._host_of(c["dedup_evidence"]) for c in combo}
                 hosts.discard(None)
                 if len(hosts) != 1:
                     continue  # same-host gate, mirrors detect_hypotheses()
 
-            prev_node_id = f"lead:{combo[0]['id']}"
+            prev_node_id = combo[0]["node_id"]
             if prev_node_id not in graph.nodes:
                 continue
 
@@ -509,9 +567,9 @@ def apply_chain_rules(graph: Graph, leads: list[dict], rules: list[ChainRule] | 
             cur_node_id = prev_node_id
             for i, step in enumerate(rule.steps):
                 if i + 1 < len(combo):
-                    leg_lead = combo[i + 1]
-                    to_node_id = f"lead:{leg_lead['id']}"
-                    to_evidence = leg_lead["evidence"]
+                    leg_cand = combo[i + 1]
+                    to_node_id = leg_cand["node_id"]
+                    to_evidence = leg_cand["dedup_evidence"]
                     if to_node_id not in graph.nodes:
                         ok = False
                         break
@@ -533,7 +591,7 @@ def apply_chain_rules(graph: Graph, leads: list[dict], rules: list[ChainRule] | 
                     break
                 new_edges.append(Edge(
                     cur_node_id, to_node_id, step.edge_type, confidence,
-                    origin_lead_id=combo[0]["id"],
+                    origin_lead_id=combo[0]["origin_lead_id"],
                     origin_source=f"rules/chain_rules.yaml#{rule.id}#step{i}",
                     confidence_source="uncalibrated_prior: rules/chain_rules.yaml step confidence "
                                        "(0.6 chain-shaped / 0.75 hypothesis-shaped, a fixed judgment call, "

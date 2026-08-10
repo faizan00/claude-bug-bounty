@@ -170,3 +170,44 @@
       to_type: Impact
       to_value: "Account Takeover (permissive CORS -> IDOR -> account surface)"
       confidence: 0.75
+
+# ── Capability-origin rules (architecture Milestone 3) ─────────────────────
+#
+# Everything above is a transcription of tools/lead_board.py's hardcoded
+# CHAIN_RULES/HYPOTHESIS_RECIPES and only ever chains Endpoint -> Endpoint ->
+# Impact, matched by lead `skill`. The rules below are new: they originate
+# from a Capability node instead of a lead. Capability nodes are real,
+# already-built by memory/attack_graph.py's build_capability_graph() from
+# Phase 1 browser intelligence (role/permission constants extracted from a
+# client bundle, e.g. "ROLE_ADMIN", "isAdmin") — but before this batch, no
+# rule's from_type was ever "Capability" and the rule ENGINE itself
+# (apply_chain_rules()) only ever looked candidates up by lead skill, so a
+# Capability node had exactly one edge (Asset->Capability, from
+# build_capability_graph() itself) and zero outgoing edges: a structural
+# dead end that could never appear in find_paths()'s output despite being a
+# declared valid path-start type. See memory/attack_graph.py's
+# _leg_source_candidates() for the (small, disclosed) engine extension this
+# required.
+#
+# from_value: "*" (WILDCARD_LEG_VALUE) is used here deliberately: unlike a
+# lead's `skill`, a Capability node's label is an arbitrary, target-specific
+# string with no fixed vocabulary to enumerate — matching by TYPE alone
+# (any Capability node) is the only thing that generalizes across targets.
+
+- id: client_capability_plus_missing_serverside_check
+  description: "privileged role/permission constant found in the client bundle (a Capability the frontend gates on) + an authz/IDOR/misconfig signal on the same asset -- client-side-only gating frequently has no matching server-side check; test whether the capability the frontend hides is actually reachable by calling the backend directly"
+  enabled: true
+  min_confidence: 0.5
+  steps:
+    - from_type: Capability
+      from_value: "*"
+      edge_type: grants
+      to_type: Endpoint
+      to_value: [hunt-auth-bypass, hunt-idor, hunt-api-misconfig]
+      # Deliberately lower than the 0.6 chain-shaped baseline: a client-side
+      # role/permission constant existing at all is a weaker, more
+      # speculative signal than a real reveals/crosses observation between
+      # two live endpoints -- flagged explicitly, not derived from data,
+      # same "confidence is a disclosed judgment call" discipline this
+      # file's header comment already establishes for every other rule.
+      confidence: 0.5
