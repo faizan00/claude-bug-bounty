@@ -47,9 +47,9 @@ For every candidate endpoint/surface, ask: what vuln class would explain this co
 | Signal source | What to look for |
 |---|---|
 | URL shape | numeric/UUID object IDs, REST resource nouns (`/users/`, `/orders/`, `/accounts/`), GraphQL/WebSocket endpoints |
-| Tech stack | framework-specific weak points (see `tools/mindmap.py`'s `TECH_CHECKS`) |
+| Tech stack | framework-specific weak points (see `tools/mindmap.py`'s `TECH_CHECKS`) — heuristic-only, no specific version confirmed vulnerable |
 | js-intelligence.md | hidden endpoints not in public recon, debug routes, feature flags, auth flow details, browser-required surface (SPA routing / client-only auth / WebSocket-only) |
-| Lead board | chain/hypothesis leads (multi-signal correlation), nuclei-confirmed findings |
+| Lead board | chain/hypothesis leads (multi-signal correlation), nuclei-confirmed findings, `source: "fingerprint-cve"` leads (below) |
 | intelligence-briefing.md | vuln classes with a positive `net_score` for this tech stack, known chains matching this stack |
 | `failed_patterns.jsonl` (via briefing) | techniques already dead here — never generate a hypothesis that's already a confirmed dead end |
 
@@ -64,6 +64,10 @@ python3 -m memory.vuln_intelligence priority --vuln-class <class> --tech "<stack
 python3 -m memory.vuln_intelligence decision --vuln-class idor --tech "<stack>" \
   --target <target> --endpoint "<endpoint>" --next-experiment "<first testing strategy>" --memory-dir hunt-memory
 ```
+
+## Framework CVE Matches Are Already Pre-Qualified — Promote, Don't Regenerate
+
+If `recon/<target>/fingerprint.json` matched the target's actual fingerprinted framework+version against a published CVE (a real `version_in_range()` comparison, not a guess), `director.py build-plan` already turned it into a `source: "fingerprint-cve"` lead on the board with the CVE id/citation in its `why` — same tier as a nuclei hit or a secrets_scanner.py match: mechanically confirmed, no judgment call needed. Don't write a fresh hypothesis re-deriving "this framework version might be vulnerable" from `tools/mindmap.py`'s generic `TECH_CHECKS` when a real, version-specific match already exists on the board — promote the existing lead into your hypotheses.md the same way you already promote `source: "hypothesis"` leads, citing the CVE id as your evidence. This is deliberately NOT written into `hypotheses.jsonl` itself (that's for a confidence number YOU declare and that gets calibrated against outcome later) — a version-range match has no judgment call to calibrate.
 
 ## Calibration Check (before finalizing any confidence number)
 
