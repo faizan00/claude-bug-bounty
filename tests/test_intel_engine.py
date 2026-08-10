@@ -4,7 +4,8 @@ import json
 import os
 import pytest
 
-from intel_engine import load_memory_context, prioritize_intel
+import intel_engine
+from intel_engine import format_output, load_memory_context, prioritize_intel
 
 
 @pytest.fixture
@@ -189,3 +190,159 @@ class TestPrioritizeIntel:
         memory = {"tested_cves": [], "tested_endpoints": [], "patterns": []}
         intel = prioritize_intel(results, memory)
         assert intel["total"] == 3
+
+
+class TestProgramMetaRouting:
+    """category="program_meta" entries (program stats + policy/scope) get
+    their own bucket -- never misfiled as an "already tested" CVE (their
+    id never starts with "CVE"), never silently folded into the invisible
+    info-count the way they were before this existed."""
+
+    def test_program_meta_entry_routed_to_its_own_bucket(self):
+        results = [
+            {"id": "program-policy:acme", "source": "HackerOne/policy",
+             "category": "program_meta", "severity": "INFO", "summary": "acme scope: 3 asset(s)"},
+        ]
+        memory = {"tested_cves": [], "tested_endpoints": [], "patterns": []}
+        intel = prioritize_intel(results, memory)
+        assert len(intel["program_meta"]) == 1
+        assert intel["critical"] == intel["high"] == intel["info"] == []
+
+    def test_program_meta_never_gets_already_tested_note(self):
+        # A program-meta id ("program-policy:acme") never starts with
+        # "CVE" so the already_tested branch can't fire for it anyway --
+        # this pins that the category check short-circuits BEFORE that
+        # logic even runs, not just that it happens to be false.
+        results = [
+            {"id": "program:acme", "source": "HackerOne/stats",
+             "category": "program_meta", "severity": "INFO", "summary": "acme: bounty"},
+        ]
+        memory = {"tested_cves": [], "tested_endpoints": [], "patterns": []}
+        intel = prioritize_intel(results, memory)
+        assert "already_tested" not in intel["program_meta"][0]
+
+    def test_total_count_includes_program_meta(self):
+        results = [
+            {"id": "program:acme", "category": "program_meta", "severity": "INFO", "summary": "s"},
+            {"id": "CVE-1", "severity": "HIGH", "summary": "h"},
+        ]
+        memory = {"tested_cves": [], "tested_endpoints": [], "patterns": []}
+        intel = prioritize_intel(results, memory)
+        assert intel["total"] == 2
+
+    def test_no_program_meta_gives_empty_bucket(self):
+        intel = prioritize_intel([], {"tested_cves": [], "tested_endpoints": [], "patterns": []})
+        assert intel["program_meta"] == []
+
+
+class TestFormatOutputProgramSection:
+
+    def _base_intel(self, **overrides):
+        base = {"critical": [], "high": [], "info": [], "program_meta": [],
+                "memory_context": {}, "total": 0}
+        base.update(overrides)
+        return base
+
+    def test_no_program_meta_omits_section(self):
+        out = format_output("t.example", self._base_intel())
+        assert "PROGRAM:" not in out
+
+    def test_program_meta_entry_renders_summary(self):
+        intel = self._base_intel(program_meta=[
+            {"source": "HackerOne/stats", "summary": "acme: bounty, 42 resolved, avg 3d response"},
+        ])
+        out = format_output("t.example", intel)
+        assert "PROGRAM:" in out
+        assert "acme: bounty, 42 resolved, avg 3d response" in out
+
+    def test_policy_scopes_render_as_bulleted_list(self):
+        intel = self._base_intel(program_meta=[
+            {
+                "source": "HackerOne/policy", "summary": "acme scope: 2 asset(s)",
+                "policy": {"scopes": [
+                    {"identifier": "*.acme.com", "type": "URL", "bounty_eligible": True, "submission_eligible": True},
+                    {"identifier": "legacy.acme.com", "type": "URL", "bounty_eligible": False, "submission_eligible": False},
+                ]},
+            },
+        ])
+        out = format_output("t.example", intel)
+        assert "*.acme.com" in out and "bounty" in out
+        assert "legacy.acme.com" in out and "OUT OF SCOPE" in out
+
+    def test_more_than_ten_scopes_truncates_with_a_count(self):
+        scopes = [{"identifier": f"asset{i}.acme.com", "type": "URL",
+                    "bounty_eligible": True, "submission_eligible": True} for i in range(15)]
+        intel = self._base_intel(program_meta=[
+            {"source": "HackerOne/policy", "summary": "s", "policy": {"scopes": scopes}},
+        ])
+        out = format_output("t.example", intel)
+        assert "asset0.acme.com" in out
+        assert "asset14.acme.com" not in out
+        assert "5 more asset(s)" in out
+
+
+class TestFetchAllIntelProgramMeta:
+    """fetch_all_intel()'s program-stats/policy branch -- monkeypatches the
+    module-level get_program_stats/get_program_policy functions rather than
+    re-testing their own network layer (already covered by
+    tests/test_hackerone_server.py)."""
+
+    def test_program_policy_is_fetched_and_tagged(self, monkeypatch):
+        monkeypatch.setattr(intel_engine, "H1_MCP_AVAILABLE", True)
+        monkeypatch.setattr(intel_engine, "search_disclosed_reports", lambda **kw: [])
+        monkeypatch.setattr(intel_engine, "get_program_stats", lambda program: {
+            "name": "acme", "offers_bounties": True, "resolved_reports": 10,
+            "avg_days_to_first_response": 2, "launched_at": "2020-01-01",
+        })
+        monkeypatch.setattr(intel_engine, "get_program_policy", lambda program: {
+            "program": program, "name": "acme", "offers_bounties": True,
+            "policy_text": "safe harbor...",
+            "scopes": [
+                {"type": "URL", "identifier": "*.acme.com", "bounty_eligible": True,
+                 "submission_eligible": True, "instruction": ""},
+                {"type": "URL", "identifier": "beta.acme.com", "bounty_eligible": False,
+                 "submission_eligible": True, "instruction": "submission only, no payout"},
+            ],
+        })
+        results = intel_engine.fetch_all_intel([], "acme.com", program="acme")
+        policy_entries = [r for r in results if r.get("source") == "HackerOne/policy"]
+        assert len(policy_entries) == 1
+        entry = policy_entries[0]
+        assert entry["category"] == "program_meta"
+        assert entry["policy"]["scopes"][0]["identifier"] == "*.acme.com"
+        assert "1 bounty-eligible" in entry["summary"]
+        assert "1 submission-only" in entry["summary"]
+
+    def test_program_policy_error_response_produces_no_entry(self, monkeypatch):
+        monkeypatch.setattr(intel_engine, "H1_MCP_AVAILABLE", True)
+        monkeypatch.setattr(intel_engine, "search_disclosed_reports", lambda **kw: [])
+        monkeypatch.setattr(intel_engine, "get_program_stats", lambda program: {"error": "not found"})
+        monkeypatch.setattr(intel_engine, "get_program_policy",
+                             lambda program: {"error": f"Program '{program}' not found", "program": program})
+        results = intel_engine.fetch_all_intel([], "ghost.com", program="ghost")
+        assert not [r for r in results if r.get("source") in ("HackerOne/policy", "HackerOne/stats")]
+
+    def test_no_bounties_flagged_in_summary(self, monkeypatch):
+        monkeypatch.setattr(intel_engine, "H1_MCP_AVAILABLE", True)
+        monkeypatch.setattr(intel_engine, "search_disclosed_reports", lambda **kw: [])
+        monkeypatch.setattr(intel_engine, "get_program_stats", lambda program: {"error": "x"})
+        monkeypatch.setattr(intel_engine, "get_program_policy", lambda program: {
+            "program": program, "name": "nobounty", "offers_bounties": False,
+            "policy_text": "", "scopes": [],
+        })
+        results = intel_engine.fetch_all_intel([], "nobounty.com", program="nobounty")
+        entry = next(r for r in results if r.get("source") == "HackerOne/policy")
+        assert "NO BOUNTIES" in entry["summary"]
+
+    def test_no_program_given_never_calls_policy(self, monkeypatch):
+        monkeypatch.setattr(intel_engine, "H1_MCP_AVAILABLE", True)
+        monkeypatch.setattr(intel_engine, "search_disclosed_reports", lambda **kw: [])
+
+        def _boom(program):
+            raise AssertionError("get_program_policy must not be called without --program")
+        monkeypatch.setattr(intel_engine, "get_program_policy", _boom)
+        monkeypatch.setattr(intel_engine, "get_program_stats", _boom)
+        # techs=[] -- avoids a real network call to fetch_github_advisories/
+        # fetch_nvd_cves (learn.py), irrelevant to what this test verifies.
+        results = intel_engine.fetch_all_intel([], "t.example", program="")
+        assert not [r for r in results if r.get("category") == "program_meta"]

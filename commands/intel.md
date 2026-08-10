@@ -10,8 +10,9 @@ Fetch actionable intelligence for a target.
 
 1. Runs `learn.py` for CVEs and advisories matching the target's tech stack
 2. Fetches HackerOne Hacktivity for the target (via HackerOne MCP if available)
-3. Cross-references with hunt memory — flags untested CVEs and new endpoints
-4. Outputs prioritized intel with hunt recommendations
+3. With `--program <handle>`: also pulls the program's stats AND its structured scope/policy (asset list, per-asset bounty eligibility, safe-harbor text) straight from HackerOne's public GraphQL API — no auth needed. Directly serves Critical Rule 1 ("READ FULL SCOPE before touching any asset"); a `PROGRAM:` section in the output lists each in-scope asset and whether it's bounty-eligible, submission-only, or out of scope.
+4. Cross-references with hunt memory — flags untested CVEs and new endpoints
+5. Outputs prioritized intel with hunt recommendations
 
 ## Tool
 
@@ -34,6 +35,7 @@ to point at a non-default hunt-memory location.
 
 ```
 /intel target.com
+/intel target.com --program acme     # also pulls scope/policy from HackerOne
 ```
 
 ## Output
@@ -41,6 +43,12 @@ to point at a non-default hunt-memory location.
 ```
 INTEL: target.com
 ═══════════════════════════════════════
+
+PROGRAM:
+  [HackerOne/stats] acme: bounty, 42 resolved, avg 2d response
+  [HackerOne/policy] acme scope: 6 asset(s), 4 bounty-eligible, 1 submission-only. Offers bounties.
+    • *.acme.com (URL) — bounty
+    • legacy.acme.com (URL) — OUT OF SCOPE
 
 ALERTS:
 [CRITICAL] CVE-2026-XXXX — Next.js middleware bypass (CVSS 9.1)
@@ -69,3 +77,13 @@ MEMORY CONTEXT:
 | `learn.py` — HackerOne Hacktivity | Disclosed reports | No |
 | HackerOne MCP (if connected) | Program stats, policy | No (public) |
 | Hunt memory | Previously tested endpoints | Local files |
+
+## Scope Safety (Critical Rule 1)
+
+`--program`'s `PROGRAM:` section only lists the first 10 scope entries in the
+formatted view — pass `--json` and read the full `policy.scopes` array before
+trusting a partial list for a program with more than 10 assets. This is a
+convenience cross-check, not a replacement for `/scope`/`tools/scope_checker.py`
+(the deterministic scope gate every recon/vuln tool actually enforces against)
+— use it to build intuition for what's in scope before running recon, not as
+the live authorization check itself.
