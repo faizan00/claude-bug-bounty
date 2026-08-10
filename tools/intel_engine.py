@@ -30,7 +30,7 @@ from learn import fetch_github_advisories, fetch_nvd_cves, severity_order
 # Try importing HackerOne MCP server
 try:
     sys.path.insert(0, os.path.join(BASE_DIR, "..", "mcp", "hackerone-mcp"))
-    from server import search_disclosed_reports, get_program_stats, HackerOneAPIError
+    from server import search_disclosed_reports, get_program_stats, get_program_policy, HackerOneAPIError
     H1_MCP_AVAILABLE = True
 except ImportError:
     H1_MCP_AVAILABLE = False
@@ -176,7 +176,11 @@ def fetch_all_intel(techs: list[str], target: str, program: str = "") -> list[di
                 h1_results = fetch_hackerone_hacktivity(kw, limit=5)
                 all_results.extend(h1_results)
 
-    # Program stats if available
+    # Program stats + policy/scope if available. Both are tagged
+    # category="program_meta" -- program metadata, not a vuln finding --
+    # so prioritize_intel() routes them to their own bucket instead of
+    # folding them into the generic "info" count, where format_output()
+    # previously only ever printed a bare number, never program detail.
     if program and H1_MCP_AVAILABLE:
         print(f"  {CYAN}[H1 MCP]{RESET} Program stats for {program}...")
         try:
@@ -185,6 +189,7 @@ def fetch_all_intel(techs: list[str], target: str, program: str = "") -> list[di
                 all_results.append({
                     "id": f"program:{program}",
                     "source": "HackerOne/stats",
+                    "category": "program_meta",
                     "tech": "program",
                     "severity": "INFO",
                     "summary": (
@@ -199,6 +204,41 @@ def fetch_all_intel(techs: list[str], target: str, program: str = "") -> list[di
         except HackerOneAPIError as e:
             print(f"  {YELLOW}Stats error: {e}{RESET}")
 
+        # Policy/scope: the SAME public GraphQL API get_program_stats()
+        # already uses, no extra credential needed -- structured_scopes
+        # (asset_type/identifier/bounty_eligible/submission_eligible/
+        # instruction) is the single most scope-safety-relevant thing
+        # this intel pipeline can surface (Critical Rule 1: READ FULL
+        # SCOPE before touching any asset). Real, tested
+        # (mcp/hackerone-mcp/server.py, tests/test_hackerone_server.py::
+        # TestGetProgramPolicy) but never called from anywhere until now.
+        print(f"  {CYAN}[H1 MCP]{RESET} Program policy/scope for {program}...")
+        try:
+            policy = get_program_policy(program)
+            if "error" not in policy:
+                scopes = policy.get("scopes", []) or []
+                bounty_eligible = sum(1 for s in scopes if s.get("bounty_eligible"))
+                submission_only = sum(
+                    1 for s in scopes if s.get("submission_eligible") and not s.get("bounty_eligible")
+                )
+                all_results.append({
+                    "id": f"program-policy:{program}",
+                    "source": "HackerOne/policy",
+                    "category": "program_meta",
+                    "tech": "program",
+                    "severity": "INFO",
+                    "summary": (
+                        f"{policy.get('name', program)} scope: {len(scopes)} asset(s), "
+                        f"{bounty_eligible} bounty-eligible, {submission_only} submission-only. "
+                        + ("Offers bounties." if policy.get("offers_bounties")
+                           else "NO BOUNTIES — verify payout expectations before testing.")
+                    ),
+                    "published": "",
+                    "policy": policy,
+                })
+        except HackerOneAPIError as e:
+            print(f"  {YELLOW}Policy error: {e}{RESET}")
+
     return all_results
 
 
@@ -206,7 +246,8 @@ def prioritize_intel(results: list[dict], memory: dict) -> dict:
     """Prioritize intel against memory context.
 
     Returns:
-        Dict with categorized alerts: critical, high, info, memory_context.
+        Dict with categorized alerts: critical, high, info, program_meta,
+        memory_context.
     """
     tested_endpoints = set(memory.get("tested_endpoints", []))
     tested_cves = set(memory.get("tested_cves", []))
@@ -214,8 +255,18 @@ def prioritize_intel(results: list[dict], memory: dict) -> dict:
     critical = []
     high = []
     info = []
+    program_meta = []
 
     for r in results:
+        # Program stats/policy aren't a vuln finding -- routing them through
+        # the severity ladder below would either misfile them as "already
+        # tested" (their id never matches a CVE) or bury them in the info
+        # bucket, which format_output() only ever renders as a bare count.
+        # Own bucket, own section, always shown.
+        if r.get("category") == "program_meta":
+            program_meta.append(r)
+            continue
+
         sev = r.get("severity", "UNKNOWN").upper()
         cve_id = r.get("id", "")
 
@@ -272,6 +323,7 @@ def prioritize_intel(results: list[dict], memory: dict) -> dict:
         "critical": critical,
         "high": high,
         "info": info,
+        "program_meta": program_meta,
         "memory_context": memory_context,
         "total": len(results),
     }
@@ -285,6 +337,20 @@ def format_output(target: str, intel: dict) -> str:
         f"{'═' * 50}",
         f"",
     ]
+
+    if intel.get("program_meta"):
+        lines.append(f"{BOLD}PROGRAM:{RESET}")
+        for item in intel["program_meta"]:
+            lines.append(f"  {CYAN}[{item.get('source', 'HackerOne')}]{RESET} {item.get('summary', '')}")
+            policy = item.get("policy")
+            if policy and policy.get("scopes"):
+                for s in policy["scopes"][:10]:
+                    tag = "bounty" if s.get("bounty_eligible") else (
+                        "submission-only" if s.get("submission_eligible") else "OUT OF SCOPE")
+                    lines.append(f"    • {s.get('identifier', '?')} ({s.get('type', '?')}) — {tag}")
+                if len(policy["scopes"]) > 10:
+                    lines.append(f"    … {len(policy['scopes']) - 10} more asset(s), see --json for the full list")
+        lines.append("")
 
     if intel["critical"]:
         lines.append(f"{BOLD}ALERTS:{RESET}")
