@@ -129,6 +129,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 - `memory/experiment_memory.py` — granular per-payload-attempt log (`experiments.jsonl`) beneath patterns/failed_patterns; `payload_category_affinity()`, `should_stop()` (5-min-rule + diminishing-returns), `suggest_pivot()` (CLI: `python3 -m memory.experiment_memory <cmd>`)
 - `memory/audit_log.py` — request audit log, rate limiter, circuit breaker
 - `memory/rotation.py` — size-based JSONL rotation (10MB cap, keep 3 backups), auto-fired on append
+- `memory/atomic_write.py` — crash-safe whole-file JSON/text replacement (temp file + fsync + `os.replace()`), the same discipline `tools/lead_board.py`'s `save_ledger()` established (PR #20) but never had extracted into a shared helper. Now used by every OTHER read-modify-write JSON state file that previously used a plain, non-atomic `path.write_text()`: `director.py`'s `save_plan()` (`hunt-plan.json`, `/pickup`'s authoritative resume point), `object_model.py`'s `save_session()` (business-logic checkpoints), `fingerprint.py`'s `sync_tech_stack()` (per-target profile) and `save_tech_attack_matrix_cache()` (live CVE cache), `browser_recon.py`'s cross-account `api-calls.json` merge.
 - `memory/schemas.py` — schema validation for all data
 
 ## Start Here

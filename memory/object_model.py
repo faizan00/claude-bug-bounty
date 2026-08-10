@@ -100,6 +100,7 @@ if _REPO not in sys.path:
 
 from memory.candidate import EVIDENCE_TYPES, make_candidate  # noqa: E402
 from memory.rotation import DEFAULT_KEEP, DEFAULT_MAX_BYTES, rotate_if_needed  # noqa: E402
+from memory.atomic_write import atomic_write_text  # noqa: E402
 from tools.auth_session import AuthSession  # noqa: E402
 
 DEFAULT_LOGIC_PATTERNS_PATH = os.path.join(_REPO, "rules", "logic_patterns.yaml")
@@ -709,10 +710,13 @@ def make_checkpoint(
 
 def save_session(checkpoint: dict, path: str | Path) -> str:
     """JSON sidecar for cross-process workflow resume — same convention as
-    tools/director.py's save_plan()."""
+    tools/director.py's save_plan(), including its atomic write (memory/
+    atomic_write.py): a crash mid-write to a business-logic checkpoint
+    that's been accumulating real --establish/--probe workflow_state
+    across a multi-step test would otherwise corrupt or empty it, taking
+    /pickup's "where you left off" resume with it."""
     out_path = Path(path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(checkpoint, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    atomic_write_text(out_path, json.dumps(checkpoint, indent=2, sort_keys=True) + "\n")
     return str(out_path)
 
 
