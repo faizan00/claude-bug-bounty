@@ -40,6 +40,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
@@ -527,26 +528,69 @@ def cloud_recon_leads(target: str, findings_dir: str) -> list[dict]:
     return leads
 
 
-# One (artifact filename, priority, signal, why) row per graphql_audit.sh
-# output file that indicates a real finding (as opposed to a clean/empty
-# scan). Table instead of one hand-written `if` per file so adding a new
-# audit-script output later is a one-line addition, not new branching logic.
-_GRAPHQL_AUDIT_SIGNALS: tuple[tuple[str, str, str, str], ...] = (
-    ("introspection.json", lead_board.P_HIGH, "introspection enabled",
+# tools/graphql_audit.sh's summary.txt is written by the script itself, one
+# "key: value" line per phase — and it's the ONLY place the script derives
+# a clean ENABLED/DISABLED/HIT verdict. Every phase's raw output file
+# (batching_dos.txt, alias_bomb.txt, gqlmap.txt, cop_report.txt,
+# introspection.json) is ALWAYS non-empty regardless of outcome: curl
+# always writes an HTTP response body even on rejection, and a
+# tool-not-installed placeholder ("(install: pip install X)") is also
+# non-empty text. A prior version of this function used
+# "is the file non-empty" as its hit signal — verified empirically (by
+# reading tools/graphql_audit.sh's actual write paths line by line, not
+# assumed) that this fabricated a P_HIGH "confirmed" lead (batching DoS,
+# alias bomb, introspection enabled, ...) on essentially every successful
+# run, a real violation of "never fabricate confidence" for code already
+# wired into build_plan(). Parsing summary.txt instead reuses the SAME
+# verdict the shell script's own author already computed, rather than a
+# second, weaker one re-derived here.
+#
+# (summary_key, is_hit(value)->bool, artifact_filename_or_None, priority,
+#  signal, why). artifact_filename is None only for field_suggestions
+# (Phase 1's built-in "did you mean" hint check has no dedicated output
+# file of its own — the evidence is the endpoint + summary.txt itself).
+_GRAPHQL_SUMMARY_SIGNALS: tuple[tuple[str, Callable[[str], bool], str | None, str, str, str], ...] = (
+    ("introspection", lambda v: v == "ENABLED", "introspection.json", lead_board.P_HIGH,
+     "introspection enabled",
      "full schema dump available — map hidden types/mutations for IDOR/auth-bypass candidates"),
-    ("field_suggestions.json", lead_board.P_MED, "clairvoyance field suggestions",
-     "introspection disabled but field-suggestion errors leak schema shape (clairvoyance technique)"),
-    ("batching_dos.txt", lead_board.P_HIGH, "batching DoS confirmed",
+    ("introspection_get_bypass", lambda v: v == "YES", "introspection.json", lead_board.P_HIGH,
+     "introspection reachable via GET (WAF/method bypass)",
+     "introspection blocked on POST but reachable via GET — WAF rule keyed on method, not query content"),
+    ("field_suggestions", lambda v: v == "ENABLED", None, lead_board.P_MED,
+     "field-suggestion hint enabled",
+     "\"did you mean\" errors leak schema shape without introspection (clairvoyance technique)"),
+    ("array_batching", lambda v: v == "ENABLED", "batching_dos.txt", lead_board.P_HIGH,
+     "batching DoS confirmed",
      "query batching bypasses per-request rate limiting — resource exhaustion / brute-force amplification"),
-    ("alias_bomb.txt", lead_board.P_HIGH, "alias bomb confirmed",
+    ("alias_bombing", lambda v: v == "ENABLED", "alias_bomb.txt", lead_board.P_HIGH,
+     "alias bomb confirmed",
      "aliased duplicate fields amplify a single request — DoS / rate-limit bypass"),
-    ("interesting_fields.txt", lead_board.P_MED, "interesting schema fields",
-     "introspection surfaced fields named like internal/admin/id — IDOR candidates"),
-    ("gqlmap.txt", lead_board.P_HIGH, "gqlmap injection signal",
-     "gqlmap flagged a possible injection point in a GraphQL field"),
-    ("cop_report.txt", lead_board.P_MED, "graphql-cop checklist findings",
-     "graphql-cop flagged one or more standard GraphQL security misconfigurations"),
+    ("sqli_quick_probe", lambda v: v == "POSSIBLE HIT", "gqlmap.txt", lead_board.P_HIGH,
+     "built-in SQLi probe hit",
+     "error-based SQL injection signal in a GraphQL field argument (gqlmap not installed, built-in fallback probe)"),
+    ("injection_scan", lambda v: v.startswith("completed"), "gqlmap.txt", lead_board.P_MED,
+     "gqlmap injection scan ran",
+     "gqlmap completed against this endpoint — review gqlmap.txt manually, the script derives no pass/fail verdict itself"),
+    ("graphql_cop", lambda v: v.startswith("completed"), "cop_report.txt", lead_board.P_MED,
+     "graphql-cop checklist findings",
+     "graphql-cop completed its standard misconfiguration checklist — review cop_report.txt for specifics"),
+    ("depth_limit", lambda v: v == "NONE DETECTED", "depth_bomb.txt", lead_board.P_HIGH,
+     "no query depth/complexity limit enforced",
+     "a depth-15 nested query was accepted with HTTP 200 and no depth/complexity rejection — DoS via deeply nested queries"),
 )
+
+
+def _parse_graphql_summary(path: Path) -> dict[str, str]:
+    """tools/graphql_audit.sh's summary.txt: one "key: value" line per
+    phase. Best-effort — a malformed or missing line is skipped, never
+    raises, same convention as every other reader in this module."""
+    result: dict[str, str] = {}
+    for line in _read_text_lines(path):
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        result[key.strip()] = value.strip()
+    return result
 
 
 def graphql_audit_leads(target: str, findings_dir: str, recon_dir: str | None = None) -> list[dict]:
@@ -568,18 +612,31 @@ def graphql_audit_leads(target: str, findings_dir: str, recon_dir: str | None = 
             api_style_confirmed = "graphql" in (fp_data.get("api_style") or [])
     tag = "[api_style=graphql, fingerprint-confirmed]" if api_style_confirmed else "[api_style=graphql]"
 
-    for filename, priority, signal, why in _GRAPHQL_AUDIT_SIGNALS:
-        path = base / filename
-        if filename.endswith(".json"):
-            data = _read_json_file(path)
-            has_content = bool(data)
-        else:
-            has_content = bool(_read_text_lines(path))
-        if not has_content:
+    summary = _parse_graphql_summary(base / "summary.txt")
+
+    for key, is_hit, artifact, priority, signal, why in _GRAPHQL_SUMMARY_SIGNALS:
+        value = summary.get(key)
+        if value is None or not is_hit(value):
             continue
+        artifact_path = base / artifact if artifact else base / "summary.txt"
         leads.append(_new_tool_lead(
             target, "hunt-graphql", priority, signal, f"{why} {tag}",
-            str(path), "graphql-audit", filename,
+            str(artifact_path), "graphql-audit", artifact or "summary.txt",
+        ))
+
+    # interesting_fields.txt has no summary.txt marker of its own — the
+    # script writes it (even the literal placeholder line below) whenever
+    # introspection succeeded, regardless of whether anything interesting
+    # was actually found, so "file is non-empty" is not a real signal —
+    # must check for the actual negative-result marker text the script
+    # itself writes (tools/graphql_audit.sh's own Python block, "no
+    # obvious sensitive names found").
+    interesting_lines = _read_text_lines(base / "interesting_fields.txt")
+    if interesting_lines and interesting_lines != ["no obvious sensitive names found"]:
+        leads.append(_new_tool_lead(
+            target, "hunt-graphql", lead_board.P_MED, "interesting schema fields",
+            f"introspection surfaced fields named like internal/admin/id — IDOR candidates {tag}",
+            str(base / "interesting_fields.txt"), "graphql-audit", "interesting_fields.txt",
         ))
 
     return leads
