@@ -440,15 +440,44 @@ def _new_tool_lead(target: str, skill: str, priority: str, signal: str, why: str
     }
 
 
+# dnsReaper's own confidence tier (finding.py's CONFIDENCE enum, upstream
+# source https://github.com/punk-security/dnsReaper/blob/main/detection_enums.py)
+# was previously discarded — every hit got a flat P_HIGH regardless of
+# whether the signature itself only rates the takeover "UNLIKELY" ("may be
+# possible (although unlikely)"). Real, self-reported evidence-quality data
+# was being thrown away, not fabricated — but flattening a genuine
+# low-confidence signal up to P_HIGH is the same "missing/ambiguous
+# evidence creates high confidence" problem in miniature.
+_DNSREAPER_CONFIDENCE_PRIORITY: dict[str, str] = {
+    "CONFIRMED": lead_board.P_HIGH,
+    "POTENTIAL": lead_board.P_MED,
+    "UNLIKELY": lead_board.P_LOW,
+}
+
+# subjack's own upstream source (subjack/output.go's printResult(), verified
+# via https://github.com/haccer/subjack) writes a line to -o's output file
+# for EVERY scanned host, vulnerable or not:
+#   vulnerable:     "[%s] %s\n"              % (service, url)
+#   not vulnerable: "[Not Vulnerable] %s\n"  % (url)
+# A prior version of this function treated every non-empty line as a P_HIGH
+# takeover lead -- the exact "successful/non-empty tool output treated as a
+# finding" bug PR #38 found in graphql_audit_leads(), now confirmed here
+# too (line.split()[0] was ALSO extracting the bracketed tag, not the URL,
+# so even the genuine-hit case had the wrong evidence field).
+_SUBJACK_LINE_RE = re.compile(r"^\[([^\]]*)\]\s+(\S+)")
+
+
 def takeover_leads(target: str, findings_dir: str) -> list[dict]:
     """Convert tools/takeover_scanner.sh output into lead-board-shaped
     candidates. Uses the existing "hunt-subdomain" skill — the same one
     lead_board.py's nuclei-tag routing already uses for takeover signals
     (tools/lead_board.py's NUCLEI_TAG_SKILL table), not a new skill name.
 
-    dnsReaper/subjack hits are the scanner's own vetted candidates -> P_HIGH.
-    The curl-fingerprint fallback (only used when neither tool is installed)
-    is explicitly labeled "(low signal)" by takeover_scanner.sh itself -> P_MED.
+    dnsReaper/subjack hits are the scanner's own vetted candidates -> P_HIGH
+    (dnsReaper further tiered by its own CONFIRMED/POTENTIAL/UNLIKELY
+    confidence field). The curl-fingerprint fallback (only used when
+    neither tool is installed) is explicitly labeled "(low signal)" by
+    takeover_scanner.sh itself -> P_MED.
     """
     leads: list[dict] = []
     base = Path(findings_dir)
@@ -471,57 +500,125 @@ def takeover_leads(target: str, findings_dir: str) -> list[dict]:
         for item in dnsreaper:
             if isinstance(item, dict):
                 host = item.get("domain") or item.get("host") or item.get("subdomain") or ""
-                _add(lead_board.P_HIGH, host, json.dumps(item)[:300], "dnsreaper.json")
+                priority = _DNSREAPER_CONFIDENCE_PRIORITY.get(
+                    (item.get("confidence") or "").upper(), lead_board.P_HIGH)
+                _add(priority, host, json.dumps(item)[:300], "dnsreaper.json")
             elif isinstance(item, str):
                 _add(lead_board.P_HIGH, item, item, "dnsreaper.json")
 
     for line in _read_text_lines(base / "subjack.txt"):
-        _add(lead_board.P_HIGH, line.split()[0], line, "subjack.txt")
+        m = _SUBJACK_LINE_RE.match(line)
+        if not m:
+            continue
+        tag, url = m.group(1).strip(), m.group(2)
+        if tag.lower() == "not vulnerable":
+            continue
+        _add(lead_board.P_HIGH, url, line, "subjack.txt")
 
+    # fingerprint_grep.txt is entirely constructed by takeover_scanner.sh's
+    # OWN bash `case` match against known takeover-fingerprint strings
+    # (line format: "$host  $service", host first, unlike subjack) — every
+    # line already IS a genuine fingerprint hit, no further filtering needed.
     for line in _read_text_lines(base / "fingerprint_grep.txt"):
         _add(lead_board.P_MED, line.split()[0], line, "fingerprint_grep.txt")
 
     return leads
 
 
+# s3scanner's own upstream source (worker/worker.go's PrintResult(), bucket/
+# bucket.go's String() -- verified via https://github.com/sa7mon/S3Scanner)
+# writes, for the default non-JSON text mode cloud_recon.sh actually uses:
+#   not exist: "not_exist | <name>"
+#   exists:    "exists    | <name> | <region> | AuthUsers: [...] | AllUsers: [...]"
+# The word "exists" is in EVERY line for a bucket that merely EXISTS,
+# regardless of whether AuthUsers/AllUsers grant any permission at all --
+# "exists|public" (the literal word "public" never appears anywhere in
+# s3scanner's real output) was matching every existing-but-fully-private
+# bucket too. The real signal is a NON-EMPTY AllUsers (or AuthUsers)
+# bracket -- an empty "AllUsers: []" means no anonymous-internet
+# permission was actually granted.
+_S3SCANNER_ALL_USERS_RE = re.compile(r"AllUsers:\s*\[([^\]]+)\]")
+_S3SCANNER_AUTH_USERS_RE = re.compile(r"AuthUsers:\s*\[([^\]]+)\]")
+
+# cloud_enum's own upstream source (enum_tools/{aws,azure,gcp}_checks.py --
+# verified via https://github.com/initstring/cloud_enum) logs a line for
+# every check that finds the resource EXISTS, not just publicly-exposed
+# ones -- data['access'] is 'public', 'protected', or 'disabled', but the
+# logfile's own text format only ever writes "{msg}: {target}", dropping
+# the access field entirely. A prior version treated every line as a hit.
+# The negative-result msg strings ("Auth-Only Account", "Disabled Account",
+# "Protected S3/Google Bucket", "Protected Google Firebase RTDB",
+# "Payment required on Google Firebase RTDB", "The Firebase database has
+# been deactivated.", "Protected Google App Engine app", "Auth required
+# Cloud Function") cluster around a small, stable keyword vocabulary --
+# denylisting those is far more maintainable than allowlisting the ~15
+# positive msg strings, which vary per resource type ("OPEN X",
+# "Registered Y", "Contains Z", ...) and would silently miss a future one.
+_CLOUD_ENUM_NEGATIVE_RE = re.compile(
+    r"\b(protected|disabled|auth-only|auth required|payment required|deactivated)\b", re.I)
+
+# CloudFail's own upstream source (cloudfail.py -- verified via
+# https://github.com/m0rtem/CloudFail) prints "[FOUND:HOST]"/"[FOUND:DNS]"/
+# "[FOUND:MX]"/"[FOUND:IP]" ONLY when a record is confirmed off Cloudflare's
+# network (each already gated by "Cloudflare" not in provider, or a
+# non-empty crimeflare match, at the SOURCE) -- these four are always
+# genuine. The prior regex "\[FOUND\]|origin" (literal "[FOUND]" with
+# nothing between FOUND and "]", or the bare word "origin") never matches
+# ANY of CloudFail's real markers -- a false NEGATIVE that silently sent
+# zero leads to the board on every run, not a fabrication. "[FOUND:SUBDOMAIN]"
+# is the one marker CloudFail prints in BOTH the genuine-bypass case ("IP:
+# ... HTTP: ...") and the still-on-Cloudflare case ("ON CLOUDFLARE
+# NETWORK!") -- needs the negative-phrase exclusion.
+_CLOUDFAIL_ALWAYS_POSITIVE_RE = re.compile(r"\[FOUND:(HOST|DNS|MX|IP)\]")
+
+
 def cloud_recon_leads(target: str, findings_dir: str) -> list[dict]:
     """Convert tools/cloud_recon.sh output into lead-board-shaped candidates,
     using the existing "hunt-cloud-misconfig" skill (already routed by
-    lead_board.py's Firebase/cloud-bucket tech-signal rules). Public
-    buckets / exposed origin IPs are "often critical when real" (Part B
-    spec) -> P_HIGH across the board, matching cloud_recon.sh's own "hit"
-    (not "ok") classification for every one of these lines.
+    lead_board.py's Firebase/cloud-bucket tech-signal rules).
     """
     leads: list[dict] = []
     base = Path(findings_dir)
     if not base.is_dir():
         return leads
 
-    def _add(signal: str, why: str, evidence: str, artifact: str) -> None:
+    def _add(priority: str, signal: str, why: str, evidence: str, artifact: str) -> None:
         leads.append(_new_tool_lead(
-            target, "hunt-cloud-misconfig", lead_board.P_HIGH, signal, why,
+            target, "hunt-cloud-misconfig", priority, signal, why,
             evidence, "cloud-recon", artifact,
         ))
 
     for line in _read_text_lines(base / "s3scanner.txt"):
-        if re.search(r"exists|public", line, re.I):
-            _add("public/existing S3 bucket",
-                 "s3scanner matched an accessible bucket across providers — verify read/write ACLs",
+        all_users = _S3SCANNER_ALL_USERS_RE.search(line)
+        if all_users and all_users.group(1).strip():
+            _add(lead_board.P_HIGH, "public S3 bucket (AllUsers grant)",
+                 f"s3scanner: anonymous/internet-wide grant [{all_users.group(1).strip()}] on an existing bucket",
+                 line, "s3scanner.txt")
+            continue
+        auth_users = _S3SCANNER_AUTH_USERS_RE.search(line)
+        if auth_users and auth_users.group(1).strip():
+            _add(lead_board.P_MED, "S3 bucket grants any-authenticated-AWS-user access",
+                 f"s3scanner: AuthUsers grant [{auth_users.group(1).strip()}] — any AWS account can access, not just this bucket's owner",
                  line, "s3scanner.txt")
 
     for line in _read_text_lines(base / "cloud_enum.txt"):
-        _add("multi-cloud discovery (cloud_enum)",
-             "cloud_enum hit across AWS/Azure/GCP — confirm public exposure before reporting",
-             line, "cloud_enum.txt")
+        if line.strip() and not _CLOUD_ENUM_NEGATIVE_RE.search(line):
+            _add(lead_board.P_HIGH, "multi-cloud discovery (cloud_enum)",
+                 "cloud_enum confirmed a publicly-accessible AWS/Azure/GCP resource — verify exposure before reporting",
+                 line, "cloud_enum.txt")
 
     for line in _read_text_lines(base / "cloudfail.txt"):
-        if re.search(r"\[FOUND\]|origin", line, re.I):
-            _add("CloudFlare origin IP exposed",
-                 "origin IP recovered via DNS history — direct access bypasses WAF/CDN protections",
+        if _CLOUDFAIL_ALWAYS_POSITIVE_RE.search(line):
+            _add(lead_board.P_HIGH, "CloudFlare origin IP exposed",
+                 "origin IP/DNS record recovered via DNS history — direct access bypasses WAF/CDN protections",
+                 line, "cloudfail.txt")
+        elif "[FOUND:SUBDOMAIN]" in line and "ON CLOUDFLARE NETWORK" not in line:
+            _add(lead_board.P_HIGH, "CloudFlare origin IP exposed",
+                 "subdomain resolves off CloudFlare's network — direct access bypasses WAF/CDN protections",
                  line, "cloudfail.txt")
 
     for line in _read_text_lines(base / "non_cf_ips.txt"):
-        _add("non-CloudFlare origin IP",
+        _add(lead_board.P_HIGH, "non-CloudFlare origin IP",
              "subdomain resolves outside CloudFlare's published ranges — likely origin IP bypassing the WAF",
              line, "non_cf_ips.txt")
 

@@ -167,7 +167,14 @@ class TestBrowserIntelLeads:
 class TestTakeoverLeads:
     """Part B — tools/takeover_scanner.sh output -> lead-board leads. The
     scanner writes to a timestamped findings/takeover/<ts>/ dir outside
-    recon/, so the caller passes that exact dir (not a recon-dir glob)."""
+    recon/, so the caller passes that exact dir (not a recon-dir glob).
+
+    subjack fixtures use its REAL upstream output format (verified against
+    subjack/output.go's printResult(): "[%s] %s" for a vulnerable host,
+    "[Not Vulnerable] %s" for every clean host too) -- a prior version of
+    this function treated ANY non-empty subjack.txt line as a P_HIGH
+    takeover lead, which fabricated a lead for every scanned-but-clean
+    host (subjack logs one line per host, not just hits)."""
 
     def test_missing_dir_returns_empty(self, tmp_path):
         assert director.takeover_leads("t.example", str(tmp_path / "nope")) == []
@@ -176,7 +183,7 @@ class TestTakeoverLeads:
         d = tmp_path / "takeover"
         d.mkdir()
         (d / "dnsreaper.json").write_text(json.dumps([
-            {"domain": "old.t.example", "fingerprint": "github-pages"},
+            {"domain": "old.t.example", "fingerprint": "github-pages", "confidence": "CONFIRMED"},
         ]))
         leads = director.takeover_leads("t.example", str(d))
         assert len(leads) == 1
@@ -185,13 +192,67 @@ class TestTakeoverLeads:
         assert leads[0]["source"] == "takeover-scan"
         assert leads[0]["tool_artifact"] == "dnsreaper.json"
 
-    def test_subjack_txt_lines_become_leads(self, tmp_path):
+    def test_dnsreaper_confidence_tier_maps_to_priority(self, tmp_path):
+        # dnsReaper's own confidence field (detection_enums.py:
+        # CONFIRMED/POTENTIAL/UNLIKELY) was previously discarded -- every
+        # hit got flattened to P_HIGH regardless of the signature's own
+        # self-reported confidence.
         d = tmp_path / "takeover"
         d.mkdir()
-        (d / "subjack.txt").write_text("stale.t.example [VULNERABLE] [heroku]\n")
+        (d / "dnsreaper.json").write_text(json.dumps([
+            {"domain": "confirmed.t.example", "confidence": "CONFIRMED"},
+            {"domain": "potential.t.example", "confidence": "POTENTIAL"},
+            {"domain": "unlikely.t.example", "confidence": "UNLIKELY"},
+        ]))
+        leads = director.takeover_leads("t.example", str(d))
+
+        def _priority_for(host):
+            return next(l["priority"] for l in leads if host in l["evidence"])
+
+        assert _priority_for("confirmed.t.example") == "high"
+        assert _priority_for("potential.t.example") == "med"
+        assert _priority_for("unlikely.t.example") == "low"
+
+    def test_dnsreaper_missing_confidence_defaults_high(self, tmp_path):
+        # Same "no confidence field" behavior as before this fix, for a
+        # caller-supplied/malformed dnsreaper.json that omits it.
+        d = tmp_path / "takeover"
+        d.mkdir()
+        (d / "dnsreaper.json").write_text(json.dumps([{"domain": "old.t.example"}]))
+        leads = director.takeover_leads("t.example", str(d))
+        assert leads[0]["priority"] == "high"
+
+    def test_subjack_not_vulnerable_lines_never_become_leads(self, tmp_path):
+        d = tmp_path / "takeover"
+        d.mkdir()
+        (d / "subjack.txt").write_text(
+            "[Not Vulnerable] https://clean1.t.example\n"
+            "[Not Vulnerable] https://clean2.t.example\n"
+        )
+        assert director.takeover_leads("t.example", str(d)) == []
+
+    def test_subjack_real_vulnerable_line_becomes_a_lead_with_correct_url(self, tmp_path):
+        d = tmp_path / "takeover"
+        d.mkdir()
+        (d / "subjack.txt").write_text("[github] https://stale.t.example\n")
         leads = director.takeover_leads("t.example", str(d))
         assert len(leads) == 1
         assert leads[0]["priority"] == "high"
+        # line.split()[0] used to extract "[github]" (the bracket tag) as
+        # the "host" -- the real URL must be recoverable from the evidence.
+        assert "https://stale.t.example" in leads[0]["evidence"]
+
+    def test_subjack_mixed_clean_and_vulnerable_only_the_real_hit_fires(self, tmp_path):
+        d = tmp_path / "takeover"
+        d.mkdir()
+        (d / "subjack.txt").write_text(
+            "[Not Vulnerable] https://clean.t.example\n"
+            "[heroku] https://stale.t.example\n"
+            "[Not Vulnerable] https://alsoclean.t.example\n"
+        )
+        leads = director.takeover_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert "stale.t.example" in leads[0]["evidence"]
 
     def test_fingerprint_grep_fallback_is_medium_priority(self, tmp_path):
         d = tmp_path / "takeover"
@@ -214,37 +275,126 @@ class TestTakeoverLeads:
 
 
 class TestCloudReconLeads:
-    """Part B — tools/cloud_recon.sh output -> lead-board leads, always
-    P_HIGH per spec ('often critical when real')."""
+    """Part B — tools/cloud_recon.sh output -> lead-board leads.
+
+    Fixtures use each wrapped tool's REAL upstream output format, verified
+    against their actual source (s3scanner's worker.go/bucket.go, cloud_enum's
+    aws/azure/gcp_checks.py, CloudFail's cloudfail.py) rather than a
+    hand-typed guess — the same class of bug PR #38 found in
+    graphql_audit_leads(): non-empty/successful-scan output was being
+    treated as a finding regardless of whether the underlying resource was
+    actually exposed."""
 
     def test_missing_dir_returns_empty(self, tmp_path):
         assert director.cloud_recon_leads("t.example", str(tmp_path / "nope")) == []
 
-    def test_s3scanner_hit_line_becomes_lead(self, tmp_path):
+    def test_s3scanner_private_bucket_never_fires_despite_containing_exists(self, tmp_path):
+        # s3scanner's real text-mode output writes "exists    | ..." for
+        # ANY existing bucket, public or fully private -- the literal word
+        # "public" never appears anywhere in its real output at all.
         d = tmp_path / "cloud"
         d.mkdir()
         (d / "s3scanner.txt").write_text(
-            "t-example-backups | bucket_exists | AWS | us-east-1 | public\n"
-            "t-example-nope | bucket_not_exist\n"
+            "not_exist | t-example-nope\n"
+            "exists    | t-example-private | us-east-1 | AuthUsers: [] | AllUsers: []\n"
+        )
+        assert director.cloud_recon_leads("t.example", str(d)) == []
+
+    def test_s3scanner_all_users_grant_is_high_priority(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "s3scanner.txt").write_text(
+            "exists    | t-example-public | us-east-1 | AuthUsers: [] | AllUsers: [READ, LIST]\n"
         )
         leads = director.cloud_recon_leads("t.example", str(d))
         assert len(leads) == 1
         assert leads[0]["skill"] == "hunt-cloud-misconfig"
         assert leads[0]["priority"] == "high"
-        assert "public" in leads[0]["evidence"]
+        assert "AllUsers" in leads[0]["evidence"]
 
-    def test_cloud_enum_every_line_becomes_a_lead(self, tmp_path):
+    def test_s3scanner_auth_users_only_grant_is_medium_priority(self, tmp_path):
+        # AuthUsers (any authenticated AWS account, not the public
+        # internet) is real evidence but weaker than AllUsers -- must not
+        # be flattened to the same P_HIGH tier.
         d = tmp_path / "cloud"
         d.mkdir()
-        (d / "cloud_enum.txt").write_text("t-example.blob.core.windows.net\n")
+        (d / "s3scanner.txt").write_text(
+            "exists    | t-example-authonly | us-east-1 | AuthUsers: [READ] | AllUsers: []\n"
+        )
+        leads = director.cloud_recon_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "med"
+
+    def test_cloud_enum_open_bucket_becomes_a_lead(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "cloud_enum.txt").write_text("OPEN S3 BUCKET: https://t-example.s3.amazonaws.com\n")
         leads = director.cloud_recon_leads("t.example", str(d))
         assert len(leads) == 1
         assert leads[0]["source"] == "cloud-recon"
+        assert leads[0]["priority"] == "high"
 
-    def test_cloudfail_found_line_becomes_lead(self, tmp_path):
+    @pytest.mark.parametrize("msg", [
+        "Protected S3 Bucket",
+        "Protected Google Bucket",
+        "Auth-Only Account",
+        "Disabled Account",
+        "Payment required on Google Firebase RTDB",
+        "The Firebase database has been deactivated.",
+        "Protected Google App Engine app",
+        "Auth required Cloud Function",
+    ])
+    def test_cloud_enum_negative_results_never_fire(self, tmp_path, msg):
         d = tmp_path / "cloud"
         d.mkdir()
-        (d / "cloudfail.txt").write_text("[FOUND] 203.0.113.5 -- possible origin\nclean line\n")
+        (d / "cloud_enum.txt").write_text(f"{msg}: https://t-example.blob.core.windows.net\n")
+        assert director.cloud_recon_leads("t.example", str(d)) == []
+
+    def test_cloud_enum_mixed_only_real_positives_fire(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "cloud_enum.txt").write_text(
+            "Protected S3 Bucket: https://t-example-a.s3.amazonaws.com\n"
+            "OPEN GOOGLE BUCKET: https://t-example-b.storage.googleapis.com\n"
+            "Disabled Account: t-example.blob.core.windows.net\n"
+        )
+        leads = director.cloud_recon_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert "t-example-b" in leads[0]["evidence"]
+
+    def test_cloudfail_real_marker_becomes_a_lead(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "cloudfail.txt").write_text(
+            "[FOUND:HOST] t.example 203.0.113.5 AS12345 SomeHost US\n"
+        )
+        leads = director.cloud_recon_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "high"
+
+    def test_cloudfail_old_wrong_marker_format_never_matched_this_is_the_fix(self, tmp_path):
+        # The prior regex "\[FOUND\]|origin" never matched CloudFail's real
+        # markers at all (always "[FOUND:HOST]" etc, never bare "[FOUND]"
+        # or the literal word "origin") -- confirms the false-NEGATIVE this
+        # fix closes, not just a hypothetical.
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "cloudfail.txt").write_text("[FOUND] 203.0.113.5 -- possible origin\n")
+        assert director.cloud_recon_leads("t.example", str(d)) == []
+
+    def test_cloudfail_subdomain_still_on_cloudflare_never_fires(self, tmp_path):
+        # CloudFail prints "[FOUND:SUBDOMAIN]" for BOTH the genuine bypass
+        # case and the still-on-Cloudflare (non-bypass) case -- only the
+        # negative-phrase exclusion tells them apart.
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "cloudfail.txt").write_text("[FOUND:SUBDOMAIN] old.t.example ON CLOUDFLARE NETWORK!\n")
+        assert director.cloud_recon_leads("t.example", str(d)) == []
+
+    def test_cloudfail_subdomain_real_bypass_becomes_a_lead(self, tmp_path):
+        d = tmp_path / "cloud"
+        d.mkdir()
+        (d / "cloudfail.txt").write_text("[FOUND:SUBDOMAIN] origin.t.example IP: 203.0.113.9 HTTP: 200\n")
         leads = director.cloud_recon_leads("t.example", str(d))
         assert len(leads) == 1
 
@@ -998,7 +1148,7 @@ class TestBuildPlanToolAdapterWiring:
         rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
         takeover_dir = tmp_path / "takeover"
         takeover_dir.mkdir()
-        (takeover_dir / "subjack.txt").write_text("stale.t.example [VULNERABLE] [github]\n")
+        (takeover_dir / "subjack.txt").write_text("[github] https://stale.t.example\n")
         d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
         plan = d.build_plan("t.example", hours=5, recon_dir=rd, takeover_findings_dir=str(takeover_dir))
         all_evidence = [a.evidence for a in plan.attacks] + [[s["evidence"]] for s in plan.skipped]
@@ -1702,7 +1852,7 @@ class TestPlanFileCLI:
         capsys.readouterr()  # discard _seed_leads' ingest stdout
         takeover_dir = tmp_path / "takeover"
         takeover_dir.mkdir()
-        (takeover_dir / "subjack.txt").write_text("stale.t.example [VULNERABLE] [github]\n")
+        (takeover_dir / "subjack.txt").write_text("[github] https://stale.t.example\n")
         exit_code = director.main([
             "build-plan", "t.example", "--hours", "5",
             "--memory-dir", str(tmp_path / "hunt-memory"), "--recon-dir", rd,
