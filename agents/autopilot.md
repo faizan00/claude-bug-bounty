@@ -330,6 +330,27 @@ For each READY attack, in order:
    python3 tools/director.py replan --plan-file recon/<target>/hunt-plan.json \
      --results-file results.json --write
    ```
+
+   A confirmed finding (step 4) is exactly the moment `lead_board.py`'s automatic
+   2-signal chain / 3-signal hypothesis detection is most likely to fire something
+   NEW that didn't exist when `build-plan` first ran. Re-ingest and fold it in the
+   same call, not as a separate afterthought:
+   ```bash
+   python3 tools/lead_board.py ingest <target> recon/<target> >/dev/null
+   python3 -c "
+   from tools import lead_board as lb
+   import json
+   json.dump([l for l in lb.load_ledger('<target>') if l['status'] == 'new'],
+             open('new_leads.json', 'w'))
+   "
+   python3 tools/director.py replan --plan-file recon/<target>/hunt-plan.json \
+     --results-file results.json --new-leads-file new_leads.json --write
+   ```
+   Each new lead goes through the same `_score_lead`/`_skip_reason` gate `build-plan`
+   uses (a failed-pattern hard-kill or below-EV-floor lead still doesn't make the
+   plan), and a lead whose id is already planned is a silent no-op — safe to run
+   every cycle, not just after a confirmed finding, if you want the plan to stay
+   maximally current.
    `revive` un-abandons an attack you'd previously marked `abandoned` (its id must
    already be in that state) — use it if new evidence (a fresh chain leg, a changed
    endpoint) makes a previously-dropped attack worth reconsidering; otherwise leave

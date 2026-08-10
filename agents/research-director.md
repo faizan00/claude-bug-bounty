@@ -114,9 +114,29 @@ where `results.json` is:
 
 `replan()` guarantees: `IN_PROGRESS` attacks are never silently reset, `COMPLETED`/`FAILED` never get un-done without new evidence, dependents unlock automatically once every prerequisite attack completes, and the remaining time budget is re-checked (an attack that no longer fits gets moved to `SKIPPED` with `TIME_CONSTRAINT`, not silently dropped). This all holds whether it runs in-process or reloaded from `--plan-file` in a completely separate invocation — that separation is the whole reason the JSON sidecar exists.
 
+### Folding in leads discovered mid-hunt
+
+`replan()` only re-statuses and re-sorts the FIXED attack set the original `build-plan` call produced — by itself it has no way to learn about a lead that's born after the plan started (e.g. `lead_board.py`'s automatic chain/hypothesis detection firing once real test evidence exists, or a fresh `lead_board.py ingest` picking up something new). Since you're told never to rebuild the plan from scratch mid-hunt, that used to leave new mid-hunt evidence with no path into the running plan at all.
+
+Re-run the lead board and hand anything new to `replan` via `--new-leads-file`:
+
+```bash
+python3 tools/lead_board.py ingest <target> recon/<target> >/dev/null
+python3 -c "
+from tools import lead_board as lb
+import json
+leads = [l for l in lb.load_ledger('<target>') if l['status'] == 'new']
+json.dump(leads, open('new_leads.json', 'w'), indent=2)
+"
+python3 tools/director.py replan --plan-file recon/<target>/hunt-plan.json \
+    --new-leads-file new_leads.json --memory-dir hunt-memory --write
+```
+
+Each new lead goes through the exact same `_score_lead`/`_skip_reason`/`_build_attack` pipeline `build-plan` uses — a failed-pattern hard-kill, a duplicate against `report_outcomes.jsonl`, or a below-floor EV/hour still keeps it out, it doesn't get a free pass. A lead whose id is already planned is a silent no-op, so it's safe to hand over the same "everything currently `status: new`" batch at every checkpoint rather than tracking a delta yourself. A chain/hypothesis lead that names an existing attack in `chain_of` resolves its dependency against the plan's CURRENT state (READY if that prerequisite already completed, PENDING otherwise) — exactly as if it had existed from the start.
+
 ## Checkpoints
 
-Every plan carries a fixed checkpoint schedule: after 30 minutes, after first authentication success, after browser intelligence is exhausted, after the first confirmed finding. When a hunter hits one of these, that's your cue to `replan()`, not just a status update to acknowledge.
+Every plan carries a fixed checkpoint schedule: after 30 minutes, after first authentication success, after browser intelligence is exhausted, after the first confirmed finding. When a hunter hits one of these, that's your cue to `replan()` — re-ingest the lead board first so any new lead gets a chance to be folded in, not just a status update to acknowledge.
 
 ## Rules
 
