@@ -1794,15 +1794,35 @@ class Director:
 
     # ── replanning ───────────────────────────────────────────────────────
 
-    def replan(self, plan: Plan, results_so_far: dict) -> Plan:
+    def replan(self, plan: Plan, results_so_far: dict, new_leads: list[dict] | None = None,
+               memory_dir: str | None = None, recon_dir: str | None = None) -> Plan:
         """results_so_far: {"completed": [attack_id, ...], "failed": [...],
         "abandoned": [...], "in_progress": [...], "notes": {attack_id: "..."},
         "revive": [attack_id, ...]} (all optional). Preserves IN_PROGRESS
         attacks untouched, never discards a COMPLETED/FAILED/ABANDONED
-        attack's history, re-scores only what's left PENDING/READY/WAITING/
-        BLOCKED, and unlocks dependents whose prerequisites just completed.
-        Abandoned work stays abandoned unless its id is explicitly listed
-        in `revive`."""
+        attack's history, re-sorts what's left PENDING/READY/WAITING/
+        BLOCKED by their already-computed ev_per_hour/priority, and unlocks
+        dependents whose prerequisites just completed.  Abandoned work
+        stays abandoned unless its id is explicitly listed in `revive`.
+
+        new_leads (Phase 6 fix): leads discovered SINCE the plan's original
+        build_plan() call — e.g. a lead_board.py chain/hypothesis detection
+        that only fired after real test evidence came in mid-hunt. Without
+        this, a running plan had no way to ever learn about a lead born
+        after it started: build_plan() only scores what's on the lead board
+        at the moment it runs, and every caller (agents/autopilot.md,
+        agents/research-director.md) is explicitly told never to rebuild
+        from scratch mid-hunt because that discards IN_PROGRESS state — so
+        `replan()`, called repeatedly through a hunt, was the ONLY place new
+        evidence could enter, and it structurally couldn't. Each new lead is
+        scored with the same _score_lead()/_skip_reason()/_build_attack()
+        pipeline build_plan() uses (so DUPLICATE/MATCHES_FAILED_PATTERN/
+        BELOW_EV_FLOOR/TIME_CONSTRAINT all still apply — a new lead does not
+        get a free pass into the plan), a lead whose id is already planned
+        is silently skipped (idempotent across repeated replan() calls with
+        the same new_leads batch), and a lead chaining off an existing
+        attack's lead_id becomes PENDING/BLOCKED exactly like build_plan()
+        would have scored it if it had existed from the start."""
         results_so_far = results_so_far or {}
         completed = set(results_so_far.get("completed", []))
         failed = set(results_so_far.get("failed", []))
@@ -1860,6 +1880,52 @@ class Director:
             if attack.state in ("IN_PROGRESS", "COMPLETED"):
                 remaining_minutes -= attack.maximum_time_minutes
 
+        newly_skipped_leads: list[dict] = []
+        if new_leads:
+            memory_dir = memory_dir if memory_dir is not None else self.memory_dir
+            recon_dir = recon_dir if recon_dir is not None else os.path.join("recon", plan.target)
+            mem = load_memory(memory_dir)
+            tech_stack = load_tech_stack(plan.target, memory_dir)
+            tech_attack_matrix = load_fingerprint_tech_attack_matrix(plan.target, recon_dir)
+            calibration = hypothesis_calibration(
+                [h for h in mem["hypotheses"] if h.get("target") == plan.target],
+                journal_entries=mem["journal"], report_outcomes=mem["report_outcomes"],
+            )
+            lead_id_to_attack_id = {a.lead_id: a.id for a in plan.attacks}
+            id_to_attack = dict(by_id)
+            new_attacks: list[Attack] = []
+            for lead in new_leads:
+                lead_id = lead.get("id")
+                if lead_id in lead_id_to_attack_id:
+                    continue  # already planned — idempotent re-replan with the same batch
+                c = self._score_lead(lead, plan.target, tech_stack, mem, tech_attack_matrix)
+                reason = self._skip_reason(c, remaining_minutes)
+                if reason is not None:
+                    newly_skipped_leads.append({
+                        "lead_id": c["lead"]["id"], "skill": c["lead"]["skill"],
+                        "vuln_class": c["vuln_class"], "evidence": c["lead"].get("evidence", ""),
+                        "reason": reason, "detail": c["skip_detail"],
+                    })
+                    continue
+                attack = self._build_attack(c, calibration)
+                dep_lead_ids = list(attack.dependencies)
+                resolved = [lead_id_to_attack_id[d] for d in dep_lead_ids if d in lead_id_to_attack_id]
+                unmet = [d for d in dep_lead_ids if d not in lead_id_to_attack_id]
+                attack.dependencies = resolved
+                if unmet:
+                    attack.state = "BLOCKED"
+                    attack.notes.append(f"prerequisite lead(s) not in this plan: {unmet}")
+                elif resolved and all(id_to_attack[aid].state == "COMPLETED" for aid in resolved):
+                    attack.state = "READY"
+                elif resolved:
+                    attack.state = "PENDING"
+                else:
+                    attack.state = "READY"
+                new_attacks.append(attack)
+                lead_id_to_attack_id[lead_id] = attack.id
+                id_to_attack[attack.id] = attack
+            plan.attacks = plan.attacks + new_attacks
+
         still_open = [a for a in plan.attacks if a.state in ("READY", "PENDING", "WAITING")]
         still_open.sort(key=lambda a: (a.ev_per_hour, a.priority), reverse=True)
 
@@ -1879,12 +1945,19 @@ class Director:
                 remaining_minutes -= attack.maximum_time_minutes
             kept_open.append(attack)
 
-        plan.skipped = plan.skipped + newly_skipped
+        plan.skipped = plan.skipped + newly_skipped_leads + newly_skipped
+        new_leads_note = ""
+        if new_leads:
+            new_leads_note = (
+                f" {len(new_attacks)} new lead(s) folded in, "
+                f"{len(newly_skipped_leads)} new lead(s) skipped."
+            )
         plan.summary = (
             f"replanned: {sum(1 for a in plan.attacks if a.state == 'COMPLETED')} completed, "
             f"{sum(1 for a in plan.attacks if a.state == 'IN_PROGRESS')} in progress, "
             f"{sum(1 for a in plan.attacks if a.state == 'READY')} ready, "
             f"{len(newly_skipped)} newly skipped (time constraint)."
+            f"{new_leads_note}"
         )
         plan.generated_at = _now_iso()
         return plan
@@ -2107,8 +2180,13 @@ def _cmd_replan(args: argparse.Namespace) -> int:
     if args.results_file:
         with open(args.results_file, encoding="utf-8") as fh:
             results_so_far = json.load(fh)
-    director = Director()
-    updated = director.replan(plan, results_so_far)
+    new_leads = None
+    if args.new_leads_file:
+        with open(args.new_leads_file, encoding="utf-8") as fh:
+            new_leads = json.load(fh)
+    director = Director(memory_dir=args.memory_dir)
+    updated = director.replan(plan, results_so_far, new_leads=new_leads,
+                               memory_dir=args.memory_dir, recon_dir=args.recon_dir)
     save_plan(updated, args.plan_file)
     print(f"[+] updated {args.plan_file}")
     if args.write:
@@ -2166,6 +2244,15 @@ def main(argv: list[str] | None = None) -> int:
     p_replan.add_argument("--results-file", default=None,
                            help='JSON file: {"completed": [...], "failed": [...], "abandoned": [...], '
                                 '"in_progress": [...], "revive": [...], "notes": {...}}')
+    p_replan.add_argument("--new-leads-file", default=None,
+                           help="Phase 6 fix: JSON file, a list of lead dicts (same shape as "
+                                "lead_board.py's ledger entries) discovered SINCE the plan's original "
+                                "build_plan() call — e.g. from re-running `lead_board.py ingest` "
+                                "mid-hunt. Each is scored and folded into the running plan through the "
+                                "same skip-reason gate build_plan() uses; a lead whose id is already "
+                                "planned is a no-op, so re-passing the same file across multiple "
+                                "replan() calls is safe.")
+    p_replan.add_argument("--memory-dir", default="hunt-memory")
     p_replan.add_argument("--recon-dir", default=None)
     p_replan.add_argument("--write", action="store_true", help="Also (re)write recon/<target>/hunt-plan.md")
     p_replan.set_defaults(func=_cmd_replan)

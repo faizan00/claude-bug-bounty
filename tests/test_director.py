@@ -1547,6 +1547,104 @@ class TestReplan:
         # The real attack's state must be untouched by the rejected call.
         assert next(a for a in plan.attacks if a.id == real_id).state != "COMPLETED"
 
+    # -- Phase 6 fix: new_leads folding (adaptive-loop gap) ----------------
+    # Before this fix, a lead born AFTER build_plan() ran (e.g. a
+    # lead_board.py chain/hypothesis detection that only fires once real
+    # test evidence exists) had no path into a running plan: replan() only
+    # re-statused/re-sorted the fixed attack set build_plan() produced, and
+    # every caller is told never to rebuild from scratch mid-hunt because
+    # that discards IN_PROGRESS state. These tests exercise the real
+    # replan(new_leads=...) path end-to-end, through the same scoring/skip
+    # pipeline build_plan() uses.
+
+    def test_replan_folds_in_a_new_lead_discovered_mid_hunt(self, isolated, tmp_path):
+        mem_dir = tmp_path / "hunt-memory"
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(mem_dir))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+        before_ids = {a.lead_id for a in plan.attacks}
+
+        new_lead = _lead("url", skill="hunt-ssrf", evidence="https://t.example/newly/discovered")
+        plan2 = d.replan(plan, {}, new_leads=[new_lead])
+
+        added = [a for a in plan2.attacks if a.lead_id == new_lead["id"]]
+        assert len(added) == 1, f"expected the new lead to become exactly one attack, got {added}"
+        assert added[0].lead_id not in before_ids
+        assert added[0].state in ("READY", "PENDING", "BLOCKED")
+        assert "new lead(s) folded in" in plan2.summary
+
+    def test_replan_new_lead_already_planned_is_a_noop(self, isolated, tmp_path):
+        """Re-passing the same new_leads batch across repeated replan()
+        calls (the realistic caller pattern: re-ingest the lead board every
+        checkpoint and hand over whatever's new) must not duplicate an
+        attack that's already in the plan."""
+        mem_dir = tmp_path / "hunt-memory"
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(mem_dir))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+        already_planned_lead_id = plan.attacks[0].lead_id
+
+        dup_lead = _lead("url", skill=plan.attacks[0].skill, evidence="dup")
+        dup_lead["id"] = already_planned_lead_id
+        before_count = len(plan.attacks)
+        plan2 = d.replan(plan, {}, new_leads=[dup_lead])
+        assert len(plan2.attacks) == before_count
+
+    def test_replan_new_leads_batch_is_idempotent_across_repeated_calls(self, isolated, tmp_path):
+        mem_dir = tmp_path / "hunt-memory"
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(mem_dir))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+
+        new_lead = _lead("url", skill="hunt-ssrf", evidence="https://t.example/newly/discovered")
+        plan2 = d.replan(plan, {}, new_leads=[new_lead])
+        plan3 = d.replan(plan2, {}, new_leads=[new_lead])  # same batch handed over again
+        matching = [a for a in plan3.attacks if a.lead_id == new_lead["id"]]
+        assert len(matching) == 1
+
+    def test_replan_new_lead_still_hard_killed_by_a_matching_failed_pattern(self, isolated, tmp_path):
+        """A new lead discovered mid-hunt gets no free pass into the plan --
+        it goes through the exact same _skip_reason() gate build_plan()
+        uses, so a proven dead end (failed_patterns.jsonl hard-kill) still
+        kills it."""
+        mem_dir = tmp_path / "hunt-memory"
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        FailedPatternDB(mem_dir / "failed_patterns.jsonl").save(make_failed_pattern_entry(
+            target="t.example", vuln_class="idor", technique="numeric_id_swap",
+            tech_stack=[], endpoint="https://t.example/api/v2/orders/9001",
+            reason="egress filtered",
+        ))
+        d = director.Director(memory_dir=str(mem_dir))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+
+        new_lead = _lead("url", skill="hunt-idor", evidence="https://t.example/api/v2/orders/9001")
+        plan2 = d.replan(plan, {}, new_leads=[new_lead])
+
+        assert not any(a.lead_id == new_lead["id"] for a in plan2.attacks)
+        skipped = [s for s in plan2.skipped if s["lead_id"] == new_lead["id"]]
+        assert skipped and skipped[0]["reason"] == "MATCHES_FAILED_PATTERN"
+
+    def test_replan_new_chain_lead_depends_on_an_already_completed_attack(self, isolated, tmp_path):
+        """A new hypothesis lead chaining off ('chain_of') a lead that's
+        already an attack in the running plan resolves its dependency
+        against the CURRENT plan state -- READY if that prerequisite is
+        already COMPLETED, exactly like build_plan() would have scored it
+        had it existed from the start."""
+        mem_dir = tmp_path / "hunt-memory"
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d = director.Director(memory_dir=str(mem_dir))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+        prereq = plan.attacks[0]
+
+        chain_lead = _lead("hypothesis", skill="hunt-idor", evidence="https://t.example/chained",
+                            chain_of=[prereq.lead_id])
+        plan2 = d.replan(plan, {"completed": [prereq.id]}, new_leads=[chain_lead])
+
+        added = next((a for a in plan2.attacks if a.lead_id == chain_lead["id"]), None)
+        assert added is not None, "chain lead should not be skipped: its only dependency just completed"
+        assert added.state == "READY"
+        assert added.dependencies == [prereq.id]
+
 
 class TestExplain:
 
