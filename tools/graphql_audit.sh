@@ -3,7 +3,8 @@
 # GraphQL Security Audit — multi-phase sweep for common GraphQL vulnerabilities
 #
 # Phases: introspection -> fingerprint -> field discovery -> batching DoS ->
-#         alias bomb -> injection scan (gqlmap) -> graphql-cop checklist
+#         alias bomb -> injection scan (gqlmap) -> graphql-cop checklist ->
+#         depth limit probe
 #
 # Falls back to built-in curl probes when optional tools are missing.
 #

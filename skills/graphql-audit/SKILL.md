@@ -49,14 +49,16 @@ bash tools/graphql_audit.sh https://target.com/graphql --output-dir ./findings/t
 ```
 
 **Output:** `findings/<target>/graphql/<timestamp>/`
-- `introspection.json` — full schema dump (if enabled)
+- `introspection.json` — full schema dump (if enabled), or the raw disabled-response otherwise
 - `fingerprint.txt` — engine type (graphw00f)
-- `field_suggestions.txt` — discovered fields via clairvoyance
+- `field_suggestions.json` — clairvoyance's own field-recovery output (a DIFFERENT signal from the `field_suggestions:` line in `summary.txt`, which is the built-in "did you mean" hint check)
+- `interesting_fields.txt` — introspected type/field names matching admin/internal/secret/token/password/role/debug/legacy/private/key/flag
 - `batching_dos.txt` — response time delta for 1 vs 100 queries
 - `alias_bomb.txt` — alias depth test results
-- `gqlmap.txt` — injection scan results
+- `gqlmap.txt` — injection scan results (or a built-in SQLi quick-probe result if gqlmap isn't installed)
 - `cop_report.txt` — graphql-cop attack checklist results
-- `summary.txt` — hit/miss per phase
+- `depth_bomb.txt` — depth-15 query response + HTTP status/timing
+- `summary.txt` — the one place every phase writes a clean ENABLED/DISABLED/HIT verdict; `tools/director.py`'s `graphql_audit_leads()` reads this, not the raw per-phase files (always non-empty regardless of outcome)
 
 ---
 

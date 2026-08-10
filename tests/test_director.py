@@ -257,17 +257,78 @@ class TestCloudReconLeads:
         assert leads[0]["tool_artifact"] == "non_cf_ips.txt"
 
 
+def _write_graphql_summary(d: Path, **overrides) -> None:
+    """Seed a realistic summary.txt matching tools/graphql_audit.sh's own
+    "key: value" grammar exactly. Defaults are the CLEAN/negative-result
+    value for every key the script writes -- a caller overrides only the
+    keys relevant to the scenario under test, so each test stays honest
+    about what it's actually asserting."""
+    defaults = {
+        "connectivity": "HTTP 200",
+        "introspection": "DISABLED",
+        "field_suggestions": "disabled or no hints",
+        "fingerprint": "skipped (graphw00f not installed)",
+        "clairvoyance": "skipped (not installed)",
+        "array_batching": "likely disabled (HTTP 400)",
+        "alias_bombing": "blocked or limited",
+        "injection_scan": "skipped (gqlmap not installed)",
+        "sqli_quick_probe": "no obvious errors",
+        "graphql_cop": "skipped (not installed)",
+        "depth_limit": "enforced or endpoint rejected query",
+    }
+    defaults.update(overrides)
+    lines = ["GraphQL Audit -- https://t.example/graphql", "Date: today", "---"]
+    lines += [f"{k}: {v}" for k, v in defaults.items()]
+    (d / "summary.txt").write_text("\n".join(lines) + "\n")
+
+
 class TestGraphqlAuditLeads:
     """Part B — tools/graphql_audit.sh output -> hunt-graphql leads tagged
     api_style=graphql, optionally cross-referenced against Phase 3's
-    fingerprint.json."""
+    fingerprint.json.
+
+    Every raw output file (batching_dos.txt, alias_bomb.txt, gqlmap.txt,
+    cop_report.txt, introspection.json) is ALWAYS non-empty regardless of
+    outcome -- curl always writes an HTTP response body even on
+    rejection, and a tool-not-installed placeholder is also non-empty
+    text (verified by reading tools/graphql_audit.sh line by line, not
+    assumed). graphql_audit_leads() parses summary.txt's own derived
+    ENABLED/DISABLED/HIT verdicts instead of "is the file non-empty" --
+    the FALSE-POSITIVE-prevention tests below are the actual point of
+    this class, not incidental coverage."""
 
     def test_missing_dir_returns_empty(self, tmp_path):
         assert director.graphql_audit_leads("t.example", str(tmp_path / "nope")) == []
 
+    def test_no_summary_file_emits_no_leads(self, tmp_path):
+        # Raw files present but summary.txt missing -- must never fall
+        # back to has-content guessing.
+        d = tmp_path / "graphql"
+        d.mkdir()
+        (d / "batching_dos.txt").write_text("[{...},{...}]\n")
+        assert director.graphql_audit_leads("t.example", str(d)) == []
+
+    def test_realistic_clean_scan_emits_zero_leads(self, tmp_path):
+        # The exact false-positive this fix closes: a clean run where
+        # every raw file is non-empty (curl always writes a response
+        # body; skipped-tool placeholders are also non-empty text) but
+        # summary.txt correctly says nothing was found anywhere.
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d)
+        (d / "batching_dos.txt").write_text('{"errors":[{"message":"batching disabled"}]}\nHTTP: 400\n')
+        (d / "alias_bomb.txt").write_text('{"errors":[{"message":"too many aliases"}]}\nHTTP: 400\n')
+        (d / "introspection.json").write_text('{"errors":[{"message":"introspection disabled"}]}')
+        (d / "gqlmap.txt").write_text("(install: pip install gqlmap)")
+        (d / "cop_report.txt").write_text("(install: pip install graphql-cop)")
+        (d / "depth_bomb.txt").write_text('{"data":{}}\nHTTP 400\n')
+        (d / "interesting_fields.txt").write_text("no obvious sensitive names found")
+        assert director.graphql_audit_leads("t.example", str(d)) == []
+
     def test_introspection_enabled_becomes_high_priority_lead(self, tmp_path):
         d = tmp_path / "graphql"
         d.mkdir()
+        _write_graphql_summary(d, introspection="ENABLED")
         (d / "introspection.json").write_text(json.dumps({"data": {"__schema": {"types": []}}}))
         leads = director.graphql_audit_leads("t.example", str(d))
         assert len(leads) == 1
@@ -276,18 +337,158 @@ class TestGraphqlAuditLeads:
         assert leads[0]["source"] == "graphql-audit"
         assert "api_style=graphql" in leads[0]["why"]
 
-    def test_empty_output_files_emit_no_leads(self, tmp_path):
+    def test_introspection_disabled_never_emits_a_lead_even_with_nonempty_json(self, tmp_path):
+        # introspection.json is written in BOTH branches of the shell
+        # script (schema dump OR the raw disabled-response) -- content
+        # alone was the bug; summary.txt's own verdict must gate this.
         d = tmp_path / "graphql"
         d.mkdir()
-        (d / "batching_dos.txt").write_text("")
-        (d / "introspection.json").write_text("")
+        _write_graphql_summary(d, introspection="DISABLED")
+        (d / "introspection.json").write_text(json.dumps({"errors": [{"message": "disabled"}]}))
         assert director.graphql_audit_leads("t.example", str(d)) == []
 
-    def test_multiple_signal_files_each_become_a_lead(self, tmp_path):
+    def test_introspection_get_bypass_is_its_own_high_priority_lead(self, tmp_path):
         d = tmp_path / "graphql"
         d.mkdir()
-        (d / "batching_dos.txt").write_text("10 queries batched, all 200 OK\n")
-        (d / "alias_bomb.txt").write_text("500 aliases accepted in one request\n")
+        _write_graphql_summary(d, introspection="DISABLED", introspection_get_bypass="YES")
+        (d / "introspection.json").write_text('{"errors":[{"message":"disabled"}]}')
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert "GET" in leads[0]["signal"]
+
+    def test_field_suggestions_enabled_has_no_artifact_file_requirement(self, tmp_path):
+        # This signal has no dedicated output file (Phase 1's built-in
+        # "did you mean" check) -- must fire from summary.txt alone.
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, field_suggestions="ENABLED")
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "med"
+
+    def test_batching_dos_gated_on_summary_not_file_content(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, array_batching="ENABLED")
+        (d / "batching_dos.txt").write_text("[{...},{...}]\n100-query batch time: 0.2s  HTTP: 200\n")
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "high"
+        assert leads[0]["tool_artifact"] == "batching_dos.txt"
+
+    def test_batching_dos_disabled_never_fires_despite_nonempty_file(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, array_batching="likely disabled (HTTP 400)")
+        (d / "batching_dos.txt").write_text('{"errors":"batching not supported"}\nsingle query time: 0.1s\n')
+        assert director.graphql_audit_leads("t.example", str(d)) == []
+
+    def test_alias_bombing_gated_on_summary_not_file_content(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, alias_bombing="ENABLED")
+        (d / "alias_bomb.txt").write_text('{"data":{"q0":"Query"}}\n')
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "high"
+
+    def test_sqli_quick_probe_hit_is_high_priority(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, sqli_quick_probe="POSSIBLE HIT")
+        (d / "gqlmap.txt").write_text("mysql syntax error near '1--'\n")
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "high"
+        assert leads[0]["tool_artifact"] == "gqlmap.txt"
+
+    def test_gqlmap_completed_is_medium_priority_manual_review(self, tmp_path):
+        # gqlmap actually running derives no pass/fail verdict from the
+        # shell script itself -- must be a lower-confidence "review this"
+        # lead, not an auto-confirmed P_HIGH the way it was before this fix.
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, injection_scan="completed (see gqlmap.txt)")
+        (d / "gqlmap.txt").write_text("gqlmap: no injection found\n")
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "med"
+
+    def test_gqlmap_not_installed_placeholder_never_fires(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, injection_scan="skipped (gqlmap not installed)")
+        (d / "gqlmap.txt").write_text("(install: pip install gqlmap)")
+        assert director.graphql_audit_leads("t.example", str(d)) == []
+
+    def test_graphql_cop_completed_is_medium_priority(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, graphql_cop="completed (see cop_report.txt)")
+        (d / "cop_report.txt").write_text("graphql-cop: 3 checks failed\n")
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "med"
+
+    def test_graphql_cop_not_installed_placeholder_never_fires(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, graphql_cop="skipped (not installed)")
+        (d / "cop_report.txt").write_text("(install: pip install graphql-cop)")
+        assert director.graphql_audit_leads("t.example", str(d)) == []
+
+    def test_depth_limit_none_detected_is_a_new_high_priority_lead(self, tmp_path):
+        # Previously had ZERO lead-board coverage at all -- not in the
+        # old table under any name.
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, depth_limit="NONE DETECTED")
+        (d / "depth_bomb.txt").write_text('{"data":{"viewer":{}}}\ndepth-15 query: HTTP 200  time: 0.3s\n')
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1
+        assert leads[0]["priority"] == "high"
+        assert leads[0]["tool_artifact"] == "depth_bomb.txt"
+
+    def test_depth_limit_enforced_never_fires(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, depth_limit="enforced or endpoint rejected query")
+        (d / "depth_bomb.txt").write_text('{"errors":"query depth exceeds maximum"}\nHTTP 400\n')
+        assert director.graphql_audit_leads("t.example", str(d)) == []
+
+    def test_interesting_fields_real_hits_become_a_lead(self, tmp_path):
+        # interesting_fields.txt only ever exists alongside a successful
+        # introspection run in the real script -- both signals fire here,
+        # which is the faithful scenario, not an isolated one.
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, introspection="ENABLED")
+        (d / "introspection.json").write_text(json.dumps({"data": {"__schema": {"types": []}}}))
+        (d / "interesting_fields.txt").write_text("TYPE: AdminUser\nFIELD: User.password\n")
+        leads = director.graphql_audit_leads("t.example", str(d))
+        signals = {l["signal"] for l in leads}
+        assert "interesting schema fields" in signals
+        assert "introspection enabled" in signals
+        assert len(leads) == 2
+
+    def test_interesting_fields_negative_marker_never_fires(self, tmp_path):
+        # The script ALWAYS writes this file when introspection succeeds
+        # -- including the literal "nothing found" placeholder line.
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, introspection="ENABLED")
+        (d / "introspection.json").write_text(json.dumps({"data": {"__schema": {"types": []}}}))
+        (d / "interesting_fields.txt").write_text("no obvious sensitive names found")
+        leads = director.graphql_audit_leads("t.example", str(d))
+        assert len(leads) == 1  # introspection itself, not interesting_fields
+        assert leads[0]["signal"] == "introspection enabled"
+
+    def test_multiple_real_signals_each_become_a_lead(self, tmp_path):
+        d = tmp_path / "graphql"
+        d.mkdir()
+        _write_graphql_summary(d, array_batching="ENABLED", alias_bombing="ENABLED")
+        (d / "batching_dos.txt").write_text("[{...}]\n")
+        (d / "alias_bomb.txt").write_text('{"data":{"q0":"Query"}}\n')
         leads = director.graphql_audit_leads("t.example", str(d))
         assert len(leads) == 2
         assert all(l["skill"] == "hunt-graphql" for l in leads)
@@ -298,14 +499,16 @@ class TestGraphqlAuditLeads:
         (recon_dir / "fingerprint.json").write_text(json.dumps({"api_style": ["graphql"]}))
         gd = tmp_path / "graphql"
         gd.mkdir()
-        (gd / "introspection.json").write_text(json.dumps({"data": {}}))
+        _write_graphql_summary(gd, introspection="ENABLED")
+        (gd / "introspection.json").write_text(json.dumps({"data": {"__schema": {"types": []}}}))
         leads = director.graphql_audit_leads("t.example", str(gd), str(recon_dir))
         assert "fingerprint-confirmed" in leads[0]["why"]
 
     def test_no_fingerprint_file_still_emits_leads_without_confirmation_tag(self, tmp_path):
         gd = tmp_path / "graphql"
         gd.mkdir()
-        (gd / "introspection.json").write_text(json.dumps({"data": {}}))
+        _write_graphql_summary(gd, introspection="ENABLED")
+        (gd / "introspection.json").write_text(json.dumps({"data": {"__schema": {"types": []}}}))
         leads = director.graphql_audit_leads("t.example", str(gd), str(tmp_path / "recon" / "nope"))
         assert leads and "fingerprint-confirmed" not in leads[0]["why"]
 
