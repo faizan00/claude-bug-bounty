@@ -39,7 +39,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
-from memory.candidate import EVIDENCE_TYPES  # noqa: E402
+from memory.candidate import EVIDENCE_TYPES, lead_to_candidate_view  # noqa: E402
 from memory.object_model import (  # noqa: E402
     detect_logic_pattern_violations,
     detect_relationship_violations,
@@ -415,7 +415,17 @@ def _load_jsonl(path: str | None) -> list[dict]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Phase 7 Self-Critique Gate for a memory/candidate.py Candidate")
-    ap.add_argument("--candidate", required=True, help="Path to a Candidate JSON file")
+    ap.add_argument("--candidate", default=None, help="Path to a Candidate JSON file")
+    ap.add_argument(
+        "--from-lead-board", nargs=2, metavar=("TARGET", "LEAD_ID"), default=None,
+        help="Alternative to --candidate: load an existing lead_board.py ledger entry "
+             "(memory/leads/<TARGET>.jsonl, matched by LEAD_ID) and convert it via "
+             "memory.candidate.lead_to_candidate_view() instead of hand-transcribing a "
+             "Candidate JSON file. Closes the gap where a confirmed finding whose evidence "
+             "originated as a plain lead-board lead (not memory/object_model.py, which "
+             "already produces native Candidates) had no path into this gate short of "
+             "manually authoring one.",
+    )
     ap.add_argument("--report-outcomes", default=None, help="Path to hunt-memory/report_outcomes.jsonl")
     ap.add_argument("--observations", default=None, help="Path to memory/object_model.py's observations.jsonl")
     ap.add_argument(
@@ -441,7 +451,21 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    candidate = _load_json(args.candidate)
+    if bool(args.candidate) == bool(args.from_lead_board):
+        ap.error("exactly one of --candidate or --from-lead-board is required")
+
+    if args.candidate:
+        candidate = _load_json(args.candidate)
+    else:
+        import tools.lead_board as lead_board
+
+        target, lead_id = args.from_lead_board
+        lead = next((ld for ld in lead_board.load_ledger(target) if ld.get("id") == lead_id), None)
+        if lead is None:
+            print(f"ERROR: no lead {lead_id!r} in memory/leads/{target}.jsonl", file=sys.stderr)
+            return 1
+        candidate = lead_to_candidate_view(lead)
+
     report_outcomes = _load_jsonl(args.report_outcomes)
     observations = _load_jsonl(args.observations)
     prior_candidates = _load_jsonl(args.prior_candidates)

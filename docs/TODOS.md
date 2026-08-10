@@ -6,7 +6,7 @@ Items deferred from the MCP-First Bionic Hunter design review (2026-03-24).
 
 ## ~~TODO-1: Secure credential handling for hunt sessions~~ ✅ RESOLVED (2026-04-02)
 
-**Resolution:** Implemented `tools/credential_store.py` — loads credentials from `.env` file (already in `.gitignore`). Values never appear in `repr()`/`str()`, masked output via `get_masked()`, auth header builder via `as_headers()`. 15 tests in `tests/test_credential_store.py`.
+**Resolution:** Originally implemented as `tools/credential_store.py` (2026-04-02) — loaded credentials from a gitignored `.env` file, masked in `repr()`/`str()`. That module was never actually wired into any real tool; `tools/auth_session.py`'s `AuthSession` (env vars, JSON, `.env`, or CLI flags; secrets never appear in logs/repr/str; only a hashed `session_id` is persisted) is the mechanism every real caller (`browser_recon.py`'s `Fetcher`, `tools/hunt.py`) actually uses and independently covers the same guarantee. Found during the 2026-08-10 Phase 12 dormant-capability sweep — `credential_store.py` and its 15 tests were pure dead code (real, tested, documented, zero production callers) superseding nothing and superseded by nothing it was ever connected to. Removed `tools/credential_store.py`/`tests/test_credential_store.py` rather than leave a redundant, never-called second implementation of the same capability sitting next to the real one.
 
 **What:** Auth credentials (API keys, cookies, Bearer tokens) passed to `/hunt` or `/autopilot` via Bash env vars or direct input persist in the Claude Code conversation transcript. Anyone with access to `~/.claude/projects/` can read them.
 
