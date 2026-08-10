@@ -7,6 +7,7 @@ from memory.object_model import make_observation
 from memory.identity import entity_id, object_id
 from memory.vuln_intelligence import DEFAULT_DEDUP_PROBABILITY, MIN_SAMPLES_FOR_DEDUP_PROBABILITY, priority_score
 from tools import self_critique as sc
+from tools import lead_board as lb
 
 
 def _candidate(**overrides):
@@ -469,3 +470,66 @@ class TestCLI:
         sc.main()
         report = _json.loads(capsys.readouterr().out)
         assert report["details"]["duplicate_probability"]["details"]["novel_impact_argument_reused_verbatim"] is True
+
+    # -- Phase 12 fix: --from-lead-board (memory.candidate.lead_to_candidate_view
+    # was real, tested, and zero-callers -- a confirmed finding whose evidence
+    # originated as a plain lead-board lead had no path into this gate short of
+    # hand-authoring a Candidate JSON from scratch) -----------------------------
+
+    def test_cli_from_lead_board_converts_a_real_ledger_entry(self, tmp_path, monkeypatch, capsys):
+        import sys as _sys
+        import json as _json
+
+        monkeypatch.setattr(lb, "LEADS_DIR", str(tmp_path / "leads"))
+        lb.save_ledger("t.example", [{
+            "id": "lb-real-lead", "target": "t.example", "skill": "hunt-idor",
+            "priority": "high", "signal": "test", "why": "attacker can read victim's order",
+            "evidence": "https://t.example/api/orders/42", "source": "url", "status": "new",
+            "note": "", "created": lb.now_iso(), "last_seen": lb.now_iso(), "seen_count": 1,
+        }])
+        monkeypatch.setattr(_sys, "argv", [
+            "self_critique.py", "--from-lead-board", "t.example", "lb-real-lead", "--no-fetch",
+        ])
+        assert sc.main() == 1  # no fetcher -> reproducibility blocks, same as --candidate path
+        report = _json.loads(capsys.readouterr().out)
+        assert report["overall"] == "block"
+        # evidence_completeness also blocks here, but only on the fields a plain
+        # lead-board lead genuinely never carries (validation_plan -- lead_to_
+        # candidate_view() honestly leaves it empty rather than fabricating
+        # steps). evidence/rationale are NOT in the missing list, proving the
+        # conversion really carried the lead's own evidence/why over, not just
+        # that main() didn't crash.
+        missing = report["details"]["evidence_completeness"]["details"]["missing"]
+        assert all(m.startswith("validation_plan.") for m in missing)
+        assert "evidence" not in missing and "rationale" not in missing
+
+    def test_cli_from_lead_board_unknown_lead_id_fails_loud_not_silent(self, tmp_path, monkeypatch, capsys):
+        import sys as _sys
+
+        monkeypatch.setattr(lb, "LEADS_DIR", str(tmp_path / "leads"))
+        lb.save_ledger("t.example", [])
+        monkeypatch.setattr(_sys, "argv", [
+            "self_critique.py", "--from-lead-board", "t.example", "does-not-exist", "--no-fetch",
+        ])
+        assert sc.main() == 1
+        assert "no lead 'does-not-exist'" in capsys.readouterr().err
+
+    def test_cli_requires_exactly_one_of_candidate_or_from_lead_board(self, monkeypatch):
+        import sys as _sys
+
+        monkeypatch.setattr(_sys, "argv", ["self_critique.py", "--no-fetch"])
+        with pytest.raises(SystemExit):
+            sc.main()
+
+    def test_cli_rejects_both_candidate_and_from_lead_board_together(self, tmp_path, monkeypatch):
+        import sys as _sys
+        import json as _json
+
+        candidate_path = tmp_path / "candidate.json"
+        candidate_path.write_text(_json.dumps(_candidate()))
+        monkeypatch.setattr(_sys, "argv", [
+            "self_critique.py", "--candidate", str(candidate_path),
+            "--from-lead-board", "t.example", "lb-real-lead", "--no-fetch",
+        ])
+        with pytest.raises(SystemExit):
+            sc.main()

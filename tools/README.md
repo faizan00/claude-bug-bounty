@@ -38,8 +38,7 @@ Python and shell scanner pipeline (~35 tools). Every tool checks whether its ext
 | Tool | Purpose |
 |:---|:---|
 | `memory_gc.py` | Inspect and rotate hunt-memory JSONL files (10 MB cap, 3 backups) |
-| `auth_session.py` | Auth header management across all tools |
-| `credential_store.py` | Encrypted credential store for hunt sessions |
+| `auth_session.py` | Auth header management across all tools — secrets never appear in logs/repr/str |
 
 ## Credential Attack (requires `--with-credential-attack`)
 `wordlist_engine.sh` · `osint_employees.sh` · `breach_checker.py` · `spray_orchestrator.sh`
