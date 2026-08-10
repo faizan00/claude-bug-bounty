@@ -1,5 +1,5 @@
 ---
-description: Inspect or rotate hunt-memory JSONL files (audit.jsonl, patterns.jsonl, journal.jsonl). Caps file size and keeps N rotated backups so memory does not grow unbounded.
+description: Inspect or rotate every hunt-memory JSONL file (audit.jsonl, patterns.jsonl, journal.jsonl, failed_patterns.jsonl, chains.jsonl, report_outcomes.jsonl, hypotheses.jsonl, experiments.jsonl, finding_states.jsonl, object_model/<target>.jsonl). Caps file size and keeps N rotated backups so memory does not grow unbounded.
 ---
 
 # /memory-gc
@@ -10,7 +10,7 @@ Garbage-collect the hunt-memory directory. Reports current sizes, rotates oversi
 
 Append-only logs grow without bound. On active hunters:
 - `audit.jsonl` can reach 100 MB+ in months (every outbound request)
-- `patterns.jsonl` and `journal.jsonl` accumulate forever
+- `patterns.jsonl`, `journal.jsonl`, `chains.jsonl`, `hypotheses.jsonl`, `report_outcomes.jsonl`, `failed_patterns.jsonl`, `experiments.jsonl`, `finding_states.jsonl`, and `object_model/<target>.jsonl` all accumulate forever too
 
 This command surfaces that growth and gives you a one-shot fix.
 
@@ -27,10 +27,19 @@ This command surfaces that growth and gives you a one-shot fix.
 ## What It Does
 
 1. Walks the hunt-memory directory recursively.
-2. Finds `audit.jsonl`, `patterns.jsonl`, and `journal.jsonl` files at any depth.
+2. Finds every file matching `tools/memory_gc.py`'s `ROTATABLE` list at any depth: `audit.jsonl`, `patterns.jsonl`, `journal.jsonl`, `failed_patterns.jsonl`, `chains.jsonl`, `report_outcomes.jsonl`, `hypotheses.jsonl`, `experiments.jsonl`, `finding_states.jsonl`, and `object_model/*.jsonl` (one file per target — `memory/object_model.py`'s per-target observation log, unlike every other entry here which is a single shared file).
 3. Prints a per-file table: live size, total (live + backups), backup count, status.
 4. With `--rotate`: renames oversize files to `<file>.1`, shifting older backups up to `<file>.{keep}`. The oldest is dropped.
 5. With `--purge-backups`: removes every `.1`/`.2`/`.3` backup, keeping only live files.
+
+`memory/leads/<target>.jsonl` (the lead board, `tools/lead_board.py`) is
+deliberately **not** covered — it lives outside `hunt-memory/` entirely and
+is a stateful keyed ledger (read-modify-write on every `ingest`/`touch`/`add`
+call), not a pure append-only log. Byte-cap rotation is only safe for
+append-only files; applying it here would silently drop killed/reported
+lead history, violating Critical Rule 6 ("never lose a lead"). If that
+ledger ever needs size management, it needs its own compaction design, not
+this tool.
 
 ## Implementation
 
@@ -50,7 +59,9 @@ from the repo root.
 
 Auto-rotation fires automatically in two places:
 
-1. **On every write** — inside `AuditLog.log()` and `PatternDB.save()` when the next append would exceed the cap.
-2. **On session end** — a `Stop` hook in `.claude/settings.json` runs `python3 -m tools.memory_gc --rotate` so long sessions that wrote a lot but never crossed the cap mid-session still get cleaned up.
+1. **On every write** — every one of the 10 classes above (`AuditLog`, `PatternDB`, `FailedPatternDB`, `ChainDB`, `ReportOutcomeDB`, `HypothesisDB`, `ExperimentDB`, `FindingStateDB`, `ObservationStore`, plus the journal writer) calls `memory.rotation.rotate_if_needed()` inside its own `.save()`/`.record()`/`.log()` before appending — this is what actually protects every one of these files from unbounded growth. It doesn't depend on this command ever being run.
+2. **On session end** — a `Stop` hook in `.claude/settings.json` runs `python3 -m tools.memory_gc --rotate`, catching anything that crossed the cap but hasn't been written to again since (the on-write trigger above only fires on the *next* write to that specific file).
+
+This command's job is reporting/visibility and manual cleanup — the files stay protected from unbounded growth whether or not you ever run it.
 
 So this slash command is mainly for ad-hoc reporting (`/memory-gc` with no args) and manual cleanup of accumulated backups (`/memory-gc --purge-backups`).
