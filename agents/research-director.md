@@ -33,7 +33,7 @@ python3 tools/director.py build-plan <target> --hours <N> --memory-dir hunt-memo
 
 This does, in order:
 1. Loads every `status: "new"` lead from the lead board.
-2. Converts Phase 1 browser intelligence (`never-called.json`, `routes.json`, `auth-model.json`, `api-calls.json`) into the same lead shape, tagged `source: "browser-intel"` — hidden endpoints, framework routes, candidate privileged client routes, role/permission constants, and authenticated API calls all become real attack candidates instead of sitting in a JSON file nobody reads.
+2. Converts Phase 1 browser intelligence (`never-called.json`, `routes.json`, `auth-model.json`, `api-calls.json`) into the same lead shape, tagged `source: "browser-intel"` — hidden endpoints, framework routes, candidate privileged client routes, role/permission constants, and authenticated API calls all become real attack candidates instead of sitting in a JSON file nobody reads. Also converts Phase 2.6's `fingerprint.json` `cves[]` (a version-CONFIRMED match against the target's actual fingerprinted framework, not a heuristic) into `source: "fingerprint-cve"` leads the same way — no opt-in flag needed, both are deterministic recon-dir-relative and always run unconditionally.
 3. Scores every candidate via `memory.vuln_intelligence.priority_score()` / `expected_value_per_hour()` — the one formula, same as `recon-ranker`. Nothing here recomputes it.
 4. Orders by EV/hour (not raw priority — a fast, high-probability P2 can and should outrank a slow P1 when the goal is maximizing value per hour, not landing the single best possible finding).
 5. Classifies every candidate as either a planned attack or a skip with a machine-checkable reason (see SKIPPED below), respecting the `--hours` budget.

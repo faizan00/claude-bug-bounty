@@ -186,10 +186,29 @@ class TestVersionInRange:
             ]}
         }
         hits = fp._match_cves("nextjs", "12.0.0", matrix)
-        assert hits == [{"id": "CVE-2025-29927", "severity": "critical", "affected_versions": [">=11.1.4,<13.5.9"]}]
+        assert hits == [{
+            "id": "CVE-2025-29927", "severity": "critical",
+            "affected_versions": [">=11.1.4,<13.5.9"],
+            "vuln_class": "auth-bypass", "citation": "y",
+        }]
 
         # Version outside the CVE's range -> no hit, even though the "*" entry matches (but has no cve).
         assert fp._match_cves("nextjs", "14.0.0", matrix) == []
+
+    def test_match_cves_degrades_class_and_citation_to_none_when_absent(self):
+        # A caller-supplied/malformed matrix omitting class/citation must
+        # degrade to None, never raise -- vuln_class=None is how
+        # director.py's fingerprint_cve_leads() knows to skip this hit
+        # rather than guess a skill.
+        matrix = {"custom": {"version_ranges": [
+            {"range": "*", "vulns": [{"cve": "CVE-2024-0001", "weight": 60}]},
+        ]}}
+        hits = fp._match_cves("custom", "1.0.0", matrix)
+        assert hits == [{
+            "id": "CVE-2024-0001", "severity": "medium",
+            "affected_versions": ["*"],
+            "vuln_class": None, "citation": None,
+        }]
 
 
 # ─── Phase 1 data wins over re-derivation ──────────────────────────────────

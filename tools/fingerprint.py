@@ -37,7 +37,8 @@ SCHEMA — recon/<target>/fingerprint.json:
   "api_style": [str, ...],          # subset of {"graphql", "json"}
   "spa_framework": str | null,      # "nextjs" | "angular" | "react" | null
   "router_type": str | null,        # best-effort, only where provable — see _detect_router_type
-  "cves": [{"id": str, "severity": str, "affected_versions": [str]}]
+  "cves": [{"id": str, "severity": str, "affected_versions": [str],
+            "vuln_class": str, "citation": str | null}]
 }
 
 FRAMEWORK DETECTION — priority tiers. A lower tier only fills a gap a
@@ -464,7 +465,16 @@ def _severity_for_weight(weight: float) -> str:
 def _match_cves(tag: str, version: str | None, matrix: dict) -> list[dict]:
     """Only matrix entries carrying a real, non-null `cve` id are surfaced
     here — weight-only entries (no known CVE) are a priority_score()
-    signal, not a fabricated CVE record."""
+    signal, not a fabricated CVE record.
+
+    vuln_class/citation are carried through from the matrix entry (not
+    dropped) so a downstream caller can route a confirmed, version-matched
+    CVE hit to a specific hunt-* skill — see tools/director.py's
+    fingerprint_cve_leads(), the first consumer that needs vuln_class here.
+    citation can legitimately be null (tech_attack_matrix.json doesn't
+    require one per entry); vuln_class cannot be missing for a real CVE
+    entry in the shipped matrix, but a caller-supplied/malformed matrix
+    could omit it, so this degrades to None rather than raising."""
     entry = matrix.get(tag) or matrix.get((tag or "").lower())
     if not entry:
         return []
@@ -481,6 +491,8 @@ def _match_cves(tag: str, version: str | None, matrix: dict) -> list[dict]:
                 "id": cve,
                 "severity": _severity_for_weight(vuln.get("weight", 0)),
                 "affected_versions": [rng],
+                "vuln_class": vuln.get("class"),
+                "citation": vuln.get("citation"),
             })
     return hits
 

@@ -775,6 +775,97 @@ def object_model_leads(target: str, memory_dir: str) -> list[dict]:
     return leads
 
 
+# ─── Fingerprinted framework CVE -> concrete lead (framework-aware hypothesis) ──
+#
+# tools/fingerprint.py's Phase 2.6 output already answers the single
+# highest-confidence question this whole pipeline can ask about tech stack:
+# "is THIS target's actual fingerprinted version inside a published CVE's
+# vulnerable range" (version_in_range() in that module — a real, deterministic
+# range check, not a heuristic). Before this adapter, that answer was
+# discarded past _matrix_technology_match() (memory/vuln_intelligence.py),
+# which only ever nudges an EXISTING lead's score and is itself version-
+# blind (load_tech_stack() returns bare tag strings like "nextjs", never a
+# version) — so a target on a patched version got the exact same technology_
+# match floor as one on a genuinely vulnerable version, and a target with NO
+# other lead touching that vuln_class got no candidate to test at all, no
+# matter how severe the confirmed CVE was.
+#
+# This is the SAME "mechanically confirmed, no LLM judgment required" tier
+# as a nuclei hit (lead_board.py's ROUTES catch-all: any nuclei match is an
+# automatic P_HIGH lead) or a secrets_scanner.py pattern match — not a
+# statistical affinity guess, so it gets a real lead, not a hypotheses.jsonl
+# entry. hypotheses.jsonl (HypothesisDB, agents/hypothesis-engine.md) is
+# reserved for an LLM synthesizing a falsifiable claim ACROSS several
+# weaker signals and self-declaring a confidence to be calibrated later —
+# there is no judgment call here, only a version-range comparison
+# fingerprint.py already made, so routing it through the same lead pipeline
+# every other mechanically-confirmed signal uses is the correct fit, not a
+# missed opportunity to write a hypothesis.
+#
+# vuln_class (tools/tech_attack_matrix.json's own `class` field per CVE,
+# now carried through by fingerprint.py's _match_cves() instead of being
+# dropped) -> an EXISTING hunt-* skill. Deliberately NOT exhaustive: a class
+# with no honest existing-skill match (e.g. "reentrancy" — smart-contract-
+# specific, belongs to the separate /web3-audit pipeline, not any web2
+# hunt-* skill lead_board.py routes) is left unmapped on purpose, and
+# _new_fingerprint_cve_lead() below skips it rather than inventing a skill
+# name nothing else in this repo recognizes.
+_FINGERPRINT_CVE_CLASS_ROUTE: dict[str, str] = {
+    "auth-bypass": "hunt-auth-bypass",
+    "cors": "hunt-cors",
+    "idor": "hunt-idor",
+    "info-disclosure": "hunt-misc",
+    "misconfig": "hunt-misc",
+    "open-redirect": "hunt-open-redirect",
+    "race-condition": "hunt-business-logic",
+    "rce": "hunt-rce",
+    "ssrf": "hunt-ssrf",
+    "xss": "hunt-xss",
+}
+# fingerprint.json's cves[] already carries a severity string _severity_for_
+# weight() (tools/fingerprint.py) computed from the matrix's own weight —
+# reused verbatim here, not re-derived from a second threshold table.
+_FINGERPRINT_CVE_SEVERITY_PRIORITY: dict[str, str] = {
+    "critical": lead_board.P_HIGH, "high": lead_board.P_HIGH,
+    "medium": lead_board.P_MED, "low": lead_board.P_LOW,
+}
+
+
+def fingerprint_cve_leads(target: str, recon_dir: str) -> list[dict]:
+    """Convert recon/<target>/fingerprint.json's cves[] (Phase 2.6, always-
+    on, no opt-in flag needed — same deterministic recon_dir-relative
+    convention as secret_scan_leads() above) into lead-board-shaped
+    candidates. A framework CVE is not endpoint-specific the way a URL-
+    shaped signal is, so evidence is the target's host root, tagged with
+    the CVE id/citation in `why` for a hunter to act on. Never raises: a
+    target with no fingerprint.json yet (Phase 2.6 never ran, or ran and
+    found framework="unknown") just yields [], same cold-start convention
+    as every other *_leads() adapter."""
+    fp_data = _read_json_file(Path(recon_dir) / "fingerprint.json")
+    if not isinstance(fp_data, dict):
+        return []
+    leads = []
+    for hit in fp_data.get("cves", []) or []:
+        if not isinstance(hit, dict):
+            continue
+        vuln_class = hit.get("vuln_class")
+        skill = _FINGERPRINT_CVE_CLASS_ROUTE.get((vuln_class or "").lower())
+        if not skill:
+            continue
+        cve_id = hit.get("id", "unknown-cve")
+        priority = _FINGERPRINT_CVE_SEVERITY_PRIORITY.get(hit.get("severity", ""), lead_board.P_MED)
+        citation = hit.get("citation")
+        why = (f"fingerprint.py matched {fp_data.get('framework')} "
+               f"{fp_data.get('version') or '(unknown version)'} against {cve_id}'s "
+               f"vulnerable range ({', '.join(hit.get('affected_versions', []) or [])})"
+               + (f" — {citation}" if citation else ""))
+        leads.append(_new_tool_lead(
+            target, skill, priority, f"fingerprinted CVE: {cve_id}", why,
+            f"https://{target}/", "fingerprint-cve", "fingerprint.json",
+        ))
+    return leads
+
+
 # ─── Cross-source dedup (HIGH-severity fix) ─────────────────────────────────
 #
 # Problem: build_plan() concatenates six independent lead sources into
@@ -802,9 +893,17 @@ def object_model_leads(target: str, memory_dir: str) -> list[dict]:
 #      takeover-scan       or confirmed-exposed-sourcemap-directory check
 #      cloud-recon         over ALREADY-RECOVERED source, and real scanner
 #      graphql-audit       tool output (dnsReaper/subjack/S3Scanner/
-#                          gqlmap/graphql-cop) — an actual DNS/HTTP round
+#      fingerprint-cve     gqlmap/graphql-cop) — an actual DNS/HTTP round
 #                          trip already ran; not an inference over other
-#                          leads.
+#                          leads. fingerprint-cve is the one exception that
+#                          made no NEW round trip (it matches already-
+#                          fingerprinted framework+version against
+#                          tech_attack_matrix.json's version ranges) but
+#                          earns the same tier for a different reason: a
+#                          real version_in_range() comparison, not a
+#                          probabilistic guess — either the target's exact
+#                          version is in the published CVE's vulnerable
+#                          range or it isn't.
 #   3  browser-intel    — real Phase 1 browser-recon artifacts
 #                         (routes.json/auth-model.json/never-called.json),
 #                         but heuristic extraction (documented
@@ -841,6 +940,7 @@ _SOURCE_CONFIDENCE_RANK: dict[str, int] = {
     "takeover-scan": 4,
     "cloud-recon": 4,
     "graphql-audit": 4,
+    "fingerprint-cve": 4,
     "browser-intel": 3,
     "attack-graph": 2,
 }
@@ -1236,6 +1336,10 @@ class Director:
         # cold-start (no memory/object_model/<target>.jsonl yet) is just []
         # (Phase 6, Part 1).
         object_model_leads_list = object_model_leads(target, memory_dir)
+        # Deterministic recon_dir-relative, same unconditional convention as
+        # secret_leads above — fingerprint.json is Phase 2.6's always-on
+        # output, so a not-yet-fingerprinted target just yields [].
+        fingerprint_leads = fingerprint_cve_leads(target, recon_dir)
 
         # Standalone-tool adapters (Phase 5, Part B) — all default None,
         # so omitting them reproduces prior build_plan() behavior exactly.
@@ -1253,7 +1357,8 @@ class Director:
         if param_findings_dir:
             tool_leads += param_discovery_leads(target, param_findings_dir)
 
-        all_leads = board_leads + bi_leads + graph_leads + secret_leads + object_model_leads_list + tool_leads
+        all_leads = (board_leads + bi_leads + graph_leads + secret_leads
+                     + object_model_leads_list + fingerprint_leads + tool_leads)
         # HIGH-severity fix — collapse the same real vulnerability
         # independently surfaced by multiple lead sources (e.g. object-model
         # + attack-graph + the plain lead board all pointing at the same

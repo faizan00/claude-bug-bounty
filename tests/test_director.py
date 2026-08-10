@@ -477,6 +477,148 @@ class TestBuildPlanSecretScanWiring:
         assert any("AKIA" in e for e in flat)
 
 
+def _write_fingerprint(recon_dir, cves):
+    fp_path = Path(recon_dir)
+    fp_path.mkdir(parents=True, exist_ok=True)
+    (fp_path / "fingerprint.json").write_text(json.dumps({
+        "target": "t.example", "framework": "nextjs", "version": "12.0.0", "cves": cves,
+    }))
+
+
+_NEXTJS_CVE_HIT = {
+    "id": "CVE-2025-29927", "severity": "critical",
+    "affected_versions": [">=11.1.4,<13.5.9"],
+    "vuln_class": "auth-bypass", "citation": "Next.js middleware authorization bypass",
+}
+
+
+class TestFingerprintCveLeads:
+    """recon/<target>/fingerprint.json's cves[] (Phase 2.6, always-on) ->
+    lead-board leads for the version-confirmed CVE match — the
+    "framework-aware hypothesis" gap: this is the ONE precise, mechanical
+    signal fingerprint.py already computes (a real version_in_range() match
+    against the target's actual fingerprinted version) that nothing
+    downstream ever turned into a testable candidate before this."""
+
+    def test_missing_fingerprint_json_returns_empty(self, tmp_path):
+        assert director.fingerprint_cve_leads("t.example", str(tmp_path / "recon" / "t.example")) == []
+
+    def test_malformed_fingerprint_json_does_not_raise(self, tmp_path):
+        rd = tmp_path / "recon" / "t.example"
+        rd.mkdir(parents=True)
+        (rd / "fingerprint.json").write_text("{not json")
+        assert director.fingerprint_cve_leads("t.example", str(rd)) == []
+
+    def test_no_cves_key_returns_empty(self, tmp_path):
+        rd = tmp_path / "recon" / "t.example"
+        rd.mkdir(parents=True)
+        (rd / "fingerprint.json").write_text(json.dumps({"target": "t.example", "framework": "unknown"}))
+        assert director.fingerprint_cve_leads("t.example", str(rd)) == []
+
+    def test_real_cve_hit_becomes_high_priority_lead_with_expected_skill(self, tmp_path):
+        rd = tmp_path / "recon" / "t.example"
+        _write_fingerprint(rd, [_NEXTJS_CVE_HIT])
+        leads = director.fingerprint_cve_leads("t.example", str(rd))
+        assert len(leads) == 1
+        lead = leads[0]
+        assert lead["skill"] == "hunt-auth-bypass"
+        assert lead["priority"] == "high"
+        assert lead["source"] == "fingerprint-cve"
+        assert lead["tool_artifact"] == "fingerprint.json"
+        assert "CVE-2025-29927" in lead["signal"]
+        assert "CVE-2025-29927" in lead["why"]
+        assert "middleware authorization bypass" in lead["why"]
+        assert lead["evidence"] == "https://t.example/"
+
+    def test_severity_maps_to_expected_priority_tier(self, tmp_path):
+        rd = tmp_path / "recon" / "t.example"
+        _write_fingerprint(rd, [
+            {**_NEXTJS_CVE_HIT, "id": "CVE-A", "severity": "medium"},
+            {**_NEXTJS_CVE_HIT, "id": "CVE-B", "severity": "low"},
+        ])
+        leads = director.fingerprint_cve_leads("t.example", str(rd))
+        by_id = {l["signal"]: l["priority"] for l in leads}
+        assert by_id["fingerprinted CVE: CVE-A"] == "med"
+        assert by_id["fingerprinted CVE: CVE-B"] == "low"
+
+    def test_unmapped_vuln_class_is_skipped_not_fabricated(self, tmp_path):
+        # "reentrancy" is smart-contract-specific -- no honest web2 hunt-*
+        # skill exists for it, so this must be silently skipped, never
+        # routed to a made-up or wrong skill.
+        rd = tmp_path / "recon" / "t.example"
+        _write_fingerprint(rd, [
+            {"id": "CVE-FAKE", "severity": "high", "affected_versions": ["*"],
+             "vuln_class": "reentrancy", "citation": None},
+        ])
+        assert director.fingerprint_cve_leads("t.example", str(rd)) == []
+
+    def test_missing_vuln_class_is_skipped(self, tmp_path):
+        rd = tmp_path / "recon" / "t.example"
+        _write_fingerprint(rd, [
+            {"id": "CVE-FAKE", "severity": "high", "affected_versions": ["*"],
+             "vuln_class": None, "citation": None},
+        ])
+        assert director.fingerprint_cve_leads("t.example", str(rd)) == []
+
+    def test_multiple_real_cves_each_become_their_own_lead(self, tmp_path):
+        rd = tmp_path / "recon" / "t.example"
+        _write_fingerprint(rd, [
+            _NEXTJS_CVE_HIT,
+            {"id": "CVE-OTHER", "severity": "high", "affected_versions": ["*"],
+             "vuln_class": "ssrf", "citation": "test"},
+        ])
+        leads = director.fingerprint_cve_leads("t.example", str(rd))
+        assert {l["skill"] for l in leads} == {"hunt-auth-bypass", "hunt-ssrf"}
+
+
+class TestBuildPlanFingerprintCveWiring:
+    """fingerprint_cve_leads() is wired unconditionally into build_plan(),
+    same as secret_scan_leads() above -- fingerprint.json is Phase 2.6's
+    always-on output, no opt-in findings_dir param."""
+
+    def test_no_fingerprint_json_reproduces_prior_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        d1 = director.Director(memory_dir=str(tmp_path / "hunt-memory-a"))
+        d2 = director.Director(memory_dir=str(tmp_path / "hunt-memory-b"))
+        plan_a = d1.build_plan("t.example", hours=5, recon_dir=rd)
+        plan_b = d2.build_plan("t.example", hours=5, recon_dir=rd)
+        assert len(plan_a.attacks) == len(plan_b.attacks)
+
+    def test_fingerprinted_cve_adds_a_candidate_to_the_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        _write_fingerprint(rd, [_NEXTJS_CVE_HIT])
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+        all_evidence = [a.evidence for a in plan.attacks] + [[s["evidence"]] for s in plan.skipped]
+        flat = [e for group in all_evidence for e in group]
+        assert any("t.example" in e and e.rstrip("/").endswith("t.example") for e in flat)
+
+    def test_fingerprint_cve_lead_confidence_rank_wins_a_dedup_collision(self, isolated, tmp_path):
+        # A plain lead-board "url"-source lead whose evidence normalizes to
+        # the SAME shape ("/") as the fingerprint-cve lead's host-root
+        # evidence must lose the dedup collision -- fingerprint-cve (rank 4)
+        # outranks the default rank-0 tier a plain recon-ingested lead gets.
+        rd = _seed_leads(isolated, "t.example", ["https://t.example/"])
+        leads = lb.load_ledger("t.example")
+        auth_bypass_lead = next((l for l in leads if l["skill"] == "hunt-auth-bypass"), None)
+        if auth_bypass_lead is None:
+            # REALISTIC_URLS-shaped seed didn't happen to produce an
+            # auth-bypass lead at "/" -- add one directly so the collision
+            # is deterministic regardless of ROUTES table changes elsewhere.
+            lb.save_ledger("t.example", leads + [{
+                "id": "lb-collide", "target": "t.example", "skill": "hunt-auth-bypass",
+                "priority": "med", "signal": "test", "why": "test",
+                "evidence": "https://t.example/", "source": "url", "status": "new", "note": "",
+                "created": lb.now_iso(), "last_seen": lb.now_iso(), "seen_count": 1,
+            }])
+        _write_fingerprint(rd, [_NEXTJS_CVE_HIT])
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+        matching = [a for a in plan.attacks if any("fingerprinted CVE" in e for e in a.evidence)]
+        matching += [s for s in plan.skipped if "fingerprinted CVE" in s.get("evidence", "")]
+        assert len(matching) == 1, f"expected the fingerprint-cve lead to win the collision, got {matching}"
+
+
 _lead_id_counter = iter(range(1_000_000))
 
 
