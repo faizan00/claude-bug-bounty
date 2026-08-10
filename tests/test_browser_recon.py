@@ -393,6 +393,78 @@ class TestRequestCap:
             fetcher.get(url)
 
 
+class TestWallClockBudget:
+    """Phase 3 (resource governance): max_requests alone bounds request
+    COUNT, not elapsed TIME -- a slow/hanging target could burn the full
+    per-request timeout on every request without ever tripping the
+    count-based cap. This is a real, code-enforced budget (not advisory):
+    the SAME choke point (Fetcher._preflight()) every real-request-firing
+    tool built this session (idor_diff.py, business_logic_probe.py,
+    incremental_recon.py) already goes through, so all of them inherit
+    this protection automatically with zero changes to those files."""
+
+    def test_default_budget_does_not_fire_immediately(self, checker):
+        url = "https://t.example/x"
+        session = FakeSession({url: FakeResponse(200, "ok")})
+        fetcher = br.Fetcher(checker, session=session, limiter=SpyLimiter())
+        fetcher.get(url)  # must not raise
+
+    def test_budget_exceeded_blocks_the_next_request(self, checker, monkeypatch):
+        url = "https://t.example/x"
+        session = FakeSession({url: FakeResponse(200, "ok")})
+        fetcher = br.Fetcher(checker, session=session, limiter=SpyLimiter(),
+                              max_wall_clock_seconds=100.0)
+        fetcher.get(url)
+
+        # Simulate real elapsed time by moving the fetcher's own start_time
+        # into the past -- exercises the exact same time.monotonic() delta
+        # check _preflight() runs on a real clock, not a mocked one.
+        fetcher._start_time -= 101.0
+        with pytest.raises(br.WallClockBudgetExceeded, match="wall-clock budget"):
+            fetcher.get(url)
+
+    def test_budget_exceeded_blocks_check_too(self, checker):
+        # check() (preflight-only, browser-driven capture path) shares the
+        # exact same _preflight() gate as request() -- must be bound by
+        # the same budget, not a code path that bypasses it.
+        fetcher = br.Fetcher(checker, session=object(), limiter=SpyLimiter(),
+                              max_wall_clock_seconds=100.0)
+        fetcher._start_time -= 101.0
+        with pytest.raises(br.WallClockBudgetExceeded):
+            fetcher.check("GET", "https://t.example/x")
+
+    def test_budget_is_a_real_clock_not_a_request_count(self, checker):
+        # Confirms this is genuinely time-based, not request-count-based
+        # in disguise: zero requests fired yet, but the clock already ran
+        # out -- must still block the very FIRST request.
+        fetcher = br.Fetcher(checker, session=object(), limiter=SpyLimiter(),
+                              max_wall_clock_seconds=100.0)
+        assert fetcher.request_count == 0
+        fetcher._start_time -= 101.0
+        with pytest.raises(br.WallClockBudgetExceeded):
+            fetcher.check("GET", "https://t.example/x")
+
+    def test_cli_flag_reaches_the_fetcher(self, tmp_path, monkeypatch):
+        # End-to-end: the --max-wall-clock-seconds CLI arg actually
+        # constructs a Fetcher with that value, not just parsed and dropped.
+        # --source-maps is one of the flags that actually instantiates a
+        # Fetcher (wants_fetcher); --hidden-endpoints deliberately does not
+        # (local-file-only, no network) so it wouldn't exercise this at all.
+        captured = {}
+        real_init = br.Fetcher.__init__
+
+        def _spy_init(self, *a, **kw):
+            captured.update(kw)
+            return real_init(self, *a, **kw)
+
+        monkeypatch.setattr(br.Fetcher, "__init__", _spy_init)
+        br.main([
+            "t.example", "--recon-dir", str(tmp_path), "--domain", "t.example",
+            "--source-maps", "--max-wall-clock-seconds", "42",
+        ])
+        assert captured.get("max_wall_clock_seconds") == 42.0
+
+
 # ─── Playwright-absent degradation ─────────────────────────────────────────
 
 class TestPlaywrightAbsent:
