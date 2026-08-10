@@ -238,6 +238,14 @@ of a flat scored list you'd have to re-rank yourself every turn:
 python3 tools/director.py build-plan <target> --hours <hours from Step 1> --memory-dir hunt-memory --write
 ```
 
+If `/takeover`, `/cloud-recon`, `/graphql-audit`, or `/param-discover` ran earlier this
+session (they're standalone, not part of this loop), their output lives in a
+timestamped `findings/<tool>/<timestamp>/` directory `build-plan` won't find on its
+own — add whichever of `--takeover-findings-dir` / `--cloud-findings-dir` /
+`--graphql-findings-dir` / `--param-findings-dir` applies, or that tool's leads are
+silently absent from the plan. See `research-director`'s "Standalone-Tool Findings"
+section for the full flag list.
+
 This writes `recon/<target>/hunt-plan.md` (read this — it's the plan, the stdout
 summary is only a sanity check) and a `hunt-plan.json` sidecar Step 6 uses for
 `replan()`. Every attack in it already carries: an EV/hour-ordered position, a

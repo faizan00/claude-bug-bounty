@@ -98,7 +98,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 - `tools/secrets_scanner.py` — pattern + Shannon-entropy + JS-signal (internal API URLs, feature flags, GraphQL fragments, exposed sourcemaps) secret scanner over `recon/<target>/browser/sources/` and `recon/<target>/cicd/`
 - `tools/takeover_scanner.sh` — dnsReaper/subjack subdomain-takeover scanner
 - `tools/cloud_recon.sh` — S3Scanner + cloud_enum + CloudFail wrapper
-- `tools/param_discovery.sh` — Arjun/x8 hidden-parameter discovery
+- `tools/param_discovery.sh` — Arjun/x8 hidden-parameter discovery, writing `findings/params/<timestamp>/{arjun.json,x8.txt}`. `director.py`'s `param_discovery_leads()` (opt-in `--param-findings-dir`, same "standalone tool, timestamped external findings dir" convention as takeover/cloud/graphql below) routes each diff-confirmed param NAME through `lead_board.py`'s new `"param"` ROUTES source — previously a dead end nothing downstream ever read.
 - `tools/bypass_403.sh` — byp4xx + built-in 403/401 bypass matrix
 - `tools/cve_scan.sh` — focused nuclei CVE-tag sweep + optional log4j-scan
 - `tools/external_arsenal.sh` — installed-tool registry (~50 tools); other scripts source this for `_have <tool>`
@@ -125,7 +125,7 @@ This repo is a Claude Code plugin for professional bug bounty hunting across Hac
 ### Hunt Memory (in `memory/`)
 
 - `memory/pattern_db.py` — cross-target pattern learning
-- `memory/vuln_intelligence.py` — failed-pattern + confirmed-chain + report-outcome + hypothesis memory, tech→vuln affinity, endpoint-shape scoring, the `priority_score()` decision-engine formula (self-learning: its `impact_potential` prior bounded-blends toward observed `report_outcomes.jsonl` acceptance rate once 5+ samples exist per vuln_class), `expected_value_per_hour()` (score × payout probability × time cost), `duplicate_or_noise_check()`, and `hypothesis_calibration()` (does stated confidence match actual outcomes) (CLI: `python3 -m memory.vuln_intelligence <cmd>`)
+- `memory/vuln_intelligence.py` — failed-pattern + confirmed-chain + report-outcome + hypothesis memory, tech→vuln affinity, endpoint-shape scoring (`normalize_endpoint()`/`endpoint_shape_stats()` — cross-target win/loss history for a URL's *shape*, e.g. `/api/v2/users/{id}/orders`), the `priority_score()` decision-engine formula (self-learning: its `impact_potential` prior bounded-blends toward observed `report_outcomes.jsonl` acceptance rate once 5+ samples exist per vuln_class; also applies `endpoint_shape_stats()`'s losing-track-record penalty when called with `endpoint=`/`--endpoint`, so `director.py build-plan` — which always passes a lead's evidence as `endpoint` — gets this signal automatically, not just the `recon-ranker` agent's hand-applied version), `expected_value_per_hour()` (score × payout probability × time cost), `duplicate_or_noise_check()`, and `hypothesis_calibration()` (does stated confidence match actual outcomes) (CLI: `python3 -m memory.vuln_intelligence <cmd>`)
 - `memory/experiment_memory.py` — granular per-payload-attempt log (`experiments.jsonl`) beneath patterns/failed_patterns; `payload_category_affinity()`, `should_stop()` (5-min-rule + diminishing-returns), `suggest_pivot()` (CLI: `python3 -m memory.experiment_memory <cmd>`)
 - `memory/audit_log.py` — request audit log, rate limiter, circuit breaker
 - `memory/rotation.py` — size-based JSONL rotation (10MB cap, keep 3 backups), auto-fired on append

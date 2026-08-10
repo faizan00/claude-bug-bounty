@@ -310,6 +310,75 @@ class TestGraphqlAuditLeads:
         assert leads and "fingerprint-confirmed" not in leads[0]["why"]
 
 
+class TestParamDiscoveryLeads:
+    """tools/param_discovery.sh (Arjun/x8) output -> lead-board leads,
+    routed through lead_board's new "param" ROUTES source (bare param-NAME
+    match). Same timestamped-external-dir shape as TestTakeoverLeads/
+    TestCloudReconLeads/TestGraphqlAuditLeads above."""
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert director.param_discovery_leads("t.example", str(tmp_path / "nope")) == []
+
+    def test_empty_dir_returns_empty(self, tmp_path):
+        d = tmp_path / "params"
+        d.mkdir()
+        assert director.param_discovery_leads("t.example", str(d)) == []
+
+    def test_arjun_json_param_names_route_through_lead_board(self, tmp_path):
+        d = tmp_path / "params"
+        d.mkdir()
+        (d / "arjun.json").write_text(json.dumps({
+            "https://t.example/api/v1/account": {"params": ["account_id", "callback", "not_a_signal_xyz"]},
+        }))
+        leads = director.param_discovery_leads("t.example", str(d))
+        skills = {l["skill"] for l in leads}
+        assert "hunt-idor" in skills   # account_id
+        assert "hunt-ssrf" in skills   # callback
+        assert all(l["source"] == "param-discovery" for l in leads)
+        assert all(l["tool_artifact"] == "arjun.json" for l in leads)
+        # "not_a_signal_xyz" matches no ROUTES pattern -> no lead for it,
+        # never a fabricated one.
+        assert not any("not_a_signal_xyz" in l["evidence"] for l in leads)
+
+    def test_arjun_json_malformed_does_not_raise(self, tmp_path):
+        d = tmp_path / "params"
+        d.mkdir()
+        (d / "arjun.json").write_text("{not json")
+        assert director.param_discovery_leads("t.example", str(d)) == []
+
+    def test_arjun_json_non_dict_top_level_ignored(self, tmp_path):
+        d = tmp_path / "params"
+        d.mkdir()
+        (d / "arjun.json").write_text(json.dumps(["unexpected", "list", "shape"]))
+        assert director.param_discovery_leads("t.example", str(d)) == []
+
+    def test_x8_standart_format_parsed_as_fallback(self, tmp_path):
+        d = tmp_path / "params"
+        d.mkdir()
+        (d / "x8.txt").write_text(
+            "GET https://t.example/api/v1/report % template, redirect_uri\n"
+            "this line has no percent sign and must be skipped\n"
+        )
+        leads = director.param_discovery_leads("t.example", str(d))
+        skills = {l["skill"] for l in leads}
+        assert "hunt-ssti" in skills
+        assert "hunt-lfi" in skills
+        assert "hunt-open-redirect" in skills
+        assert all(l["tool_artifact"] == "x8.txt" for l in leads)
+
+    def test_arjun_and_x8_both_present_arjun_still_parsed(self, tmp_path):
+        # arjun.json is preferred but x8.txt is still read if present --
+        # never an either/or gate, just two independent sources.
+        d = tmp_path / "params"
+        d.mkdir()
+        (d / "arjun.json").write_text(json.dumps({"https://t.example/a": {"params": ["user_id"]}}))
+        (d / "x8.txt").write_text("GET https://t.example/b % is_admin\n")
+        leads = director.param_discovery_leads("t.example", str(d))
+        skills = {l["skill"] for l in leads}
+        assert "hunt-idor" in skills
+        assert "hunt-auth-bypass" in skills
+
+
 class TestSecretScanLeads:
     """Part C — tools/secrets_scanner.py findings -> lead-board leads.
     Deterministic recon_dir-relative paths (unlike Part B's three tools),
@@ -549,7 +618,7 @@ class TestBuildPlanCrossSourceDedup:
 
 
 class TestBuildPlanToolAdapterWiring:
-    """The three Part B adapters are additive/opt-in on build_plan() —
+    """The four Part B adapters are additive/opt-in on build_plan() —
     omitting their *_findings_dir params must reproduce prior behavior
     exactly, matching the tech_attack_matrix/rejection_lessons precedent."""
 
@@ -561,10 +630,24 @@ class TestBuildPlanToolAdapterWiring:
         plan_explicit_none = d2.build_plan(
             "t.example", hours=5, recon_dir=rd,
             takeover_findings_dir=None, cloud_findings_dir=None, graphql_findings_dir=None,
+            param_findings_dir=None,
         )
         assert len(plan_default.attacks) == len(plan_explicit_none.attacks)
         assert sorted(s["reason"] for s in plan_default.skipped) == \
                sorted(s["reason"] for s in plan_explicit_none.skipped)
+
+    def test_param_findings_dir_adds_candidates_to_the_plan(self, isolated, tmp_path):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        params_dir = tmp_path / "params"
+        params_dir.mkdir()
+        (params_dir / "arjun.json").write_text(json.dumps({
+            "https://t.example/api/v1/account": {"params": ["account_id"]},
+        }))
+        d = director.Director(memory_dir=str(tmp_path / "hunt-memory"))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd, param_findings_dir=str(params_dir))
+        all_evidence = [a.evidence for a in plan.attacks] + [[s["evidence"]] for s in plan.skipped]
+        flat = [e for group in all_evidence for e in group]
+        assert any("account_id" in e for e in flat)
 
     def test_takeover_findings_dir_adds_candidates_to_the_plan(self, isolated, tmp_path):
         rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
@@ -587,6 +670,47 @@ class TestBuildPlanToolAdapterWiring:
         all_evidence = [a.evidence for a in plan.attacks] + [[s["evidence"]] for s in plan.skipped]
         flat = [e for group in all_evidence for e in group]
         assert any("203.0.113.9" in e for e in flat)
+
+
+class TestScoreLeadEndpointShapeWiring:
+    """_score_lead() now passes lead.get("evidence", "") + mem["journal"]
+    through to priority_score()/expected_value_per_hour() as endpoint=/
+    journal_entries= -- verifies this reaches a real build_plan() candidate,
+    not just the memory.vuln_intelligence unit tests in isolation."""
+
+    def test_losing_endpoint_shape_lowers_a_real_candidates_score(self, isolated, tmp_path):
+        mem_dir = tmp_path / "hunt-memory"
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        leads = lb.load_ledger("t.example")
+        idor_lead = next(l for l in leads if l["skill"] == "hunt-idor")
+        # idor_lead["evidence"] normalizes to /api/v2/users/{id} (numeric
+        # ?id= param) -- three prior REJECTED journal entries for that
+        # same shape should trip the losing-track-record penalty.
+        (mem_dir).mkdir(parents=True, exist_ok=True)
+        with open(mem_dir / "journal.jsonl", "w") as fh:
+            for i in (101, 202, 303):
+                fh.write(json.dumps(make_journal_entry(
+                    target="t.example", action="hunt", vuln_class="idor",
+                    endpoint=f"https://t.example/api/v2/users?id={i}", result="rejected",
+                )) + "\n")
+
+        d = director.Director(memory_dir=str(mem_dir))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+        cand = next(c for c in d._last_plan_context["candidates"] if c["lead"]["id"] == idor_lead["id"])
+        assert cand["score_result"]["components"]["endpoint_shape_penalty"] == 15
+        assert cand["score_result"]["endpoint_shape"]["losses"] == 3
+        assert cand["score_result"]["endpoint_shape"]["wins"] == 0
+
+    def test_no_journal_history_never_applies_penalty(self, isolated, tmp_path):
+        mem_dir = tmp_path / "hunt-memory"
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        leads = lb.load_ledger("t.example")
+        idor_lead = next(l for l in leads if l["skill"] == "hunt-idor")
+
+        d = director.Director(memory_dir=str(mem_dir))
+        plan = d.build_plan("t.example", hours=5, recon_dir=rd)
+        cand = next(c for c in d._last_plan_context["candidates"] if c["lead"]["id"] == idor_lead["id"])
+        assert cand["score_result"]["components"]["endpoint_shape_penalty"] == 0
 
 
 class TestBuildPlanBasics:
@@ -1157,6 +1281,22 @@ class TestPlanFileCLI:
         import os
         assert os.path.exists(os.path.join(rd, "hunt-plan.md"))
         assert os.path.exists(os.path.join(rd, "hunt-plan.json"))
+
+    def test_build_plan_param_findings_dir_flag_reaches_the_plan(self, isolated, tmp_path, capsys):
+        rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)
+        params_dir = tmp_path / "params"
+        params_dir.mkdir()
+        (params_dir / "arjun.json").write_text(json.dumps({
+            "https://t.example/api/v1/account": {"params": ["account_id"]},
+        }))
+        exit_code = director.main([
+            "build-plan", "t.example", "--hours", "5",
+            "--memory-dir", str(tmp_path / "hunt-memory"),
+            "--recon-dir", rd, "--param-findings-dir", str(params_dir),
+        ])
+        assert exit_code == 0
+        out = capsys.readouterr().out
+        assert "account_id" in out
 
     def test_build_plan_plan_file_override(self, isolated, tmp_path):
         rd = _seed_leads(isolated, "t.example", REALISTIC_URLS)

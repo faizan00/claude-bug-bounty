@@ -72,6 +72,8 @@ Every endpoint/host gets an additive **score** (0–100+, uncapped on the high e
 | **Failed-pattern match** — this exact technique already failed on this target | **−100 (kill)** | briefing / `failed-check` |
 | Endpoint shape (`normalize_endpoint`) has a losing track record (losses > wins, sample ≥ 3) | −15 | `endpoint-stats` |
 
+`priority_score()` (the same formula `python3 -m memory.vuln_intelligence priority/ev/decision` compute, and the one `director.py build-plan` uses automatically) now applies this identical rule in code when called with `--endpoint` — this row exists here for when you're scoring an endpoint by hand outside a `priority`/`ev`/`decision`/`build-plan` call; it isn't a second, independent heuristic.
+
 ### Confidence (separate scale, 0–100)
 
 ```

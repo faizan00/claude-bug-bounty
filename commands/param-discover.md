@@ -49,3 +49,20 @@ targeted testing.
 `findings/params/<timestamp>/`:
 - `arjun.json` / `arjun_summary.txt` — endpoint → discovered params
 - `x8.txt` — diff-based hits when arjun is unavailable
+
+## Feeding the Lead Board / Decision Engine
+
+A raw `findings/params/<timestamp>/` directory isn't picked up by anything
+automatically — same convention as `/takeover`, `/cloud-recon`, `/graphql-audit`
+(all standalone, timestamped output). Point `director.py build-plan` at it:
+
+```bash
+python3 tools/director.py build-plan target.com --hours 4 \
+  --param-findings-dir findings/params/<timestamp> --write
+```
+
+Each diff-confirmed param name routes through `lead_board.py`'s `"param"`
+ROUTES source (bare-name match — `user_id`→`hunt-idor`, `callback`→`hunt-ssrf`,
+`is_admin`→`hunt-auth-bypass`, etc.) into a real, scored lead, and composes
+with existing chain/hypothesis detection (e.g. a leaked secret + a hidden
+IDOR param on the same host still trips the `secret_plus_api` chain).

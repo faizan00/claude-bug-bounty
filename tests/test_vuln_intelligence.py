@@ -11,6 +11,8 @@ from memory.vuln_intelligence import (
     MIN_SAMPLES_FOR_DEDUP_PROBABILITY,
     MAX_IMPACT_RECALIBRATION_WEIGHT,
     DEFAULT_DEDUP_PROBABILITY,
+    MIN_SAMPLES_FOR_ENDPOINT_SHAPE_PENALTY,
+    ENDPOINT_SHAPE_LOSING_PENALTY,
     chain_priority,
     dedup_probability,
     duplicate_or_noise_check,
@@ -964,6 +966,86 @@ class TestDedupProbabilityWiredIntoPriorityScore:
         discounted = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
                                               report_outcomes=outcomes, dedup_probability_result=hot)
         assert discounted["payout_probability"] < baseline["payout_probability"]
+
+
+class TestEndpointShapeWiredIntoPriorityScore:
+    """priority_score()/expected_value_per_hour() now apply
+    endpoint_shape_stats()'s losing-track-record penalty when called with
+    endpoint= (director.py's _score_lead() always passes lead evidence +
+    mem["journal"]) — the same -15/sample>=3/losses>wins rule
+    agents/recon-ranker.md documents and hand-applies, now also in code."""
+
+    LOSING_JOURNAL = [
+        {"endpoint": "https://a.com/api/v2/users/1/orders", "vuln_class": "idor", "result": "rejected"},
+        {"endpoint": "https://a.com/api/v2/users/2/orders", "vuln_class": "idor", "result": "rejected"},
+        {"endpoint": "https://a.com/api/v2/users/3/orders", "vuln_class": "idor", "result": "rejected"},
+    ]
+    SAME_SHAPE_ENDPOINT = "https://a.com/api/v2/users/9/orders"
+
+    def test_omitting_endpoint_reproduces_prior_score_exactly(self):
+        before = priority_score("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[])
+        after = priority_score("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                endpoint=None, journal_entries=None)
+        assert before == after
+        assert after["endpoint_shape"] is None
+
+    def test_losing_shape_with_sufficient_sample_applies_flat_penalty(self):
+        baseline = priority_score("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[])
+        penalized = priority_score("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                    endpoint=self.SAME_SHAPE_ENDPOINT, journal_entries=self.LOSING_JOURNAL)
+        assert penalized["components"]["endpoint_shape_penalty"] == ENDPOINT_SHAPE_LOSING_PENALTY
+        assert penalized["score"] < baseline["score"]
+        c = baseline["components"]
+        base = (c["impact_potential"] + c["historical_success_probability"]
+                + c["technology_match"] + c["attack_chain_probability"]) / 4
+        assert penalized["score"] == max(0, min(100, round(base - ENDPOINT_SHAPE_LOSING_PENALTY)))
+        assert penalized["endpoint_shape"]["wins"] == 0
+        assert penalized["endpoint_shape"]["losses"] == 3
+
+    def test_below_min_sample_never_applies_penalty(self):
+        below_threshold = self.LOSING_JOURNAL[:MIN_SAMPLES_FOR_ENDPOINT_SHAPE_PENALTY - 1]
+        result = priority_score("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                 endpoint=self.SAME_SHAPE_ENDPOINT, journal_entries=below_threshold)
+        assert result["components"]["endpoint_shape_penalty"] == 0
+
+    def test_winning_shape_never_applies_penalty(self):
+        winning_journal = [
+            {"endpoint": "https://a.com/api/v2/users/1/orders", "vuln_class": "idor", "result": "confirmed"},
+            {"endpoint": "https://a.com/api/v2/users/2/orders", "vuln_class": "idor", "result": "rejected"},
+            {"endpoint": "https://a.com/api/v2/users/3/orders", "vuln_class": "idor", "result": "confirmed"},
+        ]
+        result = priority_score("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                 endpoint=self.SAME_SHAPE_ENDPOINT, journal_entries=winning_journal)
+        assert result["components"]["endpoint_shape_penalty"] == 0
+
+    def test_different_shape_never_applies_penalty(self):
+        # /orders/{id}/refund is a DIFFERENT shape from /users/{id}/orders --
+        # the losing journal above must not leak across shapes.
+        result = priority_score("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                 endpoint="https://a.com/api/v2/orders/9/refund", journal_entries=self.LOSING_JOURNAL)
+        assert result["components"]["endpoint_shape_penalty"] == 0
+        assert result["endpoint_shape"]["wins"] == 0
+        assert result["endpoint_shape"]["losses"] == 0
+
+    def test_score_never_negative_when_stacked_with_failure_penalty(self):
+        failed = [{"target": "a.com", "vuln_class": "idor", "technique": "t", "tech_stack": ["express"]}]
+        result = priority_score("idor", ["express"], "a.com", technique="t", patterns=[],
+                                 failed_patterns=failed, chains=[], impact_override=0,
+                                 endpoint=self.SAME_SHAPE_ENDPOINT, journal_entries=self.LOSING_JOURNAL)
+        assert result["score"] == 0
+
+    def test_expected_value_per_hour_omitting_endpoint_reproduces_prior_exactly(self):
+        before = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[])
+        after = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                         endpoint=None, journal_entries=None)
+        assert before == after
+
+    def test_expected_value_per_hour_propagates_endpoint_shape_penalty(self):
+        baseline = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[])
+        penalized = expected_value_per_hour("idor", ["express"], "a.com", patterns=[], failed_patterns=[], chains=[],
+                                             endpoint=self.SAME_SHAPE_ENDPOINT, journal_entries=self.LOSING_JOURNAL)
+        assert penalized["score"] < baseline["score"]
+        assert penalized["priority_components"]["endpoint_shape_penalty"] == ENDPOINT_SHAPE_LOSING_PENALTY
 
 
 class TestExtractRejectionLessons:
